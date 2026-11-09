@@ -330,6 +330,57 @@ static void test_stream(void) {
     oylng_parser_free(p);
 }
 
+/* What the fast paths read, at their edges: test-plain runs these without
+ * them, and the results must be the same */
+static void test_fast(void) {
+    oylng_mark m;
+    int n;
+    /* the size limit passed inside a flow collection on one line: 1 + 1 +
+       (2 + 3) * 2 */
+    const char *f = "%YAML 2.0\n---\n- {a: bb, c: dd}\n";
+    CHECK(parse(f, 12, NULL) == OYLNG_OK, "a flow line at the limit");
+    CHECK(parse(f, 11, &m) == OYLNG_ERR_LIMIT && m.line == 3 && m.col == 14, "past it, at dd: %zu:%zu",
+          m.line, m.col);
+    oylng_parser *p = oylng_parser_new(f, strlen(f));
+    oylng_parser_set_limit(p, 11);
+    CHECK(read_all(p, &n) == OYLNG_ERR_LIMIT && n == 7, "the events before it: %d", n);
+    oylng_parser_free(p);
+    CHECK(!strcmp(brief("%YAML 2.0\n---\n{a: 1, b: 2, a: 3}\n"), "ERR 3:14"), "a repeat in a flow line");
+
+    /* more events on one line than the queue has room for */
+    char s[4096];
+    size_t o = (size_t)sprintf(s, "%%YAML 2.0\n---\n[");
+    for (int i = 0; i < 300; i++) o += (size_t)sprintf(s + o, "%s%d", i ? ", " : "", i);
+    sprintf(s + o, "]\n");
+    const char *b = brief(s);
+    CHECK(!strncmp(b, "[ 0 1 2", 7) && strstr(b, " 298 299 ]") && strlen(strstr(b, "299")) == 5,
+          "a long flow line: %.40s", b);
+    o = (size_t)sprintf(s, "%%YAML 2.0\n---\n{");
+    for (int i = 0; i < 100; i++) o += (size_t)sprintf(s + o, "k%d: %d, ", i, i);
+    sprintf(s + o, "k0: x}\n");
+    CHECK(!strcmp(brief(s), "ERR 3:882"), "a repeat in a long flow line: %s", brief(s));
+
+    /* block mapping lines, then a repeat, or the limit */
+    const char *r = "%YAML 2.0\n---\na: 1\nb: 2\nc: 3\na: 4\n";
+    p = oylng_parser_new(r, strlen(r));
+    CHECK(read_all(p, &n) == OYLNG_ERR_PARSE && n == 9, "a repeat after lines: %d events", n);
+    m = oylng_parser_error_mark(p);
+    CHECK(m.line == 6 && m.col == 1, "at the repeat: %zu:%zu", m.line, m.col);
+    oylng_parser_free(p);
+    const char *l = "%YAML 2.0\n---\nab: cd\nef: gh\n";
+    CHECK(parse(l, 13, NULL) == OYLNG_OK, "lines at the limit");
+    CHECK(parse(l, 12, &m) == OYLNG_ERR_LIMIT && m.line == 4 && m.col == 5, "past it, at gh: %zu:%zu",
+          m.line, m.col);
+
+    /* what a line's plain value holds, and what may follow it */
+    CHECK(!strcmp(brief("%YAML 2.0\r\n---\r\na: 1 # c\r\nb: 'x' # d\r\nc: \"y\"\r\n"), "{ a 1 b x c y }"),
+          "breaks and comments: %s", brief("%YAML 2.0\r\n---\r\na: 1 # c\r\nb: 'x' # d\r\nc: \"y\"\r\n"));
+    CHECK(!strcmp(brief("%YAML 2.0\n---\na: b#c\nd: e:f  \ng: h i\n"), "{ a b#c d e:f g h i }"),
+          "# and : in values: %s", brief("%YAML 2.0\n---\na: b#c\nd: e:f  \ng: h i\n"));
+    CHECK(!strcmp(brief("%YAML 2.0\n---\na: \"x\"# c\n"), "ERR 3:7"), "a # right after a quote");
+    CHECK(!strcmp(brief("%YAML 2.0\n---\na: b: c\n"), "ERR 3:5"), "a second : in a line");
+}
+
 int main(void) {
     test_error_marks();
     test_stop();
@@ -338,6 +389,7 @@ int main(void) {
     test_api_edges();
     test_big_maps();
     test_stream();
+    test_fast();
     printf("api: %d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }

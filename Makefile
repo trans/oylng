@@ -14,7 +14,7 @@ OBJDIR := build
 
 SRCS := $(wildcard $(SRCDIR)/*.c)
 OBJS := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
-HDRS := include/oylng/oylng.h $(SRCDIR)/oylng_internal.h
+HDRS := include/oylng/oylng.h $(SRCDIR)/oylng_internal.h $(SRCDIR)/oylng_simd.h
 
 LIB  := $(OBJDIR)/liboylng.a
 TOOL := $(OBJDIR)/oylng
@@ -30,7 +30,7 @@ DIFF_N     ?= 20000
 
 SAN := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-api test-suite test-diff test-asan bench fuzz clean
+.PHONY: all test test-api test-suite test-plain test-diff test-asan bench fuzz clean
 
 all: $(LIB) $(TOOL)
 
@@ -67,6 +67,11 @@ $(OBJDIR)/bench_parser: bench/bench_parser.c bench/bench_gen.h $(LIB)
 $(OBJDIR)/%_asan: test/%.c $(SRCS) $(HDRS) tools/events.h | $(OBJDIR)
 	$(CC) -std=c11 $(WARNINGS) $(SAN) -Iinclude -Itools $(SRCS) $< -o $@
 
+# The library built into each test with plain loops for the SIMD scans
+# and without the fast paths, so that what they stand in for stays tested
+$(OBJDIR)/%_plain: test/%.c $(SRCS) $(HDRS) tools/events.h | $(OBJDIR)
+	$(CC) $(OYLNG_CFLAGS) -DOYLNG_NO_SIMD -DOYLNG_NO_FAST -Itools $(SRCS) $< -o $@
+
 $(OBJDIR)/fuzz_parser: fuzz/fuzz_parser.c $(SRCS) $(HDRS) | $(OBJDIR)
 	clang -std=c11 -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
 	    -Iinclude $(SRCS) $< -o $@
@@ -83,7 +88,12 @@ test-suite: $(OBJDIR)/test_suite $(SUITE_DATA)
 test-api: $(OBJDIR)/test_api
 	$(OBJDIR)/test_api
 
-test: test-api test-suite
+test: test-api test-suite test-plain
+
+# Both tests again, built for test-plain
+test-plain: $(OBJDIR)/test_api_plain $(OBJDIR)/test_suite_plain $(SUITE_DATA)
+	$(OBJDIR)/test_api_plain
+	$(OBJDIR)/test_suite_plain $(SUITE_DATA)
 
 # Both tests again with the sanitizers
 test-asan: $(OBJDIR)/test_api_asan $(OBJDIR)/test_suite_asan $(SUITE_DATA)

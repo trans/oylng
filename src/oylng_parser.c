@@ -29,6 +29,7 @@
  */
 
 #include "oylng_internal.h"
+#include "oylng_simd.h"
 #include <setjmp.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -147,8 +148,10 @@ typedef struct {
 
 enum { ST_START, ST_BETWEEN, ST_DOC, ST_DONE, ST_ERROR };
 
-/* How many events are made at a time */
+/* How many events are made at a time, and the room past them for the
+ * flow fast path's (flow_fast) */
 #define QN 64
+#define QX 64
 
 struct oylng_parser {
     const char *in, *end, *p;
@@ -164,6 +167,12 @@ struct oylng_parser {
     bool     defer;      /* reading an entry's key: check the limit after */
     bool     any_doc;    /* a marker has been read */
     unsigned depth;      /* collections open, as written */
+
+    /* the last look for a block mapping's key, at look_at: whether one
+       and its : start there, and, for a plain key of printable ASCII,
+       where it ends, so that reading it needn't scan it again */
+    const char *look_at, *look_end;
+    bool        look_map;
 
     gframe  *g;          /* the grammar's frames */
     uint32_t ng, capg;
@@ -206,7 +215,7 @@ struct oylng_parser {
     oylng_arena_mark b_mark, doc_mark;
 
     /* events are made QN at a time, and handed out one a call */
-    oylng_event q[QN];
+    oylng_event q[QN + QX];
     uint32_t    qn, qi;
     bool        qstop;        /* make no more this time */
     bool        rel_pending;  /* strings to let go before the next ones */
@@ -440,7 +449,11 @@ static size_t indent_here(const parser *P) {
 
 /* At a #: to the end of the line, checking what the comment holds */
 static void skip_comment(parser *P) {
-    while (!at_eol(P, P->p)) P->p += char_len(P, P->p, false);
+    for (;;) {
+        P->p += oylng_ascii_run(P->p, (size_t)(P->end - P->p), '\0', '\0');
+        if (at_eol(P, P->p)) return;
+        P->p += char_len(P, P->p, false);
+    }
 }
 
 /* eol ::= (white+ comment?)? (break | EOF) */
@@ -728,9 +741,9 @@ static inline bool in_run(unsigned c, uint64_t lo, uint64_t hi) {
     return c < 64 ? (lo >> c) & 1 : c < 128 && (hi >> (c - 64)) & 1;
 }
 
-/* Where a plain scalar from q ends, before any spaces after it. With
- * check, every character is checked; without, it only looks ahead. */
-static const char *plain_end(parser *P, const char *q, bool flow, bool check) {
+/* Where a plain scalar from q ends, before any spaces after it, every
+ * character checked */
+static const char *plain_end(parser *P, const char *q, bool flow) {
     const char *e = P->end, *last = q;
     uint64_t lo = flow ? flow_run_lo : plain_run_lo, hi = flow ? flow_run_hi : plain_run_hi;
     while (q < e) {
@@ -748,9 +761,36 @@ static const char *plain_end(parser *P, const char *q, bool flow, bool check) {
         }
         if (flow && is_flowi(c)) break;
         if (c == ' ' || c == '\t') { q++; continue; }
-        q += check ? char_len(P, q, false) : 1;
+        q += char_len(P, q, false);
         last = q;
     }
+    return last;
+}
+
+/* Looking ahead, without refusing anything: where a plain scalar from q
+ * ends in a block, as plain_end finds it, and whether every byte of it is
+ * printable ASCII, so that it needs no check */
+static const char *plain_look(const parser *P, const char *q, bool *ascii) {
+    const char *e = P->end, *last = q;
+    bool ok = true;
+    while (q < e) {
+        unsigned char c = (unsigned char)*q;
+        if (in_run(c, plain_run_lo, plain_run_hi)) {
+            do q++; while (q < e && in_run((unsigned char)*q, plain_run_lo, plain_run_hi));
+            last = q;
+            continue;
+        }
+        if (c == '\n' || (c == '\r' && q + 1 < e && q[1] == '\n')) break;
+        if (c == '#' && (q[-1] == ' ' || q[-1] == '\t')) break;
+        if (c == ':') {
+            const char *r = q + 1;
+            if (r >= e || *r == ' ' || *r == '\t' || is_brk(P, r)) break;
+        }
+        if (c == ' ' || c == '\t') { q++; continue; }
+        if (c != '#' && c != ':') ok = false;
+        last = ++q;
+    }
+    *ascii = ok;
     return last;
 }
 
@@ -761,7 +801,7 @@ static scal plain(parser *P, bool flow) {
         if (s < P->end && *s == '\r' && !is_brk(P, s)) char_len(P, s, false);
         fail(P, s, "%s", why);
     }
-    const char *e = plain_end(P, s, flow, true);
+    const char *e = plain_end(P, s, flow);
     P->p = e;
     return (scal){ s, (size_t)(e - s), s, S_PLAIN };
 }
@@ -798,6 +838,7 @@ static scal dquoted(parser *P) {
     const char *s = P->p, *q = s + 1, *e = P->end;
     bool esc = false;
     for (;;) {
+        q += oylng_ascii_run(q, (size_t)(e - q), '"', '\\');
         if (at_eol(P, q)) fail(P, s, "a double-quoted scalar must close on its line");
         if (*q == '"') break;
         if (*q != '\\') { q += char_len(P, q, true); continue; }
@@ -858,6 +899,7 @@ static scal squoted(parser *P) {
     const char *s = P->p, *q = s + 1;
     bool doubled = false;
     for (;;) {
+        q += oylng_ascii_run(q, (size_t)(P->end - q), '\'', '\'');
         if (at_eol(P, q)) fail(P, s, "a single-quoted scalar must close on its line");
         if (*q == '\'') {
             if (q + 1 < P->end && q[1] == '\'') { doubled = true; q += 2; continue; }
@@ -912,7 +954,11 @@ static scal block(parser *P, long n) {
         if (fold && (*t == ' ' || *t == '\t'))
             fail(P, t, "a line of a folded scalar can't start with a space or a tab");
         q = t;
-        while (!at_eol(P, q)) q += char_len(P, q, false);
+        for (;;) {
+            q += oylng_ascii_run(q, (size_t)(e - q), '\0', '\0');
+            if (at_eol(P, q)) break;
+            q += char_len(P, q, false);
+        }
         if (q < e) q += brk_len(q);
         stop = q;
     }
@@ -933,7 +979,7 @@ static scal block(parser *P, long n) {
             continue;
         }
         const char *t = ls + m, *te = t;
-        while (!at_eol(P, te)) te++;
+        te += oylng_find_break(te, (size_t)(e - te));   /* the lines are checked: a CR is a break's */
         q = te < e ? te + brk_len(te) : te;
         if (fold && seen && blanks == 0) out[o++] = ' ';
         else {
@@ -1263,18 +1309,29 @@ static const char *key_end(parser *P, const char *q) {
         return NULL;
     }
     if (plain_start_bad(P, q, false)) return NULL;
-    const char *r = plain_end(P, q, false, false);
+    bool ascii;
+    const char *r = plain_look(P, q, &ascii);
     if (r - q == 2 && q[0] == '<' && q[1] == '<') return NULL;
+    if (ascii) P->look_end = r;
     return r;
 }
 
+/* Whether a block mapping starts at the cursor: a <<: or a key and its :.
+ * What it finds is kept for the key() that follows. */
 static bool is_map(parser *P) {
     const char *q = P->p, *e = P->end;
-    if (starts_merge(P, false)) return true;
-    const char *r = key_end(P, q);
-    if (!r) return false;
-    while (r < e && *r == ' ') r++;
-    return r < e && *r == ':' && sep_at(P, r + 1);
+    if (q == P->look_at) return P->look_map;
+    P->look_at = q;
+    P->look_end = NULL;
+    bool m;
+    if (starts_merge(P, false)) m = true;
+    else {
+        const char *r = key_end(P, q);
+        if (r) while (r < e && *r == ' ') r++;
+        m = r && r < e && *r == ':' && sep_at(P, r + 1);
+    }
+    P->look_map = m;
+    return m;
 }
 
 /* At an entry at indent m: mid-line at that column, or a line indented m */
@@ -1296,17 +1353,27 @@ static void colon(parser *P) {
 }
 
 /* fs ::= (white | break | comment break)* */
+static void flow_line(parser *P, const char *q) {
+    if (line_is(P, q, "---") || line_is(P, q, "..."))
+        fail(P, q, "a flow collection can't hold a --- or ... line");
+}
+
 static void fs(parser *P) {
+    const char *q = P->p, *e = P->end;
+    if (bol(P, q)) flow_line(P, q);
     for (;;) {
-        const char *q = P->p;
-        if (bol(P, q) && (line_is(P, q, "---") || line_is(P, q, "...")))
-            fail(P, q, "a flow collection can't hold a --- or ... line");
-        if (q >= P->end) return;
-        if (*q == ' ' || *q == '\t' || *q == '\n') P->p++;
-        else if (is_brk(P, q)) P->p += 2;
-        else if (*q == '#' && (bol(P, q) || q[-1] == ' ' || q[-1] == '\t')) skip_comment(P);
-        else return;
+        while (q < e && (*q == ' ' || *q == '\t')) q++;
+        if (q >= e) break;
+        if (*q == '\n' || (*q == '\r' && q + 1 < e && q[1] == '\n')) {
+            q += *q == '\r' ? 2 : 1;
+            flow_line(P, q);
+        } else if (*q == '#' && (bol(P, q) || q[-1] == ' ' || q[-1] == '\t')) {
+            P->p = q;
+            skip_comment(P);
+            q = P->p;
+        } else break;
     }
+    P->p = q;
 }
 
 static void entry_set(parser *P, uint32_t k, uint32_t v, uint32_t e);
@@ -1315,7 +1382,11 @@ static void entry_set(parser *P, uint32_t k, uint32_t v, uint32_t e);
 static scal key(parser *P, uint32_t *node) {
     int c = peek(P, 0);
     P->in_key = true;
-    scal s = c == '"' ? dquoted(P) : c == '\'' ? squoted(P) : plain(P, false);
+    scal s;
+    if (P->p == P->look_at && P->look_end) {   /* found by is_map, needing no check */
+        s = (scal){ P->p, (size_t)(P->look_end - P->p), P->p, S_PLAIN };
+        P->p = P->look_end;
+    } else s = c == '"' ? dquoted(P) : c == '\'' ? squoted(P) : plain(P, false);
     P->in_key = false;
     *node = put_str(P, &s);
     if (s.style == S_PLAIN && s.len == 2 && memcmp(s.data, "<<", 2) == 0)
@@ -1489,10 +1560,129 @@ static uint32_t value(parser *P, long m, bool inmap) {
     return node_at(P, m);
 }
 
+/* ── The flow fast path ──────────────────────────────────────
+ * A flow collection written on one line, of plain scalars of letters,
+ * digits and . _ + - and of double-quoted ones of printable ASCII and no
+ * escapes, as JSON mostly is, is read in one pass that makes its events
+ * straight into the queue, with no frames. Anything else, anything the
+ * general path would refuse (a repeated key, the limits) and a collection
+ * with more events than the queue has room for are left to it: nothing is
+ * kept, and it reads the collection from the start. */
+
+#if defined(OYLNG_NO_FAST)   /* the tests' build of the general path alone */
+#  define FAST_PATHS 0
+#else
+#  define FAST_PATHS 1
+#endif
+
+static inline bool ff_alnum(unsigned c) {
+    return (unsigned)((c | 0x20) - 'a') < 26 || c - '0' < 10;
+}
+
+static inline bool ff_plain(unsigned c) {
+    return ff_alnum(c) || c == '.' || c == '_' || c == '+' || c == '-';
+}
+
+static inline void ff_emit(oylng_event *e, oylng_event_type t, const char *data, size_t len, size_t at) {
+    e->type = t;
+    e->value.data = data;
+    e->value.len = len;
+    e->offset = at;
+}
+
+/* At a [ or a {: true once the collection is read and its events made */
+static bool flow_fast(parser *P) {
+    if (!FAST_PATHS || P->building || P->defer) return false;
+    enum { ITEM, COLON, VALUE, SEP };
+    struct { const char *k; size_t len; } keys[QN + QX];
+    bool map[QN + QX];
+    uint32_t k0[QN + QX];
+    const char *q = P->p, *e = P->end;
+    oylng_event *out = &P->q[P->qn];
+    uint32_t room = QN + QX - P->qn, n = 0, nk = 0, depth = 0;
+    uint64_t add = 0;
+    int st = ITEM;
+    for (;;) {
+        while (q < e && (*q == ' ' || *q == '\t')) q++;
+        if (q >= e || n == room) return false;
+        unsigned c = (unsigned char)*q;
+        if (st == COLON) {
+            if (c != ':') return false;
+            q++;
+            st = VALUE;
+            continue;
+        }
+        if (st == SEP && c == ',') {
+            q++;
+            st = ITEM;
+            continue;
+        }
+        if (c == '}' || c == ']') {
+            if (st == VALUE || (c == '}') != map[depth - 1]) return false;
+            q++;
+            ff_emit(&out[n++], c == '}' ? OYLNG_EVT_MAP_END : OYLNG_EVT_SEQ_END, NULL, 0, pos(P, q));
+            nk = k0[--depth];
+            if (!depth) break;
+            st = SEP;
+            continue;
+        }
+        if (st == SEP) return false;
+        bool is_key = depth && st == ITEM && map[depth - 1];
+        if (c == '{' || c == '[') {
+            if (is_key || P->depth + depth + 1 > P->max_levels) return false;
+            map[depth] = c == '{';
+            k0[depth++] = nk;
+            ff_emit(&out[n++], c == '{' ? OYLNG_EVT_MAP_START : OYLNG_EVT_SEQ_START, NULL, 0, pos(P, q));
+            add++;
+            q++;
+            st = ITEM;
+            continue;
+        }
+        const char *a = q, *d, *z;   /* the scalar at a: its text from d to z */
+        if (c == '"') {
+            d = q + 1;
+            z = d + oylng_ascii_run(d, (size_t)(e - d), '"', '\\');
+            if (z >= e || *z != '"') return false;
+            q = z + 1;
+        } else {
+            if (!(ff_alnum(c) || c == '.' || c == '_' ||
+                  ((c == '-' || c == '+') && q + 1 < e && ff_plain((unsigned char)q[1]))))
+                return false;
+            d = q;
+            z = q + 1;
+            while (z < e && ff_plain((unsigned char)*z)) z++;
+            q = z;
+            while (q < e && (*q == ' ' || *q == '\t')) q++;
+            if (q >= e) return false;
+            if (*q == ':') {
+                if (!is_key || q + 1 >= e || (q[1] != ' ' && q[1] != '\t')) return false;
+            } else if (*q != ',' && *q != ']' && *q != '}') return false;
+        }
+        size_t len = (size_t)(z - d);
+        if (is_key) {
+            for (uint32_t i = k0[depth - 1]; i < nk; i++)
+                if (same(keys[i].k, keys[i].len, d, len)) return false;
+            keys[nk].k = d;
+            keys[nk++].len = len;
+        }
+        ff_emit(&out[n++], OYLNG_EVT_SCALAR, d, len, pos(P, a));
+        add = sat(add, 1 + (uint64_t)len);
+        st = is_key ? COLON : SEP;
+    }
+    if (sat(sat(P->t_full, P->d_full), add) > P->limit || sat(sat(P->t_held, P->d_held), add) > P->limit)
+        return false;
+    P->d_held = sat(P->d_held, add);
+    P->d_full = sat(P->d_full, add);
+    P->qn += n;
+    P->p = q;
+    return true;
+}
+
 static uint32_t line_node(parser *P, long n) {
     int c = peek(P, 0);
     uint32_t v;
     if (c == '|' || c == '>') return put_value(P, block(P, n));
+    if ((c == '[' || c == '{') && flow_fast(P)) { eol(P); return NONE; }
     if (c == '[') { open_seq(P, G_FSEQ, 0, true); return PUSHED; }
     if (c == '{') { open_map(P, G_FMAP, 0, true); return PUSHED; }
     if (c == '*') v = plainref(P, false);
@@ -1507,6 +1697,7 @@ static uint32_t line_node(parser *P, long n) {
 
 static uint32_t fnode(parser *P) {
     int c = peek(P, 0);
+    if ((c == '[' || c == '{') && flow_fast(P)) return NONE;
     if (c == '[') { open_seq(P, G_FSEQ, 0, false); return PUSHED; }
     if (c == '{') { open_map(P, G_FMAP, 0, false); return PUSHED; }
     if (c == '"') return put_value(P, dquoted(P));
@@ -1559,6 +1750,109 @@ static void flow_next(parser *P, const gframe *f, int close) {
 
 static inline bool go_on(const parser *P) { return P->qn < QN && !P->sp; }
 
+/* ── The block fast path ─────────────────────────────────────
+ * Lines of a block mapping that are a plain key of letters, digits and
+ * . _ + -, ": ", and a value of printable ASCII to the end of the line,
+ * plain or quoted with no escapes, and then perhaps a comment, are read
+ * with no frames or look ahead. Their keys and values are counted, the
+ * keys checked and their events made by the functions the general path
+ * uses, in its order. A line that doesn't fit is left to it, from its
+ * start. */
+
+/* Where a key the fast path takes starts at q: not ---, ... or %YAML at a
+ * line's start, nor -<< */
+static inline bool fb_key_start(const char *q, const char *e) {
+    unsigned c = (unsigned char)*q;
+    if (c == '-' || c == '.' || c == '+') return q + 1 < e && ff_alnum((unsigned char)q[1]);
+    return ff_alnum(c) || c == '_';
+}
+
+/* A plain value can start at q, in a line after its start, as
+ * plain_start_bad sees it */
+static inline bool fb_value_start(const char *q, const char *e) {
+    unsigned c = (unsigned char)*q;
+    if (c == '-' || c == '?' || c == ':') return q + 1 < e && ff_alnum((unsigned char)q[1]);
+    return c > ' ' && c < 0x7F && !is_indicator((int)c) && c != '!';
+}
+
+/* The end of a line at q, after a value and any spaces: past its break,
+ * or NULL if there's anything else there but a comment of printable
+ * ASCII and tabs */
+static inline const char *fb_eol(const char *q, const char *e) {
+    if (q < e && *q == '#' && q[-1] == ' ') {
+        q++;
+        q += oylng_ascii_run(q, (size_t)(e - q), '\0', '\0');
+    }
+    if (q < e && *q == '\n') return q + 1;
+    if (q + 1 < e && *q == '\r' && q[1] == '\n') return q + 2;
+    return NULL;
+}
+
+/* At a block mapping's key, after its indent: reads lines while they fit,
+ * and the next is at the mapping's indent; true if it read any, leaving
+ * the mapping after the last */
+static bool block_fast(parser *P, gframe *f) {
+    if (!FAST_PATHS || P->building || P->defer) return false;
+    const char *q = P->p, *e = P->end;
+    bool any = false;
+    for (;;) {
+        const char *k = q;
+        if (q >= e || !fb_key_start(q, e)) break;
+        q++;
+        while (q < e && ff_plain((unsigned char)*q)) q++;
+        const char *kz = q;
+        while (q < e && *q == ' ') q++;
+        if (e - q < 2 || q[0] != ':' || q[1] != ' ') break;
+        const char *cz = ++q;
+        while (q < e && *q == ' ') q++;
+        if (q >= e) break;
+        const char *v = q, *vz, *d = q;
+        int style = S_PLAIN;
+        if (*q == '"' || *q == '\'') {
+            char t = *q++;
+            d = q;
+            q += oylng_ascii_run(q, (size_t)(e - q), t, t == '"' ? '\\' : t);
+            if (q >= e || *q != t || (t == '\'' && q + 1 < e && q[1] == '\'')) break;
+            vz = q++;
+            style = t == '"' ? S_DOUBLE : S_SINGLE;
+        } else {
+            if (!fb_value_start(q, e)) break;
+            vz = ++q;
+            for (;;) {
+                while (q < e && in_run((unsigned char)*q, plain_run_lo, plain_run_hi)) q++;
+                if (q > vz && q[-1] != ' ') vz = q;
+                if (q >= e) break;
+                if (*q == ' ') { q++; continue; }
+                if (*q == ':' && q + 1 < e && in_run((unsigned char)q[1], plain_run_lo, plain_run_hi)) {
+                    vz = ++q;
+                    continue;
+                }
+                if (*q == '#' && q[-1] != ' ') { vz = ++q; continue; }
+                break;
+            }
+        }
+        const char *after = vz + (style != S_PLAIN);
+        q = after;
+        while (q < e && *q == ' ') q++;
+        const char *nl = fb_eol(q, e);   /* a # right after a quote isn't a comment's: refused */
+        if (!nl) break;
+        scal ks = { k, (size_t)(kz - k), k, S_PLAIN };
+        scal vs = { d, (size_t)(vz - d), v, style };
+        P->p = cz;
+        put_str(P, &ks);
+        f->r = map_key(P, &f->c, &ks, NONE);
+        emit_str(P, &ks);
+        put_value(P, vs);
+        P->p = q = nl;
+        f->at_ = A_AFTER;
+        any = true;
+        if (P->qn >= QN) break;
+        while (q < e && *q == ' ') q++;
+        if (q - nl != f->m) break;
+    }
+    return any;
+}
+
 static void bmap_step(parser *P, gframe *f) {
     do {
         if (f->at_ == A_AFTER) {
@@ -1577,6 +1871,7 @@ static void bmap_step(parser *P, gframe *f) {
                 close_coll(P);
                 return;
             }
+            if (block_fast(P, f)) continue;
             if (starts_merge(P, false)) {
                 const char *at = P->p;
                 if (f->c.started) fail(P, at, "<<: comes before the mapping's other keys");
