@@ -4,18 +4,25 @@
  * The language is spec/yaml-2.0.md at trans/yaml2, Draft 1. Section numbers
  * below are that draft's.
  *
- * One path: a recursive descent over the grammar (section 12), one
- * document at a time, into an array of nodes in document order. The
- * table's nodes come first in the array and stay until `...`; a document's
- * follow them and go once it has been delivered. Events are then read off
- * the array: a reference is followed where it stands, a `-<<` splices in
- * the items it names, and a merged mapping is read through its plan, the
- * order section 9.1 gives its keys.
+ * The grammar (section 12) is read by a state machine with a stack of
+ * frames, one per open collection. It makes events a few dozen at a time,
+ * and hands them out one a call. So a document is delivered as it is read,
+ * and what the parser holds is what the draft makes it hold:
  *
- * The two sizes of section 10 are counted as nodes are added, so the limit
- * refuses a stream before anything is built past it. A document is read
- * whole before its first event, so a document in error is never delivered
- * in part (section 2).
+ * - the table, as an array of nodes in document order, until `...`, so
+ *   that references can be followed: a reference is delivered by walking
+ *   the nodes it names, and a `-<<` by walking the items;
+ * - the keys of each open mapping, to refuse a repeated one (section 7.4);
+ * - a mapping with `<<:` lines, built as nodes until it closes, because a
+ *   key written after them can replace a merged one in place (section
+ *   9.1). It is then delivered through its plan, the order section 9.1
+ *   gives its keys, and let go.
+ *
+ * The table is read by the same machine, building. The two sizes of
+ * section 10, and the levels with references followed, are counted as the
+ * stream is read, so a stream is refused before anything is built past
+ * the limit. A document in error may have delivered events already, but
+ * the error comes before its end (section 2).
  *
  * Errors unwind with longjmp to oylng_parse_next. Everything the parser
  * allocates hangs off the parser, so nothing leaks when they do.
@@ -52,8 +59,12 @@ typedef struct {
 typedef struct { uint32_t key, val; } pair;
 typedef struct { uint32_t start, count; } plan;
 
-/* An open mapping's pair, and its key's hash once the mapping has a table */
-typedef struct { uint32_t key, val, hash; } spair;
+/* An open mapping's pair: its key's text, the text's hash once the mapping
+ * has a table, and while building, the key's node and the value's */
+typedef struct {
+    const char *k;
+    uint32_t    klen, hash, key, val;
+} spair;
 
 #define NONE  UINT32_MAX
 #define ROOT  UINT32_MAX     /* the mapping the table's entries are keys of */
@@ -93,7 +104,51 @@ typedef struct {
     uint32_t cur, end;
 } frame;
 
-enum { ST_START, ST_BETWEEN, ST_WALK, ST_DONE, ST_ERROR };
+/* An open mapping, or (M, lv and before only) an open sequence. A
+ * mapping's pairs are in the scratch from s0, in the order they are
+ * delivered: for a merged one, its plan as it is built. Past SMALL_MAP
+ * pairs it has a hash table of tcap slots in lix from t0. Collections
+ * close in the reverse of the order they open, and a mapping takes no pair
+ * while one opened inside it is open, so the mapping taking a pair has the
+ * scratch's last pairs and lix's last table. */
+typedef struct {
+    uint32_t M;        /* its node while building, or NONE */
+    uint32_t s0;       /* where its pairs start in the scratch */
+    uint32_t t0, tcap; /* its table in lix; tcap 0 until it has one */
+    uint32_t lv;       /* building: the most levels below it */
+    uint64_t before;   /* building: full before it */
+    bool     merged, started;
+} mapctx;
+
+/* The grammar's frames: a document, the collections open in it, or the
+ * table's own mapping, block or flow */
+enum { G_DOC, G_BMAP, G_BSEQ, G_FSEQ, G_FMAP, G_TMAP, G_TFLOW };
+
+/* Where a frame is: at an entry (or a document's value), at a mapping's
+ * value, or after an entry */
+enum { A_ENTRY, A_VALUE, A_AFTER };
+
+typedef struct {
+    uint8_t     kind, at_;
+    bool        eol_after;    /* opened by line_node, so an eol follows its close */
+    bool        build_root;   /* the merged mapping a document's build began at */
+    bool        inline_root;  /* G_DOC: its value is on the marker's line */
+    bool        has_mk;       /* mapping, delivered: it has kept a key's text, from mk */
+    long        m;            /* block: its indent */
+    const char *at;           /* where it opens */
+    mapctx      c;
+    uint32_t    r;            /* mapping: the pair whose value is next */
+    uint32_t    k, e;         /* table: the entry's key node and its place */
+    oylng_arena_mark mk;      /* the strings before its first kept key */
+} gframe;
+
+/* The value a frame was given, when one opened a frame of its own instead */
+#define PUSHED (UINT32_MAX - 1)
+
+enum { ST_START, ST_BETWEEN, ST_DOC, ST_DONE, ST_ERROR };
+
+/* How many events are made at a time */
+#define QN 64
 
 struct oylng_parser {
     const char *in, *end, *p;
@@ -104,9 +159,14 @@ struct oylng_parser {
 
     int      state;
     bool     in_table;   /* reading a --- & document */
+    bool     building;   /* making nodes, not delivering: the table, or a merged mapping */
+    bool     in_key;     /* reading a key, whose text is kept until its mapping closes */
     bool     defer;      /* reading an entry's key: check the limit after */
     bool     any_doc;    /* a marker has been read */
     unsigned depth;      /* collections open, as written */
+
+    gframe  *g;          /* the grammar's frames */
+    uint32_t ng, capg;
 
     /* nodes, and the full size of each of the table's: a document's
        aren't needed, as nothing refers to them */
@@ -134,15 +194,26 @@ struct oylng_parser {
     /* section 10: the table's sizes, and the document's */
     uint64_t t_held, t_full, d_held, d_full;
 
-    /* the document being delivered */
-    uint32_t  root;
-    bool      root_pending;
+    /* the document being delivered, and the walk delivering nodes */
     oylng_str name;
     frame    *stack;
     uint32_t  sp, capstack;
 
-    oylng_event evt;
-    oylng_arena *strings;   /* values that had to be built */
+    /* a merged mapping built in a document, let go once delivered: what
+       was in use before it */
+    bool             release_pending;
+    uint32_t         b_n, b_pairs, b_plans;
+    oylng_arena_mark b_mark, doc_mark;
+
+    /* events are made QN at a time, and handed out one a call */
+    oylng_event q[QN];
+    uint32_t    qn, qi;
+    bool        qstop;        /* make no more this time */
+    bool        rel_pending;  /* strings to let go before the next ones */
+    oylng_arena_mark rel_mark;
+
+    oylng_arena *strings;   /* built text that lasts: the table's, keys', a merged mapping's */
+    oylng_arena *vals;      /* built text of values being delivered, until they are */
 
     bool   stopped;
     size_t stop_offset;
@@ -235,6 +306,14 @@ static void enter(parser *P, const char *at) {
 }
 
 static void leave(parser *P) { P->depth--; }
+
+/* With references followed: refuses a node reaching lev levels below the
+ * collections open around it */
+static void levels_check(parser *P, const char *at, uint32_t lev) {
+    if ((uint64_t)P->depth + lev > P->max_levels)
+        fail_limit(P, at, "with references followed, this document goes more than %u levels deep",
+                   P->max_levels);
+}
 
 static uint32_t new_node(parser *P, int kind, const char *at) {
     if (P->n >= P->cap) P->nodes = grow(P, P->nodes, &P->cap, P->n + 1, sizeof *P->nodes);
@@ -510,24 +589,79 @@ static inline bool key_is(const parser *P, uint32_t k, const char *s, size_t len
 
 static const char empty_text[] = "";
 
-static uint32_t new_str(parser *P, const char *at, const char *data, size_t len, int style) {
-    if (len > UINT32_MAX - 1) fail_limit(P, at, "a scalar of 4 GiB or more");
-    count(P, at, 1 + (uint64_t)len, 1 + (uint64_t)len);
-    uint32_t i = new_node(P, N_STR, at);
+/* A scalar as read: its value, how it was written, and where */
+typedef struct {
+    const char *data;
+    size_t      len;
+    const char *at;
+    int         style;
+} scal;
+
+static inline size_t pos(const parser *P, const char *at) { return (size_t)(at - P->in); }
+
+static void emit(parser *P, oylng_event_type t, const char *data, size_t len, size_t at) {
+    oylng_event *e = &P->q[P->qn++];
+    e->type = t;
+    e->value.data = data;
+    e->value.len = len;
+    e->offset = at;
+}
+
+/* Lets the strings after m go, once the events made so far, which may
+ * point to them, are handed out: the next ones aren't made until then */
+static void release_later(parser *P, oylng_arena_mark m) {
+    oylng_arena_mark now = oylng_arena_get_mark(P->strings);
+    if (now.block == m.block && now.used == m.used) return;
+    P->rel_pending = true;
+    P->rel_mark = m;
+    P->qstop = true;
+}
+
+static void emit_str(parser *P, const scal *s) {
+    emit(P, OYLNG_EVT_SCALAR, s->data, s->len, pos(P, s->at));
+}
+
+/* Counts a scalar (section 10), and makes its node if building */
+static uint32_t put_str(parser *P, const scal *s) {
+    if (s->len > UINT32_MAX - 1) fail_limit(P, s->at, "a scalar of 4 GiB or more");
+    count(P, s->at, 1 + (uint64_t)s->len, 1 + (uint64_t)s->len);
+    if (!P->building) return NONE;
+    uint32_t i = new_node(P, N_STR, s->at);
     node *nd = &P->nodes[i];
-    nd->data = data;
-    nd->len = (uint32_t)len;
-    nd->sub = (uint8_t)style;
-    set_full(P, i, 1 + (uint64_t)len);
+    nd->data = s->data;
+    nd->len = (uint32_t)s->len;
+    nd->sub = (uint8_t)s->style;
+    set_full(P, i, 1 + (uint64_t)s->len);
     return i;
 }
 
-static uint32_t empty_str(parser *P) {
-    return new_str(P, P->p, empty_text, 0, S_EMPTY);
+/* A value: its node while building; otherwise it is delivered, NONE */
+static uint32_t put_value(parser *P, scal s) {
+    uint32_t i = put_str(P, &s);
+    if (!P->building) emit_str(P, &s);
+    return i;
 }
 
+static uint32_t put_empty(parser *P) {
+    return put_value(P, (scal){ empty_text, 0, P->p, S_EMPTY });
+}
+
+/* Room for text built from escapes or lines. A key's lasts until its
+ * mapping closes, and what is built lasts as long as its node; a value
+ * delivered as read lasts until the next call. */
 static char *str_alloc(parser *P, size_t len) {
-    char *s = oylng_arena_alloc(P->strings, len ? len : 1, 1);
+    oylng_arena *a = P->vals;
+    if (P->building) a = P->strings;
+    else if (P->in_key) {
+        /* the mapping reading it, on top, lets it go when it closes */
+        gframe *f = &P->g[P->ng - 1];
+        if (!f->has_mk) {
+            f->mk = oylng_arena_get_mark(P->strings);
+            f->has_mk = true;
+        }
+        a = P->strings;
+    }
+    char *s = oylng_arena_alloc(a, len ? len : 1, 1);
     if (!s) fail_mem(P);
     return s;
 }
@@ -620,7 +754,7 @@ static const char *plain_end(parser *P, const char *q, bool flow, bool check) {
     return last;
 }
 
-static uint32_t plain(parser *P, bool flow) {
+static scal plain(parser *P, bool flow) {
     const char *s = P->p;
     const char *why = plain_start_bad(P, s, flow);
     if (why) {
@@ -629,7 +763,7 @@ static uint32_t plain(parser *P, bool flow) {
     }
     const char *e = plain_end(P, s, flow, true);
     P->p = e;
-    return new_str(P, s, s, (size_t)(e - s), S_PLAIN);
+    return (scal){ s, (size_t)(e - s), s, S_PLAIN };
 }
 
 static int hex4(const parser *P, const char *q) {
@@ -660,7 +794,7 @@ static size_t put_utf8(char *o, uint32_t c) {
 }
 
 /* A double-quoted scalar, as in JSON (section 6.2) */
-static uint32_t dquoted(parser *P) {
+static scal dquoted(parser *P) {
     const char *s = P->p, *q = s + 1, *e = P->end;
     bool esc = false;
     for (;;) {
@@ -691,7 +825,7 @@ static uint32_t dquoted(parser *P) {
         }
     }
     P->p = q + 1;
-    if (!esc) return new_str(P, s, s + 1, (size_t)(q - s - 1), S_DOUBLE);
+    if (!esc) return (scal){ s + 1, (size_t)(q - s - 1), s, S_DOUBLE };
 
     char *out = str_alloc(P, (size_t)(q - s - 1));
     size_t o = 0;
@@ -716,11 +850,11 @@ static uint32_t dquoted(parser *P) {
         default: out[o++] = r[1]; r += 2; break;   /* " \ / */
         }
     }
-    return new_str(P, s, out, o, S_DOUBLE);
+    return (scal){ out, o, s, S_DOUBLE };
 }
 
 /* A single-quoted scalar: '' is one ' (section 6.3) */
-static uint32_t squoted(parser *P) {
+static scal squoted(parser *P) {
     const char *s = P->p, *q = s + 1;
     bool doubled = false;
     for (;;) {
@@ -732,18 +866,18 @@ static uint32_t squoted(parser *P) {
         q += char_len(P, q, false);
     }
     P->p = q + 1;
-    if (!doubled) return new_str(P, s, s + 1, (size_t)(q - s - 1), S_SINGLE);
+    if (!doubled) return (scal){ s + 1, (size_t)(q - s - 1), s, S_SINGLE };
     char *out = str_alloc(P, (size_t)(q - s - 1));
     size_t o = 0;
     for (const char *r = s + 1; r < q; r++) {
         out[o++] = *r;
         if (*r == '\'') r++;
     }
-    return new_str(P, s, out, o, S_SINGLE);
+    return (scal){ out, o, s, S_SINGLE };
 }
 
 /* A block scalar under a parent at indent n (section 6.4) */
-static uint32_t block(parser *P, long n) {
+static scal block(parser *P, long n) {
     const char *h = P->p, *e = P->end;
     bool fold = *h == '>';
     P->p++;
@@ -783,7 +917,7 @@ static uint32_t block(parser *P, long n) {
         stop = q;
     }
     P->p = stop;
-    if (m < 0) return new_str(P, h, empty_text, 0, fold ? S_FOLDED : S_LITERAL);
+    if (m < 0) return (scal){ empty_text, 0, h, fold ? S_FOLDED : S_LITERAL };
 
     /* then the value */
     char *out = str_alloc(P, (size_t)(stop - body) + 1);
@@ -814,7 +948,7 @@ static uint32_t block(parser *P, long n) {
         seen = true;
     }
     if (!chomp) out[o++] = '\n';
-    return new_str(P, h, out, o, fold ? S_FOLDED : S_LITERAL);
+    return (scal){ out, o, h, fold ? S_FOLDED : S_LITERAL };
 }
 
 /* ── References (section 8.2) ────────────────────────────── */
@@ -912,10 +1046,19 @@ static uint32_t ref(parser *P, bool flow) {
     return deref(P, v);
 }
 
+static bool handle(parser *P, uint32_t i);
+
+/* A reference as a value: its node while building; otherwise the node it
+ * names is delivered, NONE */
 static uint32_t plainref(parser *P, bool flow) {
     const char *s = P->p;
     uint32_t t = ref(P, flow);
     count(P, s, 1, P->full[t]);
+    if (!P->in_table) levels_check(P, s, P->nodes[t].lev);
+    if (!P->building) {
+        handle(P, t);
+        return NONE;
+    }
     uint32_t r = new_node(P, N_REF, s);
     P->nodes[r].link = t;
     set_full(P, r, P->full[t]);
@@ -925,31 +1068,8 @@ static uint32_t plainref(parser *P, bool flow) {
 
 /* ── Mappings, with merges (sections 7.1, 7.4, 9.1) ──────── */
 
-/* An open mapping. Its pairs are in the scratch from s0, in the order they
- * are delivered: for a merged one, its plan as it is built. Past SMALL_MAP
- * pairs it has a hash table of tcap slots in lix from t0. Mappings close in
- * the reverse of the order they open, and a mapping takes no pair while one
- * opened inside it is open, so the mapping taking a pair has the scratch's
- * last pairs and lix's last table. */
-typedef struct {
-    uint32_t M;
-    uint32_t s0;       /* where its pairs start in the scratch */
-    uint32_t t0, tcap; /* its table in lix; tcap 0 until it has one */
-    uint32_t lv;       /* the most levels below it */
-    uint64_t before;   /* full before it */
-    bool     merged, started;
-} mapctx;
-
-static void map_open(parser *P, mapctx *c, const char *at) {
-    c->before = cur_full(P);
-    enter(P, at);
-    count(P, at, 1, 1);
-    c->M = new_node(P, N_MAP, at);
-    c->s0 = P->nscratch;
-    c->t0 = P->nlix;
-    c->tcap = 0;
-    c->lv = 0;
-    c->merged = c->started = false;
+static inline bool same(const char *a, size_t al, const char *b, size_t bl) {
+    return al == bl && (al == 0 || memcmp(a, b, al) == 0);
 }
 
 /* The open mapping's pair whose key is k, as its place from s0, or NONE;
@@ -959,7 +1079,7 @@ static uint32_t pair_find(const parser *P, const mapctx *c, const char *k, size_
     if (!c->tcap) {
         uint32_t cnt = P->nscratch - c->s0;
         for (uint32_t i = 0; i < cnt; i++)
-            if (key_is(P, sp[i].key, k, len)) return i;
+            if (same(sp[i].k, sp[i].klen, k, len)) return i;
         return NONE;
     }
     const uint32_t *t = P->lix + c->t0;
@@ -967,7 +1087,7 @@ static uint32_t pair_find(const parser *P, const mapctx *c, const char *k, size_
     for (uint32_t j = h & mask;; j = (j + 1) & mask) {
         uint32_t i = t[j];
         if (i == EMPTY) return NONE;
-        if (sp[i].hash == h && key_is(P, sp[i].key, k, len)) return i;
+        if (sp[i].hash == h && same(sp[i].k, sp[i].klen, k, len)) return i;
     }
 }
 
@@ -983,10 +1103,7 @@ static void table_put(parser *P, const mapctx *c, uint32_t i) {
 static void table_build(parser *P, mapctx *c, uint32_t cnt) {
     spair *sp = P->scratch + c->s0;
     if (!c->tcap)
-        for (uint32_t i = 0; i < cnt; i++) {
-            const node *kn = &P->nodes[sp[i].key];
-            sp[i].hash = text_hash(P, kn->data, kn->len);
-        }
+        for (uint32_t i = 0; i < cnt; i++) sp[i].hash = text_hash(P, sp[i].k, sp[i].klen);
     uint64_t cap = c->tcap ? (uint64_t)c->tcap * 2 : 32;
     while (cap < (uint64_t)cnt * 2) cap *= 2;
     if (c->t0 + cap > UINT32_MAX) fail_limit(P, P->p, "too many keys for one parser");
@@ -999,24 +1116,27 @@ static void table_build(parser *P, mapctx *c, uint32_t cnt) {
 
 /* A new pair for the open mapping, whose key hashes to h if the mapping
  * has a table; returns its place from s0 */
-static uint32_t pair_add(parser *P, mapctx *c, uint32_t k, uint32_t v, uint32_t h) {
-    P->scratch = grow(P, P->scratch, &P->capscratch, P->nscratch + 1, sizeof *P->scratch);
+static uint32_t pair_add(parser *P, mapctx *c, const char *k, size_t klen, uint32_t key,
+                         uint32_t val, uint32_t h) {
+    if (P->nscratch >= P->capscratch)
+        P->scratch = grow(P, P->scratch, &P->capscratch, P->nscratch + 1, sizeof *P->scratch);
     uint32_t r = P->nscratch - c->s0;
-    P->scratch[P->nscratch++] = (spair){ k, v, h };
+    P->scratch[P->nscratch++] = (spair){ k, (uint32_t)klen, h, key, val };
     if (r + 1 <= SMALL_MAP) return r;
     if ((uint64_t)(r + 1) * 2 > c->tcap) table_build(P, c, r + 1);
     else table_put(P, c, r);
     return r;
 }
 
-static inline uint32_t pair_hash(parser *P, const mapctx *c, uint32_t k) {
-    return c->tcap ? text_hash(P, P->nodes[k].data, P->nodes[k].len) : 0;
+static inline uint32_t pair_hash(parser *P, const mapctx *c, const char *k, size_t len) {
+    return c->tcap ? text_hash(P, k, len) : 0;
 }
 
-/* <<: *src, before any written key */
+/* <<: *src, before any written key. Only a mapping being built has them. */
 static void map_merge(parser *P, mapctx *c, uint32_t src, const char *at) {
     if (P->nodes[src].kind != N_MAP) fail(P, at, "<<: names a mapping");
     count(P, at, 1, P->full[src] - 1);
+    if (!P->in_table) levels_check(P, at, P->nodes[src].lev - 1u);   /* its values sit in this mapping */
     uint32_t g = new_node(P, N_MERGE, at);
     P->nodes[g].link = src;
     c->merged = true;
@@ -1031,25 +1151,23 @@ static void map_merge(parser *P, mapctx *c, uint32_t src, const char *at) {
         if (via_plan) { k = P->pairs[i].key; v = P->pairs[i].val; i++; }
         else { k = i; v = i + 1; i = subtree_end(P, v); }
         const node *kn = &P->nodes[k];
-        uint32_t h = pair_hash(P, c, k);
+        uint32_t h = pair_hash(P, c, kn->data, kn->len);
         uint32_t r = pair_find(P, c, kn->data, kn->len, h);
         if (r != NONE) P->scratch[c->s0 + r].val = v;
-        else pair_add(P, c, k, v, h);
+        else pair_add(P, c, kn->data, kn->len, k, v, h);
     }
 }
 
-/* A written key, node k: refused if written before. Returns its pair's
- * place from s0. */
-static uint32_t map_key(parser *P, mapctx *c, uint32_t k) {
-    const node *kn = &P->nodes[k];
-    uint32_t h = pair_hash(P, c, k);
-    uint32_t r = pair_find(P, c, kn->data, kn->len, h);
+/* A written key, with its node k while building: refused if written
+ * before. Returns its pair's place from s0. */
+static uint32_t map_key(parser *P, mapctx *c, const scal *s, uint32_t k) {
+    uint32_t h = pair_hash(P, c, s->data, s->len);
+    uint32_t r = pair_find(P, c, s->data, s->len, h);
     c->started = true;
-    if (r == NONE) return pair_add(P, c, k, NONE, h);
+    if (r == NONE) return pair_add(P, c, s->data, s->len, k, NONE, h);
     /* a merged key has its node in the source, before M */
     if (!c->merged || P->scratch[c->s0 + r].key > c->M)
-        fail(P, P->in + kn->pos, "the key \"%.*s\" is repeated",
-             (int)(kn->len > 60 ? 60 : kn->len), kn->data);
+        fail(P, s->at, "the key \"%.*s\" is repeated", (int)(s->len > 60 ? 60 : s->len), s->data);
     P->scratch[c->s0 + r].key = k;
     return r;
 }
@@ -1059,6 +1177,8 @@ static void map_value(parser *P, mapctx *c, uint32_t r, uint32_t v) {
     if (!c->merged && P->nodes[v].lev > c->lv) c->lv = P->nodes[v].lev;
 }
 
+/* Closes a mapping being built: its plan if merged, its keys in the
+ * table's index if it is the table's and big */
 static uint32_t map_close(parser *P, mapctx *c) {
     uint32_t lv = c->lv, cnt = P->nscratch - c->s0;
     const spair *sp = P->scratch + c->s0;
@@ -1074,27 +1194,33 @@ static uint32_t map_close(parser *P, mapctx *c) {
     } else P->nodes[c->M].aux = cnt;
     /* paths look keys up in the table's mappings until ... */
     if (P->in_table && cnt > SMALL_MAP)
-        for (uint32_t i = 0; i < cnt; i++) {
-            const node *kn = &P->nodes[sp[i].key];
+        for (uint32_t i = 0; i < cnt; i++)
             ix_insert(P, &P->tix, c->M, sp[i].key, c->merged ? i : sp[i].val,
-                      key_hash(P, c->M, kn->data, kn->len));
-        }
+                      key_hash(P, c->M, sp[i].k, sp[i].klen));
     P->nscratch = c->s0;
     P->nlix = c->t0;
     P->nodes[c->M].link = P->n;
     set_lev(P, c->M, lv + 1);
     set_full(P, c->M, cur_full(P) - c->before);
-    leave(P);
     return c->M;
 }
 
-static uint32_t splice(parser *P, uint32_t src, const char *at, uint32_t *lv) {
+static void push(parser *P, uint8_t mode, uint32_t cur, uint32_t end, uint8_t close);
+
+/* -<< *src in a sequence: a node while building; otherwise its items are
+ * delivered */
+static void splice(parser *P, mapctx *c, uint32_t src, const char *at) {
     if (P->nodes[src].kind != N_SEQ) fail(P, at, "-<< names a sequence");
     count(P, at, 1, P->full[src] - 1);
+    uint32_t il = P->nodes[src].lev - 1u;   /* its items' levels; a sequence has at least 1 */
+    if (!P->in_table) levels_check(P, at, il);
+    if (!P->building) {
+        push(P, W_NODES, src + 1, P->nodes[src].link, OYLNG_EVT_NONE);
+        return;
+    }
     uint32_t s = new_node(P, N_SPLICE, at);
     P->nodes[s].link = src;
-    if (P->nodes[src].lev > *lv) *lv = P->nodes[src].lev;   /* its items sit one level below src */
-    return s;
+    if (il > c->lv) c->lv = il;
 }
 
 static bool starts_merge(const parser *P, bool flow) {
@@ -1105,11 +1231,6 @@ static bool starts_merge(const parser *P, bool flow) {
 }
 
 /* ── Block nodes (sections 7.1, 7.2) ─────────────────────── */
-
-static uint32_t node_at(parser *P, long n);
-static uint32_t value(parser *P, long m, bool inmap);
-static uint32_t line_node(parser *P, long n);
-static uint32_t flow(parser *P);
 
 static bool is_seq(const parser *P) {
     const char *q = P->p;
@@ -1168,105 +1289,177 @@ static bool at_entry(parser *P, long m) {
     return (long)col(P) == m;
 }
 
-static uint32_t key(parser *P) {
-    int c = peek(P, 0);
-    if (c == '"') return dquoted(P);
-    if (c == '\'') return squoted(P);
-    const char *s = P->p;
-    uint32_t k = plain(P, false);
-    if (P->nodes[k].len == 2 && memcmp(P->nodes[k].data, "<<", 2) == 0)
-        fail(P, s, "a plain << is the merge indicator; the key is written \"<<\"");
-    return k;
-}
-
 static void colon(parser *P) {
     spaces(P);
     if (peek(P, 0) != ':') fail(P, P->p, "expected : after the key");
     P->p++;
 }
 
-static uint32_t block_map(parser *P, long m) {
-    mapctx c;
-    map_open(P, &c, P->p);
+/* fs ::= (white | break | comment break)* */
+static void fs(parser *P) {
     for (;;) {
-        const char *j = P->p;
-        if (!at_entry(P, m)) { P->p = j; break; }
-        if (starts_merge(P, false)) {
-            const char *at = P->p;
-            if (c.started) fail(P, at, "<<: comes before the mapping's other keys");
-            P->p += 3;
-            if (!spaces(P)) fail(P, P->p, "<<: needs a reference after a space");
-            uint32_t src = ref(P, false);
-            eol(P);
-            map_merge(P, &c, src, at);
-        } else {
-            if (!is_map(P)) {
-                if (is_seq(P)) fail(P, P->p, "a sequence item where this mapping expects a key");
-                fail(P, P->p, "expected a key and :, at this mapping's indent");
-            }
-            uint32_t k = key(P);
-            colon(P);
-            uint32_t r = map_key(P, &c, k);
-            map_value(P, &c, r, value(P, m, true));
-        }
-        gap(P);
+        const char *q = P->p;
+        if (bol(P, q) && (line_is(P, q, "---") || line_is(P, q, "...")))
+            fail(P, q, "a flow collection can't hold a --- or ... line");
+        if (q >= P->end) return;
+        if (*q == ' ' || *q == '\t' || *q == '\n') P->p++;
+        else if (is_brk(P, q)) P->p += 2;
+        else if (*q == '#' && (bol(P, q) || q[-1] == ' ' || q[-1] == '\t')) skip_comment(P);
+        else return;
     }
-    return map_close(P, &c);
 }
 
-static uint32_t block_seq(parser *P, long m) {
-    uint64_t before = cur_full(P);
+static void entry_set(parser *P, uint32_t k, uint32_t v, uint32_t e);
+
+/* A key, counted, with its node while building */
+static scal key(parser *P, uint32_t *node) {
+    int c = peek(P, 0);
+    P->in_key = true;
+    scal s = c == '"' ? dquoted(P) : c == '\'' ? squoted(P) : plain(P, false);
+    P->in_key = false;
+    *node = put_str(P, &s);
+    if (s.style == S_PLAIN && s.len == 2 && memcmp(s.data, "<<", 2) == 0)
+        fail(P, s.at, "a plain << is the merge indicator; the key is written \"<<\"");
+    return s;
+}
+
+/* ── Frames ──────────────────────────────────────────────── */
+
+static gframe *gpush(parser *P, int kind, long m, const char *at, bool eol_after) {
+    if (P->ng >= P->capg) P->g = grow(P, P->g, &P->capg, P->ng + 1, sizeof *P->g);
+    gframe *f = &P->g[P->ng++];
+    f->kind = (uint8_t)kind;
+    f->at_ = A_ENTRY;
+    f->eol_after = eol_after;
+    f->build_root = f->inline_root = f->has_mk = false;
+    f->m = m;
+    f->at = at;
+    f->c.tcap = f->c.lv = 0;
+    f->c.merged = f->c.started = false;
+    return f;
+}
+
+static inline gframe *gtop(parser *P) { return &P->g[P->ng - 1]; }
+
+/* A value has been read for frame f, the one on top: its node while
+ * building */
+static void value_done(parser *P, gframe *f, uint32_t v) {
+    switch (f->kind) {
+    case G_BMAP: case G_FMAP:
+        if (P->building) map_value(P, &f->c, f->r, v);
+        break;
+    case G_BSEQ: case G_FSEQ:
+        if (P->building && P->nodes[v].lev > f->c.lv) f->c.lv = P->nodes[v].lev;
+        break;
+    case G_TMAP: case G_TFLOW:
+        entry_set(P, f->k, v, f->e);
+        break;
+    default:
+        break;
+    }
+}
+
+/* A sequence at P->p: [ for a flow one */
+static void open_seq(parser *P, int kind, long m, bool eol_after) {
     const char *at = P->p;
+    uint64_t before = cur_full(P);
     enter(P, at);
     count(P, at, 1, 1);
-    uint32_t S = new_node(P, N_SEQ, at);
-    uint32_t lv = 0;
-    for (;;) {
-        const char *j = P->p;
-        if (!at_entry(P, m) || !is_seq(P)) { P->p = j; break; }
-        if (peek(P, 1) == '<') {
-            const char *sp = P->p;
-            P->p += 3;
-            spaces(P);
-            uint32_t src = ref(P, false);
-            eol(P);
-            splice(P, src, sp, &lv);
-        } else {
-            P->p++;
-            const char *k0 = P->p;
-            size_t k = spaces(P);
-            uint32_t v;
-            if (k && peek(P, 0) != '#' && !at_eol(P, P->p)) {
-                long c = (long)col(P);
-                if (is_seq(P)) v = block_seq(P, c);
-                else if (is_map(P)) v = block_map(P, c);
-                else v = line_node(P, m);
-            } else {
-                P->p = k0;
-                eol(P);
-                gap(P);
-                v = node_at(P, m);
-            }
-            if (P->nodes[v].lev > lv) lv = P->nodes[v].lev;
-        }
-        gap(P);
+    gframe *f = gpush(P, kind, m, at, eol_after);
+    f->c.before = before;
+    if (P->building) f->c.M = new_node(P, N_SEQ, at);
+    else {
+        f->c.M = NONE;
+        emit(P, OYLNG_EVT_SEQ_START, NULL, 0, pos(P, at));
     }
-    P->nodes[S].link = P->n;
-    set_lev(P, S, lv + 1);
-    set_full(P, S, cur_full(P) - before);
-    leave(P);
-    return S;
+    if (kind == G_FSEQ) {
+        P->p++;
+        fs(P);
+    }
 }
+
+/* A mapping at P->p: { for a flow one. A mapping with <<: lines is built
+ * until it closes, as a key written after them can still replace a merged
+ * one (section 9.1); one that isn't is delivered as it is read. */
+static void open_map(parser *P, int kind, long m, bool eol_after) {
+    const char *at = P->p;
+    uint64_t before = cur_full(P);
+    enter(P, at);
+    count(P, at, 1, 1);
+    if (kind == G_FMAP) {
+        P->p++;
+        fs(P);
+    }
+    gframe *f = gpush(P, kind, m, at, eol_after);
+    f->c.before = before;
+    f->c.s0 = P->nscratch;
+    f->c.t0 = P->nlix;
+    if (!P->building && starts_merge(P, kind == G_FMAP)) {
+        f->build_root = true;
+        P->building = true;
+        P->b_n = P->n;
+        P->b_pairs = P->npairs;
+        P->b_plans = P->nplans;
+        P->b_mark = oylng_arena_get_mark(P->strings);
+    }
+    if (P->building) f->c.M = new_node(P, N_MAP, at);
+    else {
+        f->c.M = NONE;
+        emit(P, OYLNG_EVT_MAP_START, NULL, 0, pos(P, at));
+    }
+}
+
+/* Closes the collection on top. A merged mapping a build began at is then
+ * delivered from its nodes, which go once it has been. */
+static void close_coll(parser *P) {
+    gframe *f = gtop(P);
+    bool map = f->kind == G_BMAP || f->kind == G_FMAP;
+    bool eol_after = f->eol_after, root = f->build_root;
+    uint32_t v = NONE;
+    if (P->building) {
+        if (map) v = map_close(P, &f->c);
+        else {
+            v = f->c.M;
+            P->nodes[v].link = P->n;
+            set_lev(P, v, f->c.lv + 1);
+            set_full(P, v, cur_full(P) - f->c.before);
+        }
+    } else {
+        if (map) {
+            P->nscratch = f->c.s0;
+            P->nlix = f->c.t0;
+            if (f->has_mk) release_later(P, f->mk);
+        }
+        emit(P, map ? OYLNG_EVT_MAP_END : OYLNG_EVT_SEQ_END, NULL, 0, pos(P, P->p));
+    }
+    leave(P);
+    P->ng--;
+    if (root) {
+        P->building = false;
+        P->release_pending = true;
+        handle(P, v);
+        v = NONE;
+    }
+    if (eol_after) eol(P);
+    value_done(P, gtop(P), v);
+}
+
+/* ── Values ──────────────────────────────────────────────────
+ * Each gives the value's node while building, NONE once it is delivered,
+ * or PUSHED when a collection opened a frame: value_done comes when it
+ * closes. */
+
+static uint32_t line_node(parser *P, long n);
 
 /* node(n) ::= map(m) | seq(m) | indent(m) line-node(max(n, 0)), m > n */
 static uint32_t node_at(parser *P, long n) {
     gap(P);
-    if (eof(P) || marker(P) || dots(P)) return empty_str(P);
+    if (eof(P) || marker(P) || dots(P)) return put_empty(P);
     long m = (long)indent_here(P);
-    if (m <= n) return empty_str(P);
+    if (m <= n) return put_empty(P);
     P->p += m;
-    if (is_seq(P)) return block_seq(P, m);
-    if (is_map(P)) return block_map(P, m);
+    if (is_seq(P)) { open_seq(P, G_BSEQ, m, false); return PUSHED; }
+    if (is_map(P)) { open_map(P, G_BMAP, m, false); return PUSHED; }
     return line_node(P, n < 0 ? 0 : n);
 }
 
@@ -1286,11 +1479,11 @@ static uint32_t value(parser *P, long m, bool inmap) {
     }
     eol(P);
     gap(P);
-    if (eof(P) || marker(P) || dots(P)) return empty_str(P);
+    if (eof(P) || marker(P) || dots(P)) return put_empty(P);
     long k = (long)indent_here(P);
     if (inmap && k == m) {
         P->p += k;
-        if (is_seq(P)) return block_seq(P, m);
+        if (is_seq(P)) { open_seq(P, G_BSEQ, m, false); return PUSHED; }
         P->p -= k;
     }
     return node_at(P, m);
@@ -1299,146 +1492,229 @@ static uint32_t value(parser *P, long m, bool inmap) {
 static uint32_t line_node(parser *P, long n) {
     int c = peek(P, 0);
     uint32_t v;
-    if (c == '|' || c == '>') return block(P, n);
-    if (c == '[' || c == '{') v = flow(P);
-    else if (c == '*') v = plainref(P, false);
-    else if (c == '"') v = dquoted(P);
-    else if (c == '\'') v = squoted(P);
-    else v = plain(P, false);
+    if (c == '|' || c == '>') return put_value(P, block(P, n));
+    if (c == '[') { open_seq(P, G_FSEQ, 0, true); return PUSHED; }
+    if (c == '{') { open_map(P, G_FMAP, 0, true); return PUSHED; }
+    if (c == '*') v = plainref(P, false);
+    else if (c == '"') v = put_value(P, dquoted(P));
+    else if (c == '\'') v = put_value(P, squoted(P));
+    else v = put_value(P, plain(P, false));
     eol(P);
     return v;
 }
 
 /* ── Flow collections (section 7.3) ──────────────────────── */
 
-/* fs ::= (white | break | comment break)* */
-static void fs(parser *P) {
-    for (;;) {
-        const char *q = P->p;
-        if (bol(P, q) && (line_is(P, q, "---") || line_is(P, q, "...")))
-            fail(P, q, "a flow collection can't hold a --- or ... line");
-        if (q >= P->end) return;
-        if (*q == ' ' || *q == '\t' || *q == '\n') P->p++;
-        else if (is_brk(P, q)) P->p += 2;
-        else if (*q == '#' && (bol(P, q) || q[-1] == ' ' || q[-1] == '\t')) skip_comment(P);
-        else return;
-    }
-}
-
 static uint32_t fnode(parser *P) {
     int c = peek(P, 0);
-    if (c == '[' || c == '{') return flow(P);
-    if (c == '"') return dquoted(P);
-    if (c == '\'') return squoted(P);
+    if (c == '[') { open_seq(P, G_FSEQ, 0, false); return PUSHED; }
+    if (c == '{') { open_map(P, G_FMAP, 0, false); return PUSHED; }
+    if (c == '"') return put_value(P, dquoted(P));
+    if (c == '\'') return put_value(P, squoted(P));
     if (c == '*') return plainref(P, true);
-    return plain(P, true);
-}
-
-static uint32_t flow_seq(parser *P) {
-    uint64_t before = cur_full(P);
-    const char *at = P->p;
-    enter(P, at);
-    count(P, at, 1, 1);
-    uint32_t S = new_node(P, N_SEQ, at);
-    uint32_t lv = 0;
-    P->p++;
-    fs(P);
-    while (peek(P, 0) != ']') {
-        if (eof(P)) fail(P, at, "this [ is never closed");
-        const char *j = P->p;
-        if (P->end - j > 3 && memcmp(j, "-<<", 3) == 0 && (j[3] == ' ' || j[3] == '\t' || is_brk(P, j + 3))) {
-            P->p += 3;
-            fs(P);
-            if (peek(P, 0) == '*') {
-                uint32_t src = ref(P, true);
-                splice(P, src, j, &lv);
-            } else {
-                P->p = j;
-                uint32_t v = fnode(P);
-                if (P->nodes[v].lev > lv) lv = P->nodes[v].lev;
-            }
-        } else {
-            uint32_t v = fnode(P);
-            if (P->nodes[v].lev > lv) lv = P->nodes[v].lev;
-        }
-        fs(P);
-        if (peek(P, 0) == ',') { P->p++; fs(P); }
-        else if (peek(P, 0) != ']') {
-            if (eof(P)) fail(P, at, "this [ is never closed");
-            fail(P, P->p, "expected , or ] here");
-        }
-    }
-    P->p++;
-    P->nodes[S].link = P->n;
-    set_lev(P, S, lv + 1);
-    set_full(P, S, cur_full(P) - before);
-    leave(P);
-    return S;
+    return put_value(P, plain(P, true));
 }
 
 /* A flow pair's key and its :, leaving the cursor after the : */
-static uint32_t flow_key(parser *P, bool *quoted) {
+static scal flow_key(parser *P, uint32_t *node) {
     int c = peek(P, 0);
-    *quoted = c == '"' || c == '\'';
-    uint32_t k;
-    if (*quoted) {
-        k = c == '"' ? dquoted(P) : squoted(P);
-        fs(P);
-    } else {
-        const char *s = P->p;
-        k = plain(P, true);
-        if (P->nodes[k].len == 2 && memcmp(P->nodes[k].data, "<<", 2) == 0)
-            fail(P, s, "a plain << is the merge indicator; the key is written \"<<\"");
+    bool quoted = c == '"' || c == '\'';
+    P->in_key = true;
+    scal s = c == '"' ? dquoted(P) : c == '\'' ? squoted(P) : plain(P, true);
+    P->in_key = false;
+    *node = put_str(P, &s);
+    if (quoted) fs(P);
+    else {
+        if (s.len == 2 && memcmp(s.data, "<<", 2) == 0)
+            fail(P, s.at, "a plain << is the merge indicator; the key is written \"<<\"");
         white(P);
     }
     if (peek(P, 0) != ':') {
-        if (!*quoted && (peek(P, 0) == ',' || peek(P, 0) == '}'))
+        if (!quoted && (peek(P, 0) == ',' || peek(P, 0) == '}'))
             fail(P, P->p, "a key in a flow mapping needs a :");
         fail(P, P->p, "expected : after the key");
     }
     P->p++;
     int d = peek(P, 0);
-    if (!*quoted && !(sep_at(P, P->p) || d == ',' || d == '}'))
+    if (!quoted && !(sep_at(P, P->p) || d == ',' || d == '}'))
         fail(P, P->p, "a : needs a space after it, or , or }");
-    return k;
+    return s;
 }
 
-static uint32_t flow_map(parser *P) {
-    const char *at = P->p;
-    mapctx c;
-    map_open(P, &c, at);
-    P->p++;
+/* After a flow entry: a , or the close */
+static void flow_next(parser *P, const gframe *f, int close) {
     fs(P);
-    while (peek(P, 0) != '}') {
-        if (eof(P)) fail(P, at, "this { is never closed");
+    if (peek(P, 0) == ',') { P->p++; fs(P); }
+    else if (peek(P, 0) != close) {
+        if (eof(P)) fail(P, f->at, close == ']' ? "this [ is never closed" : "this { is never closed");
+        fail(P, P->p, close == ']' ? "expected , or ] here" : "expected , or } here");
+    }
+}
+
+/* ── Steps ───────────────────────────────────────────────────
+ * Each moves the frame on top on, until it opens or closes a frame, a
+ * walk has nodes to deliver, or there is no room for more events: each
+ * pass makes at most one. A frame that starts a value moves itself on
+ * first, as the value may open a frame above it. */
+
+static inline bool go_on(const parser *P) { return P->qn < QN && !P->sp; }
+
+static void bmap_step(parser *P, gframe *f) {
+    do {
+        if (f->at_ == A_AFTER) {
+            gap(P);
+            f->at_ = A_ENTRY;
+        } else if (f->at_ == A_VALUE) {
+            long m = f->m;
+            f->at_ = A_AFTER;
+            uint32_t v = value(P, m, true);
+            if (v == PUSHED) return;
+            value_done(P, f, v);
+        } else {
+            const char *j = P->p;
+            if (!at_entry(P, f->m)) {
+                P->p = j;
+                close_coll(P);
+                return;
+            }
+            if (starts_merge(P, false)) {
+                const char *at = P->p;
+                if (f->c.started) fail(P, at, "<<: comes before the mapping's other keys");
+                P->p += 3;
+                if (!spaces(P)) fail(P, P->p, "<<: needs a reference after a space");
+                uint32_t src = ref(P, false);
+                eol(P);
+                map_merge(P, &f->c, src, at);
+                f->at_ = A_AFTER;
+                continue;
+            }
+            if (!is_map(P)) {
+                if (is_seq(P)) fail(P, P->p, "a sequence item where this mapping expects a key");
+                fail(P, P->p, "expected a key and :, at this mapping's indent");
+            }
+            uint32_t k;
+            scal s = key(P, &k);
+            colon(P);
+            f->r = map_key(P, &f->c, &s, k);
+            if (!P->building) emit_str(P, &s);
+            f->at_ = A_VALUE;
+        }
+    } while (go_on(P));
+}
+
+static void bseq_step(parser *P, gframe *f) {
+    do {
+        if (f->at_ == A_AFTER) {
+            gap(P);
+            f->at_ = A_ENTRY;
+            continue;
+        }
+        const char *j = P->p;
+        if (!at_entry(P, f->m) || !is_seq(P)) {
+            P->p = j;
+            close_coll(P);
+            return;
+        }
+        f->at_ = A_AFTER;
+        if (peek(P, 1) == '<') {
+            const char *sp = P->p;
+            P->p += 3;
+            spaces(P);
+            uint32_t src = ref(P, false);
+            eol(P);
+            splice(P, &f->c, src, sp);
+            continue;
+        }
+        long m = f->m;
+        P->p++;
+        const char *k0 = P->p;
+        size_t k = spaces(P);
+        uint32_t v;
+        if (k && peek(P, 0) != '#' && !at_eol(P, P->p)) {
+            long c = (long)col(P);
+            if (is_seq(P)) { open_seq(P, G_BSEQ, c, false); return; }
+            if (is_map(P)) { open_map(P, G_BMAP, c, false); return; }
+            v = line_node(P, m);
+        } else {
+            P->p = k0;
+            eol(P);
+            gap(P);
+            v = node_at(P, m);
+        }
+        if (v == PUSHED) return;
+        value_done(P, f, v);
+    } while (go_on(P));
+}
+
+static void fseq_step(parser *P, gframe *f) {
+    do {
+        if (f->at_ == A_AFTER) {
+            flow_next(P, f, ']');
+            f->at_ = A_ENTRY;
+            continue;
+        }
+        if (peek(P, 0) == ']') {
+            P->p++;
+            close_coll(P);
+            return;
+        }
+        if (eof(P)) fail(P, f->at, "this [ is never closed");
+        const char *j = P->p;
+        f->at_ = A_AFTER;
+        if (P->end - j > 3 && memcmp(j, "-<<", 3) == 0 && (j[3] == ' ' || j[3] == '\t' || is_brk(P, j + 3))) {
+            P->p += 3;
+            fs(P);
+            if (peek(P, 0) == '*') {
+                uint32_t src = ref(P, true);
+                splice(P, &f->c, src, j);
+                continue;
+            }
+            P->p = j;
+        }
+        uint32_t v = fnode(P);
+        if (v == PUSHED) return;
+        value_done(P, f, v);
+    } while (go_on(P));
+}
+
+static void fmap_step(parser *P, gframe *f) {
+    do {
+        if (f->at_ == A_AFTER) {
+            flow_next(P, f, '}');
+            f->at_ = A_ENTRY;
+            continue;
+        }
+        if (f->at_ == A_VALUE) {
+            int d = peek(P, 0);
+            f->at_ = A_AFTER;
+            uint32_t v = (d == ',' || d == '}') ? put_empty(P) : fnode(P);
+            if (v == PUSHED) return;
+            value_done(P, f, v);
+            continue;
+        }
+        if (peek(P, 0) == '}') {
+            P->p++;
+            close_coll(P);
+            return;
+        }
+        if (eof(P)) fail(P, f->at, "this { is never closed");
         if (starts_merge(P, true)) {
             const char *mp = P->p;
-            if (c.started) fail(P, mp, "<<: comes before the mapping's other keys");
+            if (f->c.started) fail(P, mp, "<<: comes before the mapping's other keys");
             P->p += 3;
             fs(P);
             uint32_t src = ref(P, true);
-            map_merge(P, &c, src, mp);
-        } else {
-            bool q;
-            uint32_t k = flow_key(P, &q);
-            uint32_t r = map_key(P, &c, k);
-            fs(P);
-            int d = peek(P, 0);
-            map_value(P, &c, r, (d == ',' || d == '}') ? empty_str(P) : fnode(P));
+            map_merge(P, &f->c, src, mp);
+            f->at_ = A_AFTER;
+            continue;
         }
+        uint32_t k;
+        scal s = flow_key(P, &k);
+        f->r = map_key(P, &f->c, &s, k);
         fs(P);
-        if (peek(P, 0) == ',') { P->p++; fs(P); }
-        else if (peek(P, 0) != '}') {
-            if (eof(P)) fail(P, at, "this { is never closed");
-            fail(P, P->p, "expected , or } here");
-        }
-    }
-    P->p++;
-    return map_close(P, &c);
-}
-
-static uint32_t flow(parser *P) {
-    return peek(P, 0) == '[' ? flow_seq(P) : flow_map(P);
+        if (!P->building) emit_str(P, &s);
+        f->at_ = A_VALUE;
+    } while (go_on(P));
 }
 
 /* ── The table (section 8.1) ─────────────────────────────── */
@@ -1468,51 +1744,64 @@ static void entry_set(parser *P, uint32_t k, uint32_t v, uint32_t e) {
     ix_insert(P, &P->tix, ROOT, k, P->nentries++, key_hash(P, ROOT, kn->data, kn->len));
 }
 
-static void table_flow(parser *P) {
-    const char *at = P->p;
-    P->p++;
-    fs(P);
-    while (peek(P, 0) != '}') {
-        if (eof(P)) fail(P, at, "this { is never closed");
-        if (P->end - P->p >= 3 && memcmp(P->p, "<<:", 3) == 0)
-            fail(P, P->p, "<<: belongs inside an entry, not at the top of the table");
-        bool q;
-        const char *ks = P->p;
-        P->defer = true;
-        uint32_t k = flow_key(P, &q);
-        uint32_t e = entry_key(P, k);
-        P->defer = false;
-        check(P, ks);
-        fs(P);
-        int d = peek(P, 0);
-        entry_set(P, k, (d == ',' || d == '}') ? empty_str(P) : fnode(P), e);
-        fs(P);
-        if (peek(P, 0) == ',') { P->p++; fs(P); }
-        else if (peek(P, 0) != '}') {
-            if (eof(P)) fail(P, at, "this { is never closed");
-            fail(P, P->p, "expected , or } here");
-        }
+
+static void tmap_step(parser *P, gframe *f) {
+    if (f->at_ == A_VALUE) {
+        f->at_ = A_ENTRY;
+        uint32_t v = value(P, 0, true);
+        if (v != PUSHED) value_done(P, f, v);
+        return;
     }
-    P->p++;
+    gap(P);
+    int c = peek(P, 0);
+    if (eof(P) || marker(P) || dots(P) || c == '%') {
+        P->ng--;
+        return;
+    }
+    if (c == ' ') fail(P, P->p, "the table's entries start at column 0");
+    if (P->end - P->p >= 3 && memcmp(P->p, "<<:", 3) == 0)
+        fail(P, P->p, "<<: belongs inside an entry, not at the top of the table");
+    const char *ks = P->p;
+    P->defer = true;
+    key(P, &f->k);
+    colon(P);
+    f->e = entry_key(P, f->k);
+    P->defer = false;
+    check(P, ks);
+    f->at_ = A_VALUE;
 }
 
-static void table_map(parser *P) {
-    for (;;) {
-        gap(P);
-        int c = peek(P, 0);
-        if (eof(P) || marker(P) || dots(P) || c == '%') break;
-        if (c == ' ') fail(P, P->p, "the table's entries start at column 0");
-        if (P->end - P->p >= 3 && memcmp(P->p, "<<:", 3) == 0)
-            fail(P, P->p, "<<: belongs inside an entry, not at the top of the table");
-        const char *ks = P->p;
-        P->defer = true;
-        uint32_t k = key(P);
-        colon(P);
-        uint32_t e = entry_key(P, k);
-        P->defer = false;
-        check(P, ks);
-        entry_set(P, k, value(P, 0, true), e);
+static void tflow_step(parser *P, gframe *f) {
+    if (f->at_ == A_AFTER) {
+        flow_next(P, f, '}');
+        f->at_ = A_ENTRY;
+        return;
     }
+    if (f->at_ == A_VALUE) {
+        int d = peek(P, 0);
+        f->at_ = A_AFTER;
+        uint32_t v = (d == ',' || d == '}') ? put_empty(P) : fnode(P);
+        if (v != PUSHED) value_done(P, f, v);
+        return;
+    }
+    if (peek(P, 0) == '}') {
+        P->p++;
+        P->ng--;
+        eol(P);
+        gap(P);
+        return;
+    }
+    if (eof(P)) fail(P, f->at, "this { is never closed");
+    if (P->end - P->p >= 3 && memcmp(P->p, "<<:", 3) == 0)
+        fail(P, P->p, "<<: belongs inside an entry, not at the top of the table");
+    const char *ks = P->p;
+    P->defer = true;
+    flow_key(P, &f->k);
+    f->e = entry_key(P, f->k);
+    P->defer = false;
+    check(P, ks);
+    fs(P);
+    f->at_ = A_VALUE;
 }
 
 /* ── Streams (section 4) ─────────────────────────────────── */
@@ -1524,6 +1813,7 @@ static void reset_table(parser *P) {
     P->nentries = 0;
     ix_clear(&P->tix);
     P->t_held = P->t_full = 0;
+    oylng_arena_reset(P->strings);
 }
 
 static void discard_doc(parser *P) {
@@ -1533,6 +1823,36 @@ static void discard_doc(parser *P) {
     P->nscratch = P->nlix = 0;
     P->d_held = P->d_full = 0;
     P->name = (oylng_str){ NULL, 0 };
+}
+
+static void doc_step(parser *P, gframe *f) {
+    if (f->at_ == A_ENTRY) {
+        bool inl = f->inline_root;
+        f->at_ = A_AFTER;
+        uint32_t v = inl ? line_node(P, 0) : node_at(P, -1);
+        if (v != PUSHED) value_done(P, f, v);
+        return;
+    }
+    emit(P, OYLNG_EVT_DOC_END, NULL, 0, pos(P, P->p));
+    P->ng--;
+    release_later(P, P->doc_mark);
+    P->qstop = true;   /* a ... next lets the table's strings go */
+    discard_doc(P);
+    P->state = ST_BETWEEN;
+}
+
+/* Moves the grammar on: until an event, while delivering */
+static void advance(parser *P) {
+    gframe *f = gtop(P);
+    switch (f->kind) {
+    case G_BMAP:  bmap_step(P, f); break;
+    case G_BSEQ:  bseq_step(P, f); break;
+    case G_FSEQ:  fseq_step(P, f); break;
+    case G_FMAP:  fmap_step(P, f); break;
+    case G_TMAP:  tmap_step(P, f); break;
+    case G_TFLOW: tflow_step(P, f); break;
+    default:      doc_step(P, f); break;
+    }
 }
 
 /* The length of a name character at q, or 0 (sections 4.3, 12) */
@@ -1555,38 +1875,36 @@ static size_t name_char(const parser *P, const char *q) {
     return ok ? n : 0;
 }
 
-/* After a marker: a document, true, or a table, false */
+/* After a marker: reads a table whole, false, or starts a document,
+ * delivering its start, true */
 static bool document(parser *P) {
     P->p += 3;
     const char *j = P->p;
     size_t n = spaces(P);
     P->in_table = false;
     if (n && peek(P, 0) == '&') {
-        P->in_table = true;
+        P->in_table = P->building = true;
         P->tdoc++;
         P->p++;
         const char *k = P->p;
-        if (spaces(P) && peek(P, 0) == '{') {
-            table_flow(P);
-            eol(P);
-            gap(P);
-        } else {
+        bool flow = spaces(P) && peek(P, 0) == '{';
+        if (!flow) {
             P->p = k;
             if (!sep_at(P, P->p)) fail(P, P->p, "--- & is followed by a space, a tab or the end of the line");
             eol(P);
             gap(P);
             k = P->p;
             spaces(P);
-            if (peek(P, 0) == '{') {
-                table_flow(P);
-                eol(P);
-                gap(P);
-            } else {
-                P->p = k;
-                table_map(P);
-            }
+            flow = peek(P, 0) == '{';
+            if (!flow) P->p = k;
         }
-        P->in_table = false;
+        if (flow) {
+            gpush(P, G_TFLOW, 0, P->p, false);
+            P->p++;
+            fs(P);
+        } else gpush(P, G_TMAP, 0, P->p, false);
+        while (P->ng) advance(P);
+        P->in_table = P->building = false;
         P->table_end = P->n;
         P->pairs_table_end = P->npairs;
         P->plans_table_end = P->nplans;
@@ -1607,18 +1925,18 @@ static bool document(parser *P) {
             fail(P, P->p, "a document name is letters, digits and . _ - /");
         }
     }
-    uint32_t root;
-    if (n && peek(P, 0) != '#' && !at_eol(P, P->p)) root = line_node(P, 0);
-    else {
+    bool inl = n && peek(P, 0) != '#' && !at_eol(P, P->p);
+    if (!inl) {
         P->p = j;
         eol(P);
         gap(P);
-        root = node_at(P, -1);
     }
-    if (P->nodes[root].lev > P->max_levels)
-        fail_limit(P, P->in + P->nodes[root].pos, "with references followed, this document goes more than %u levels deep",
-                   P->max_levels);
-    P->root = root;
+    /* the start is where the document's value is written */
+    const char *at = P->p;
+    if (!inl && !eof(P) && !marker(P) && !dots(P)) at += indent_here(P);
+    P->doc_mark = oylng_arena_get_mark(P->strings);
+    gpush(P, G_DOC, -1, at, false)->inline_root = inl;
+    emit(P, OYLNG_EVT_DOC_START, P->name.data, P->name.len, pos(P, at));
     return true;
 }
 
@@ -1637,7 +1955,8 @@ static void stream_start(parser *P) {
     gap(P);
 }
 
-/* Reads up to the next document to deliver: true, or false at the end */
+/* Reads up to the next document to deliver, delivering its start: true,
+ * or false at the end */
 static bool next_document(parser *P) {
     for (;;) {
         gap(P);
@@ -1679,36 +1998,18 @@ static bool next_document(parser *P) {
     }
 }
 
-/* ── Delivering events ───────────────────────────────────── */
+/* ── Delivering nodes ────────────────────────────────────────
+ * A reference, a -<< and a merged mapping are delivered by walking nodes:
+ * the table's, or a mapping's just built. The walk's frames are the
+ * stack, and the grammar waits until it is empty. */
 
-static void emit(parser *P, oylng_event_type t, const char *data, size_t len, size_t pos) {
-    P->evt.type = t;
-    P->evt.value.data = data;
-    P->evt.value.len = len;
-    P->evt.offset = pos;
-}
-
-/* The walk runs without setjmp, so its one failure, the stack not
- * growing, sets the error here and the walk stops on it */
 static void push(parser *P, uint8_t mode, uint32_t cur, uint32_t end, uint8_t close) {
     frame *top = P->sp ? &P->stack[P->sp - 1] : NULL;
     if (top && top->close == OYLNG_EVT_NONE && top->mode == W_NODES && top->cur == top->end) {
         *top = (frame){ mode, close, 0, cur, end };   /* a spent splice: reuse it */
         return;
     }
-    if (P->sp >= P->capstack) {
-        uint64_t nc = P->capstack ? (uint64_t)P->capstack * 2 : 64;
-        frame *ns = nc <= UINT32_MAX ? realloc(P->stack, (size_t)nc * sizeof *ns) : NULL;
-        if (!ns) {
-            P->status = OYLNG_ERR_MEMORY;
-            P->errmark = mark_of(P, P->p);
-            snprintf(P->errmsg, sizeof P->errmsg, "out of memory");
-            P->state = ST_ERROR;
-            return;
-        }
-        P->stack = ns;
-        P->capstack = (uint32_t)nc;
-    }
+    if (P->sp >= P->capstack) P->stack = grow(P, P->stack, &P->capstack, P->sp + 1, sizeof *P->stack);
     P->stack[P->sp++] = (frame){ mode, close, 0, cur, end };
 }
 
@@ -1741,31 +2042,22 @@ static bool handle(parser *P, uint32_t i) {
     }
 }
 
-static void walk(parser *P) {
-    if (P->root_pending) {
-        P->root_pending = false;
-        if (handle(P, P->root)) return;
-    }
-    for (;;) {
-        if (P->state == ST_ERROR) return;
-        if (!P->sp) {
-            emit(P, OYLNG_EVT_DOC_END, NULL, 0, (size_t)(P->p - P->in));
-            P->state = ST_BETWEEN;
-            return;
-        }
+/* The walk's next event: false once it has none */
+static bool walk(parser *P) {
+    while (P->sp) {
         frame *f = &P->stack[P->sp - 1];
         if (f->mode == W_PLAN && f->want_val) {
             f->want_val = 0;
             uint32_t v = P->pairs[f->cur++].val;
-            if (handle(P, v)) return;
+            if (handle(P, v)) return true;
             continue;
         }
         if (f->cur == f->end) {
             uint8_t c = f->close;
             P->sp--;
             if (c != OYLNG_EVT_NONE) {
-                emit(P, (oylng_event_type)c, NULL, 0, (size_t)(P->p - P->in));
-                return;
+                emit(P, (oylng_event_type)c, NULL, 0, pos(P, P->p));
+                return true;
             }
             continue;
         }
@@ -1773,12 +2065,23 @@ static void walk(parser *P) {
             const node *k = &P->nodes[P->pairs[f->cur].key];
             f->want_val = 1;
             emit(P, OYLNG_EVT_SCALAR, k->data, k->len, k->pos);
-            return;
+            return true;
         }
         uint32_t i = f->cur;
         f->cur = subtree_end(P, i);
-        if (handle(P, i)) return;
+        if (handle(P, i)) return true;
     }
+    return false;
+}
+
+/* A merged mapping built in a document has been delivered: its nodes and
+ * text go */
+static void release_build(parser *P) {
+    P->release_pending = false;
+    P->n = P->b_n;
+    P->npairs = P->b_pairs;
+    P->nplans = P->b_plans;
+    oylng_arena_release(P->strings, P->b_mark);
 }
 
 /* ── Public API ──────────────────────────────────────────── */
@@ -1788,7 +2091,13 @@ oylng_parser *oylng_parser_new(const char *input, size_t len) {
     parser *P = calloc(1, sizeof *P);
     if (!P) return NULL;
     P->strings = oylng_arena_new(4096);
-    if (!P->strings) { free(P); return NULL; }
+    P->vals = oylng_arena_new(4096);
+    if (!P->strings || !P->vals) {
+        oylng_arena_free(P->strings);
+        oylng_arena_free(P->vals);
+        free(P);
+        return NULL;
+    }
     if (!input) input = empty_text;
     P->in = P->p = input;
     P->end = input + len;
@@ -1809,43 +2118,64 @@ void oylng_parser_set_levels(oylng_parser *P, unsigned levels) {
     P->max_levels = levels;
 }
 
+/* Makes the next events: at least one, at most QN, stopping before
+ * anything they may point to is let go */
+static void fill(parser *P) {
+    oylng_arena_reset(P->vals);
+    if (P->rel_pending) {
+        P->rel_pending = false;
+        oylng_arena_release(P->strings, P->rel_mark);
+    }
+    do {
+        if (P->sp) {
+            walk(P);
+            continue;
+        }
+        if (P->release_pending) {
+            if (P->qn) break;
+            release_build(P);
+        }
+        switch (P->state) {
+        case ST_DOC:
+            advance(P);
+            break;
+        case ST_START:
+            stream_start(P);
+            emit(P, OYLNG_EVT_STREAM_START, NULL, 0, 0);
+            P->state = ST_BETWEEN;
+            break;
+        case ST_BETWEEN:
+            if (next_document(P)) P->state = ST_DOC;
+            else {
+                emit(P, OYLNG_EVT_STREAM_END, NULL, 0, pos(P, P->p));
+                P->state = ST_DONE;
+                P->qstop = true;
+            }
+            break;
+        default:
+            emit(P, OYLNG_EVT_STREAM_END, NULL, 0, pos(P, P->p));
+            P->qstop = true;
+            break;
+        }
+    } while (P->qn < QN && !P->qstop);
+}
+
 oylng_status oylng_parse_next(oylng_parser *P, const oylng_event **evt) {
     if (!P || !evt) return OYLNG_ERR_INPUT;
-    *evt = NULL;
-    if (P->state == ST_ERROR) return P->status;
-    if (P->state == ST_WALK) {
-        walk(P);
-        if (P->state == ST_ERROR) return P->status;
-        *evt = &P->evt;
+    if (P->qi < P->qn) {
+        *evt = &P->q[P->qi++];
         return OYLNG_OK;
     }
+    *evt = NULL;
+    if (P->state == ST_ERROR) return P->status;
+    P->qn = P->qi = 0;
+    P->qstop = false;
+    /* an error hands out the events made before it first */
     if (setjmp(P->jb)) {
         P->state = ST_ERROR;
-        return P->status;
-    }
-    switch (P->state) {
-    case ST_START:
-        stream_start(P);
-        emit(P, OYLNG_EVT_STREAM_START, NULL, 0, 0);
-        P->state = ST_BETWEEN;
-        break;
-    case ST_BETWEEN:
-        if (next_document(P)) {
-            emit(P, OYLNG_EVT_DOC_START, P->name.data, P->name.len,
-                 P->nodes[P->root].pos);
-            P->root_pending = true;
-            P->sp = 0;
-            P->state = ST_WALK;
-        } else {
-            emit(P, OYLNG_EVT_STREAM_END, NULL, 0, (size_t)(P->p - P->in));
-            P->state = ST_DONE;
-        }
-        break;
-    default:
-        emit(P, OYLNG_EVT_STREAM_END, NULL, 0, (size_t)(P->p - P->in));
-        break;
-    }
-    *evt = &P->evt;
+        if (!P->qn) return P->status;
+    } else fill(P);
+    *evt = &P->q[P->qi++];
     return OYLNG_OK;
 }
 
@@ -1875,7 +2205,9 @@ void oylng_parser_free(oylng_parser *P) {
     free(P->tix.s);
     free(P->lix);
     free(P->stack);
+    free(P->g);
     oylng_arena_free(P->strings);
+    oylng_arena_free(P->vals);
     free(P);
 }
 

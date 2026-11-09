@@ -38,8 +38,10 @@ extern "C" {
 #define OYLNG_VERSION_MINOR 1
 #define OYLNG_VERSION_PATCH 0
 
-/** A UTF-8 string, not NUL-terminated. It points into the input or into
- *  memory the parser owns, and stays valid until the parser is freed. */
+/** A UTF-8 string, not NUL-terminated. It points into the input, and
+ *  lasts as long as the input does, or, for a value the parser had to
+ *  build from escapes or lines, into memory the parser owns, valid until
+ *  the next oylng_parse_next. */
 typedef struct {
     const char *data;
     size_t      len;
@@ -110,8 +112,9 @@ OYLNG_API void oylng_parser_set_limit(oylng_parser *p, uint64_t limit);
 OYLNG_API void oylng_parser_set_levels(oylng_parser *p, unsigned levels);
 
 /** The next event. On OYLNG_OK, *evt points to an event the parser owns,
- *  valid until the next call. A document is checked whole before its
- *  first event, so a document in error is never delivered in part. After
+ *  valid until the next call. A document is delivered as it is read, so
+ *  one in error may already have delivered events, but the error comes
+ *  before its DOC_END (section 2): drop what it delivered. After
  *  STREAM_END, further calls give STREAM_END again. */
 OYLNG_API oylng_status oylng_parse_next(oylng_parser *p, const oylng_event **evt);
 

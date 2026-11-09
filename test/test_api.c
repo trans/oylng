@@ -122,6 +122,23 @@ static void test_levels(void) {
     sprintf(deep, "%s---\ny: [*e255]\n", s);
     CHECK(parse(deep, 0, NULL) == OYLNG_ERR_LIMIT, "257 levels through references");
     free(deep);
+
+    /* a -<< puts the items, not the sequence, at its place, and a <<: the
+       values: [-<< *s] with s: [x] is one level, and {<<: *m} with m: {a: [x]}
+       is two */
+    const char *table[] = { "s: [x]", "m: {a: [x]}" };
+    const char *inner[] = { "[-<< *s]", "{<<: *m}" };
+    int below[] = { 255, 254 };
+    for (int t = 0; t < 2; t++)
+        for (int extra = 0; extra < 2; extra++) {
+            n = (size_t)sprintf(s, "%%YAML 2.0\n--- &\n%s\n---\n", table[t]);
+            for (int i = 0; i < below[t] + extra; i++) s[n++] = '[';
+            n += (size_t)sprintf(s + n, "%s", inner[t]);
+            for (int i = 0; i < below[t] + extra; i++) s[n++] = ']';
+            s[n++] = '\n'; s[n] = 0;
+            oylng_status st = parse(s, 0, NULL);
+            CHECK(st == (extra ? OYLNG_ERR_LIMIT : OYLNG_OK), "%s at %d levels: %d", inner[t], 256 + extra, st);
+        }
     free(s);
 }
 
@@ -155,12 +172,14 @@ static void test_api_edges(void) {
     CHECK(read_all(p, NULL) == OYLNG_ERR_PARSE, "an empty input isn't a stream");
     oylng_parser_free(p);
 
-    /* a document is checked whole before its first event */
+    /* a document is delivered as it is read, and one in error stops
+       before its end (section 2) */
     const char *bad = "%YAML 2.0\n---\na: 1\n---\nb: 1\nb: 2\n";
     p = oylng_parser_new(bad, strlen(bad));
     int n = 0;
     oylng_status st = read_all(p, &n);
-    CHECK(st == OYLNG_ERR_PARSE && n == 7, "events before the bad document: %d", n);   /* +STR +DOC +MAP a 1 -MAP -DOC */
+    /* +STR +DOC +MAP a 1 -MAP -DOC, then +DOC +MAP b 1 */
+    CHECK(st == OYLNG_ERR_PARSE && n == 11, "events before the error: %d", n);
     oylng_parser_free(p);
 }
 
@@ -275,6 +294,42 @@ static void test_big_maps(void) {
     }
 }
 
+/* What streaming holds: merged mappings until they close, keys until
+ * theirs does, and nothing of a delivered value past the next call */
+static void test_stream(void) {
+    const char *t = "%YAML 2.0\n--- &\nb: {x: 1, y: 2}\nm: {<<: *b, y: 3}\ne: []\n---\n";
+    char s[4096];
+    /* a merged mapping among others, with a mapping, a reference and a
+       built value inside, then more */
+    sprintf(s, "%s- a\n- <<: *b\n  y: 'it''s'\n  z: {p: *m}\n- {<<: *m, w: \"t\\u0041\"}\n- c\n", t);
+    CHECK(!strcmp(brief(s), "[ a { x 1 y it's z { p { x 1 y 3 } } } { x 1 y 3 w tA } c ]"),
+          "merged among others: %s", brief(s));
+    /* one inside another, and the root */
+    sprintf(s, "%s<<: *m\nn:\n  <<: *b\n  k: [-<< *e, q]\n", t);
+    CHECK(!strcmp(brief(s), "{ x 1 y 3 n { x 1 y 2 k [ q ] } }"), "nested merges: %s", brief(s));
+    sprintf(s, "%s--- {<<: *b, x: 0}\n", t);
+    CHECK(!strcmp(brief(s), "{ x 0 y 2 }"), "a flow root: %s", brief(s));
+    sprintf(s, "%s[-<< *e, -<< *e]\n", t);
+    CHECK(!strcmp(brief(s), "[ ]"), "empty splices: %s", brief(s));
+
+    /* built keys are kept while values come and go: a repeat of the
+       first, after values built from lines */
+    size_t n = (size_t)sprintf(s, "%%YAML 2.0\n---\n\"k\\u0041\": 1\n");
+    for (int i = 0; i < 40; i++) n += (size_t)sprintf(s + n, "\"v%d\\t\": |\n  line %d\n", i, i);
+    sprintf(s + n, "kA: 2\n");
+    CHECK(!strcmp(brief(s), "ERR 84:1"), "a built key's repeat: %s", brief(s));
+
+    /* a built value lasts until the next call */
+    const char *v = "%YAML 2.0\n---\n- \"a\\tb\"\n- \"c\\td\"\n";
+    oylng_parser *p = oylng_parser_new(v, strlen(v));
+    const oylng_event *e;
+    for (int i = 0; i < 4; i++) oylng_parse_next(p, &e);
+    CHECK(e->type == OYLNG_EVT_SCALAR && e->value.len == 3 && !memcmp(e->value.data, "a\tb", 3), "first value");
+    oylng_parse_next(p, &e);
+    CHECK(e->type == OYLNG_EVT_SCALAR && e->value.len == 3 && !memcmp(e->value.data, "c\td", 3), "second value");
+    oylng_parser_free(p);
+}
+
 int main(void) {
     test_error_marks();
     test_stop();
@@ -282,6 +337,7 @@ int main(void) {
     test_levels();
     test_api_edges();
     test_big_maps();
+    test_stream();
     printf("api: %d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }

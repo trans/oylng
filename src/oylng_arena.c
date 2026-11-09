@@ -1,8 +1,9 @@
 /*
  * oylng_arena.c — Bump allocator with block chaining (from Oyl's oyl_arena.c)
  *
- * All allocations during a parse go through here.
- * One free at the end. No per-object bookkeeping.
+ * No per-object bookkeeping. A mark taken at any point can be released
+ * later, freeing everything allocated after it, so marks are released in
+ * the reverse of the order they are taken.
  */
 
 #include "oylng_internal.h"
@@ -22,8 +23,9 @@ typedef struct oylng_block {
 #define BLOCK_DATA(b) ((char *)(b) + sizeof(oylng_block))
 
 struct oylng_arena {
-    oylng_block *head;     /* current block (allocates from here) */
-    oylng_block *blocks;   /* all blocks (for freeing) */
+    oylng_block *head;     /* the newest block, which allocates; next leads to older ones */
+    oylng_block *first;    /* the oldest, which is never released */
+    oylng_block *spare;    /* a released block, kept for the next one needed */
     size_t     default_cap;
 };
 
@@ -50,7 +52,8 @@ oylng_arena *oylng_arena_new(size_t initial_cap) {
     a->head = block_new(initial_cap);
     if (!a->head) { free(a); return NULL; }
 
-    a->blocks      = a->head;
+    a->first       = a->head;
+    a->spare       = NULL;
     a->default_cap = initial_cap;
     return a;
 }
@@ -84,12 +87,15 @@ void *oylng_arena_alloc(oylng_arena *a, size_t size, size_t align) {
         if (b->cap <= SIZE_MAX / 2 && cap < b->cap * 2) cap = b->cap * 2;
         if (ARENA_EACH) cap = size + align;
 
-        oylng_block *nb = block_new(cap);
-        if (!nb) return NULL;
+        oylng_block *nb;
+        if (!ARENA_EACH && a->spare && a->spare->cap >= size + align) {
+            nb = a->spare;
+            a->spare = NULL;
+            nb->used = 0;
+        } else if (!(nb = block_new(cap))) return NULL;
 
-        nb->next  = a->blocks;
-        a->blocks = nb;
-        a->head   = nb;
+        nb->next = a->head;
+        a->head  = nb;
         b = nb;
         aligned = aligned_offset(b, 0, align);
     }
@@ -99,13 +105,35 @@ void *oylng_arena_alloc(oylng_arena *a, size_t size, size_t align) {
     return ptr;
 }
 
+oylng_arena_mark oylng_arena_get_mark(const oylng_arena *a) {
+    return (oylng_arena_mark){ a->head, a->head->used };
+}
+
+/* Frees what was allocated after m, keeping the biggest block let go as
+ * the spare */
+void oylng_arena_release(oylng_arena *a, oylng_arena_mark m) {
+    while (a->head != m.block) {
+        oylng_block *b = a->head;
+        a->head = b->next;
+        if (!a->spare || b->cap > a->spare->cap) { free(a->spare); a->spare = b; }
+        else free(b);
+    }
+    a->head->used = m.used;
+}
+
+void oylng_arena_reset(oylng_arena *a) {
+    if (a->head != a->first || a->first->used)
+        oylng_arena_release(a, (oylng_arena_mark){ a->first, 0 });
+}
+
 void oylng_arena_free(oylng_arena *a) {
     if (!a) return;
-    oylng_block *b = a->blocks;
+    oylng_block *b = a->head;
     while (b) {
         oylng_block *next = b->next;
         free(b);
         b = next;
     }
+    free(a->spare);
     free(a);
 }

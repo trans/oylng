@@ -15,14 +15,17 @@ references, merges (`<<:`) and splices (`-<<`) are resolved, and the table
 itself, the directives and the comments are not delivered. Every value is a
 string. The parser:
 
+- delivers a document as it reads it. What it holds is the table, the keys
+  of each open mapping, and a mapping with `<<:` lines until it closes,
+  since a key written after them can still replace a merged one;
 - refuses repeated keys, in time linear in the input;
 - applies the size limit of section 10, 64 MiB by default, to both held and
-  full sizes;
+  full sizes. A larger document needs the limit raised;
 - goes to 256 levels, with references followed, or up to 4096 if set;
-- checks a document whole before its first event, so a document in error is
-  never delivered in part;
 - stops at `...` and says where the rest of the input starts;
-- reports errors with a line, a column and a message.
+- reports errors with a line, a column and a message. A document in error
+  may already have delivered events, but the error comes before its end,
+  so a caller drops what that document gave.
 
 ## Using it
 
@@ -42,7 +45,9 @@ oylng_parser_free(p);
 ```
 
 Scalars point into the input where they can, so the input must stay valid
-until the parser is freed. `include/oylng/oylng.h` documents the rest.
+until the parser is freed. A value built from escapes or lines is valid
+until the next `oylng_parse_next`, so copy it to keep it.
+`include/oylng/oylng.h` documents the rest.
 
 The `oylng` tool prints a stream's events, or the stream as JSON:
 

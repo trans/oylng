@@ -11,13 +11,22 @@
 #include <stdbool.h>
 
 /* ── Arena (oylng_arena.c, from Oyl's oyl_arena.c) ──────────
- * A bump allocator: one free at the end, no per-object bookkeeping. */
+ * A bump allocator with no per-object bookkeeping. A mark releases
+ * everything allocated after it; marks are released last taken first. */
 
 typedef struct oylng_arena oylng_arena;
 
-oylng_arena *oylng_arena_new(size_t initial_cap);
-void        *oylng_arena_alloc(oylng_arena *a, size_t size, size_t align);
-void         oylng_arena_free(oylng_arena *a);
+typedef struct {
+    void  *block;
+    size_t used;
+} oylng_arena_mark;
+
+oylng_arena     *oylng_arena_new(size_t initial_cap);
+void            *oylng_arena_alloc(oylng_arena *a, size_t size, size_t align);
+oylng_arena_mark oylng_arena_get_mark(const oylng_arena *a);
+void             oylng_arena_release(oylng_arena *a, oylng_arena_mark m);
+void             oylng_arena_reset(oylng_arena *a);   /* releases everything */
+void             oylng_arena_free(oylng_arena *a);
 
 /* ── Hashing (oylng_hash.c, from Oyl's oyl_hash.c) ─────────
  * The key index hashes with SipHash-1-3, the variant Python's and Rust's
