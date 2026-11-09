@@ -62,11 +62,10 @@ build/oylng --json --limit 1000000 file.yaml
 
 - `make test` runs the API tests and the YAML 2.0 test suite. The suite is
   read from `../yaml2/suite` (set `SUITE=` for another place) and converted
-  with the suite's `bin/suite-to-data`, which needs PyYAML. It currently
-  lives in trans/yaml2's working copy, not yet committed there. Then
+  with the suite's `bin/suite-to-data`, which needs PyYAML. Then
   `make test-plain` runs both again, built without SIMD and without the
-  fast paths for flow collections on one line and simple block mapping
-  lines, so the code those stand in for stays tested.
+  fast paths for flow collections on one line and simple block lines, so
+  the code those stand in for stays tested.
 - `make test-asan` runs both again with AddressSanitizer and UBSan.
 - `make test-diff` reads generated and mutated streams with this parser and
   with the draft's reference checker, and reports any stream they disagree

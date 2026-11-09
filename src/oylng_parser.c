@@ -1115,7 +1115,7 @@ static uint32_t plainref(parser *P, bool flow) {
 /* ── Mappings, with merges (sections 7.1, 7.4, 9.1) ──────── */
 
 static inline bool same(const char *a, size_t al, const char *b, size_t bl) {
-    return al == bl && (al == 0 || memcmp(a, b, al) == 0);
+    return al == bl && (al == 0 || (a[0] == b[0] && memcmp(a + 1, b + 1, al - 1) == 0));
 }
 
 /* The open mapping's pair whose key is k, as its place from s0, or NONE;
@@ -1788,13 +1788,61 @@ static inline const char *fb_eol(const char *q, const char *e) {
     return NULL;
 }
 
+/* A one-line value at q the fast paths take, plain or quoted with no
+ * escapes, then perhaps a comment: true, with the value in *vs and the
+ * next line's start in *nl */
+static bool fb_value(const char *q, const char *e, scal *vs, const char **nl) {
+    if (q >= e) return false;
+    const char *v = q, *vz, *d = q;
+    int style = S_PLAIN;
+    if (*q == '"' || *q == '\'') {
+        char t = *q++;
+        d = q;
+        q += oylng_ascii_run(q, (size_t)(e - q), t, t == '"' ? '\\' : t);
+        if (q >= e || *q != t || (t == '\'' && q + 1 < e && q[1] == '\'')) return false;
+        vz = q++;
+        style = t == '"' ? S_DOUBLE : S_SINGLE;
+    } else {
+        if (!fb_value_start(q, e)) return false;
+        vz = ++q;
+        for (;;) {
+            while (q < e && in_run((unsigned char)*q, plain_run_lo, plain_run_hi)) q++;
+            if (q > vz && q[-1] != ' ') vz = q;
+            if (q >= e) break;
+            if (*q == ' ') { q++; continue; }
+            if (*q == ':' && q + 1 < e && in_run((unsigned char)q[1], plain_run_lo, plain_run_hi)) {
+                vz = ++q;
+                continue;
+            }
+            if (*q == '#' && q[-1] != ' ') { vz = ++q; continue; }
+            break;
+        }
+    }
+    q = vz + (style != S_PLAIN);
+    while (q < e && *q == ' ') q++;
+    if (!(*nl = fb_eol(q, e))) return false;   /* a # right after a quote isn't a comment's */
+    *vs = (scal){ d, (size_t)(vz - d), v, style };
+    return true;
+}
+
+/* A key the fast path read, its : at cz: counted, checked and delivered */
+static void fb_key(parser *P, gframe *f, const scal *ks, const char *cz) {
+    P->p = cz;
+    put_str(P, ks);
+    f->r = map_key(P, &f->c, ks, NONE);
+    emit_str(P, ks);
+}
+
+enum { FB_NONE, FB_LINES, FB_OPENED };
+
 /* At a block mapping's key, after its indent: reads lines while they fit,
- * and the next is at the mapping's indent; true if it read any, leaving
- * the mapping after the last */
-static bool block_fast(parser *P, gframe *f) {
-    if (!FAST_PATHS || P->building || P->defer) return false;
+ * and the next is at the mapping's indent, leaving the mapping after the
+ * last: FB_LINES if it read any. A key with a block collection on the
+ * next line opens it, FB_OPENED. */
+static int block_fast(parser *P, gframe *f) {
+    if (!FAST_PATHS || P->building || P->defer) return FB_NONE;
     const char *q = P->p, *e = P->end;
-    bool any = false;
+    int r = FB_NONE;
     for (;;) {
         const char *k = q;
         if (q >= e || !fb_key_start(q, e)) break;
@@ -1802,55 +1850,39 @@ static bool block_fast(parser *P, gframe *f) {
         while (q < e && ff_plain((unsigned char)*q)) q++;
         const char *kz = q;
         while (q < e && *q == ' ') q++;
-        if (e - q < 2 || q[0] != ':' || q[1] != ' ') break;
+        if (q >= e || *q != ':') break;
         const char *cz = ++q;
         while (q < e && *q == ' ') q++;
-        if (q >= e) break;
-        const char *v = q, *vz, *d = q;
-        int style = S_PLAIN;
-        if (*q == '"' || *q == '\'') {
-            char t = *q++;
-            d = q;
-            q += oylng_ascii_run(q, (size_t)(e - q), t, t == '"' ? '\\' : t);
-            if (q >= e || *q != t || (t == '\'' && q + 1 < e && q[1] == '\'')) break;
-            vz = q++;
-            style = t == '"' ? S_DOUBLE : S_SINGLE;
-        } else {
-            if (!fb_value_start(q, e)) break;
-            vz = ++q;
-            for (;;) {
-                while (q < e && in_run((unsigned char)*q, plain_run_lo, plain_run_hi)) q++;
-                if (q > vz && q[-1] != ' ') vz = q;
-                if (q >= e) break;
-                if (*q == ' ') { q++; continue; }
-                if (*q == ':' && q + 1 < e && in_run((unsigned char)q[1], plain_run_lo, plain_run_hi)) {
-                    vz = ++q;
-                    continue;
-                }
-                if (*q == '#' && q[-1] != ' ') { vz = ++q; continue; }
-                break;
-            }
+        scal ks = { k, (size_t)(kz - k), k, S_PLAIN }, vs;
+        const char *nl = fb_eol(q, e);
+        if (nl) {
+            /* the line ends at the key: a collection on the next line, a
+               sequence perhaps at the mapping's indent (value, node_at) */
+            const char *c = nl, *p0 = P->p;
+            while (c < e && *c == ' ') c++;
+            long n = (long)(c - nl);
+            P->p = c;
+            int kind = n >= f->m && is_seq(P) ? G_BSEQ : n > f->m && is_map(P) ? G_BMAP : -1;
+            P->p = p0;
+            if (kind < 0) break;
+            fb_key(P, f, &ks, cz);
+            f->at_ = A_AFTER;
+            P->p = c;
+            if (kind == G_BSEQ) open_seq(P, G_BSEQ, n, false);
+            else open_map(P, G_BMAP, n, false);
+            return FB_OPENED;
         }
-        const char *after = vz + (style != S_PLAIN);
-        q = after;
-        while (q < e && *q == ' ') q++;
-        const char *nl = fb_eol(q, e);   /* a # right after a quote isn't a comment's: refused */
-        if (!nl) break;
-        scal ks = { k, (size_t)(kz - k), k, S_PLAIN };
-        scal vs = { d, (size_t)(vz - d), v, style };
-        P->p = cz;
-        put_str(P, &ks);
-        f->r = map_key(P, &f->c, &ks, NONE);
-        emit_str(P, &ks);
+        if (q == cz || !fb_value(q, e, &vs, &nl)) break;
+        fb_key(P, f, &ks, cz);
         put_value(P, vs);
         P->p = q = nl;
         f->at_ = A_AFTER;
-        any = true;
+        r = FB_LINES;
         if (P->qn >= QN) break;
         while (q < e && *q == ' ') q++;
         if (q - nl != f->m) break;
     }
-    return any;
+    return r;
 }
 
 static void bmap_step(parser *P, gframe *f) {
@@ -1871,7 +1903,9 @@ static void bmap_step(parser *P, gframe *f) {
                 close_coll(P);
                 return;
             }
-            if (block_fast(P, f)) continue;
+            int fb = block_fast(P, f);
+            if (fb == FB_OPENED) return;
+            if (fb) continue;
             if (starts_merge(P, false)) {
                 const char *at = P->p;
                 if (f->c.started) fail(P, at, "<<: comes before the mapping's other keys");
@@ -1926,7 +1960,14 @@ static void bseq_step(parser *P, gframe *f) {
         size_t k = spaces(P);
         uint32_t v;
         if (k && peek(P, 0) != '#' && !at_eol(P, P->p)) {
-            long c = (long)col(P);
+            long c = m + 1 + (long)k;   /* at_entry left the - at column m */
+            scal vs;
+            const char *nl;
+            if (FAST_PATHS && !P->building && !P->defer && fb_value(P->p, P->end, &vs, &nl)) {
+                put_value(P, vs);   /* a value to the line's end: no key or - in it */
+                P->p = nl;
+                continue;
+            }
             if (is_seq(P)) { open_seq(P, G_BSEQ, c, false); return; }
             if (is_map(P)) { open_map(P, G_BMAP, c, false); return; }
             v = line_node(P, m);
