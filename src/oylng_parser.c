@@ -1046,8 +1046,9 @@ static uint32_t entry_get(parser *P, const char *k, size_t kl) {
 static uint32_t map_get(parser *P, uint32_t m, const char *k, size_t kl) {
     const node *nd = &P->nodes[m];
     bool merged = (nd->sub & F_MERGED) != 0;
-    const pair *pr = merged ? P->pairs + P->plans[nd->aux].start : NULL;
     uint32_t cnt = merged ? P->plans[nd->aux].count : nd->aux;
+    /* a merge of {} has no pairs, and pairs may be NULL */
+    const pair *pr = merged && cnt ? P->pairs + P->plans[nd->aux].start : NULL;
     if (cnt > SMALL_MAP) {
         slot *s = ix_find(P, &P->tix, m, k, kl, key_hash(P, m, k, kl));
         if (!s) return NONE;
@@ -1121,9 +1122,10 @@ static inline bool same(const char *a, size_t al, const char *b, size_t bl) {
 /* The open mapping's pair whose key is k, as its place from s0, or NONE;
  * h is k's hash if the mapping has a table */
 static uint32_t pair_find(const parser *P, const mapctx *c, const char *k, size_t len, uint32_t h) {
+    uint32_t cnt = P->nscratch - c->s0;
+    if (!cnt) return NONE;   /* before the first pair, scratch may be NULL, and NULL + 0 is undefined */
     const spair *sp = P->scratch + c->s0;
     if (!c->tcap) {
-        uint32_t cnt = P->nscratch - c->s0;
         for (uint32_t i = 0; i < cnt; i++)
             if (same(sp[i].k, sp[i].klen, k, len)) return i;
         return NONE;
@@ -1227,7 +1229,7 @@ static void map_value(parser *P, mapctx *c, uint32_t r, uint32_t v) {
  * table's index if it is the table's and big */
 static uint32_t map_close(parser *P, mapctx *c) {
     uint32_t lv = c->lv, cnt = P->nscratch - c->s0;
-    const spair *sp = P->scratch + c->s0;
+    const spair *sp = cnt ? P->scratch + c->s0 : NULL;   /* {}: scratch may be NULL */
     if (c->merged) {
         P->plans = grow(P, P->plans, &P->capplans, P->nplans + 1, sizeof *P->plans);
         P->pairs = grow(P, P->pairs, &P->cappairs, P->npairs + cnt, sizeof *P->pairs);

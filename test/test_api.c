@@ -311,6 +311,12 @@ static void test_stream(void) {
     CHECK(!strcmp(brief(s), "{ x 0 y 2 }"), "a flow root: %s", brief(s));
     sprintf(s, "%s[-<< *e, -<< *e]\n", t);
     CHECK(!strcmp(brief(s), "[ ]"), "empty splices: %s", brief(s));
+    /* {} built before any pair, and a path into a merge of {}: there are
+       no pairs to point at yet, which the sanitizers watch for */
+    const char *none = "%YAML 2.0\n--- &\ne: {}\n---\nx: *e\n";
+    CHECK(!strcmp(brief(none), "{ x { } }"), "{} built first: %s", brief(none));
+    none = "%YAML 2.0\n--- &\ne: {}\nm: {<<: *e}\n---\n- *m:k\n";
+    CHECK(!strcmp(brief(none), "ERR 6:6"), "a path into a merge of {}: %s", brief(none));
 
     /* built keys are kept while values come and go: a repeat of the
        first, after values built from lines */
