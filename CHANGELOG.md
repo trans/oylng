@@ -23,12 +23,12 @@ Easy Schema) are to come.
 - **Errors** come with a line, a column and a message, before the end of
   the document they are in. The parser stops at `...` and says where the
   rest of the input starts.
-- **Speed.** On one core, 280 to 550 MB/s on the benchmark's generated
-  inputs (`make bench`): 3.8 to 8.1 times libyaml 0.2.5. Quoted scalars,
-  comments and block scalars' lines are scanned with SSE2 on x86-64 and
-  plain loops elsewhere. Flow collections on one line and simple block
-  lines take fast paths, which give the same events, offsets and errors as
-  the general path.
+- **Speed.** On one core, about 270 to 540 MB/s on the benchmark's
+  generated inputs (`make bench`): 3.7 to 8.3 times libyaml 0.2.5.
+  Quoted scalars, comments and block scalars' lines are scanned with SSE2
+  on x86-64 and plain loops elsewhere. Flow collections on one line and
+  simple block lines take fast paths, which give the same events, offsets
+  and errors as the general path.
 - **Tests.** 347 of the suite's 356 tests pass; the other 9 need `keep` or
   `together`, which the event API doesn't do. 90 API checks. All run again
   without SIMD and the fast paths, and under ASan and UBSan. `make
