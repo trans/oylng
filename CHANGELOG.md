@@ -30,7 +30,7 @@ Easy Schema) are to come.
   lines take fast paths, which give the same events, offsets and errors as
   the general path.
 - **Tests.** 347 of the suite's 356 tests pass; the other 9 need `keep` or
-  `together`, which the event API doesn't do. 88 API checks. All run again
+  `together`, which the event API doesn't do. 90 API checks. All run again
   without SIMD and the fast paths, and under ASan and UBSan. `make
   test-diff` compares the parser with the draft's reference checker on
   generated and mutated streams, and `make fuzz` runs libFuzzer.
