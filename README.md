@@ -148,6 +148,12 @@ build/oylng --emit --flow file.yaml      # one line per document
 - `make bench` times the parser on generated inputs, then the inputs read
   and written again by the emitter. If pkg-config finds libyaml, it times
   libyaml on the same inputs, too. Set `BENCH_CPU=` to pin it to one core.
+- `make bench-files FILES='DIR ...'` times the parser on real files: each
+  directory is a group, and every `.yaml` and `.yml` file under it is read
+  as 2.0, with `%YAML 2.0` in front (and `---` where the file doesn't start
+  a document). If pkg-config finds libyaml, libyaml reads the files as
+  written, for comparison. It also lists the parser's reasons for the files
+  it refuses: those need converting to 2.0 first.
 
 ## License
 

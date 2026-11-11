@@ -59,6 +59,61 @@ static inline size_t oylng_ascii_run(const char *buf, size_t len, char a, char b
     return len;
 }
 
+/* Where a run of printable ASCII and spaces but # and : ends in
+ * buf[0..len): the first byte that is # or :, below 0x20 (tabs and line
+ * breaks among them), or 0x7F and up; or len. What stops it is what a
+ * plain scalar on one line has to look at: a comment, a key's :, its end,
+ * a character to check. */
+static inline size_t oylng_plain_run(const char *buf, size_t len) {
+    size_t i = 0;
+#if defined(OYLNG_SSE2)
+    const __m128i hash = _mm_set1_epi8('#'), colon = _mm_set1_epi8(':');
+    const __m128i c1f = _mm_set1_epi8(0x1F), c7f = _mm_set1_epi8(0x7F);
+    for (; i + 16 <= len; i += 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(buf + i));
+        __m128i low = _mm_cmpeq_epi8(_mm_min_epu8(v, c1f), v);
+        __m128i high = _mm_cmpeq_epi8(_mm_max_epu8(v, c7f), v);
+        __m128i m = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, hash), _mm_cmpeq_epi8(v, colon)),
+                                 _mm_or_si128(low, high));
+        int mask = _mm_movemask_epi8(m);
+        if (mask) return i + oylng_ctz32((uint32_t)mask);
+    }
+#endif
+    for (; i < len; i++) {
+        unsigned char c = (unsigned char)buf[i];
+        if (c == '#' || c == ':' || c < 0x20 || c >= 0x7F) return i;
+    }
+    return len;
+}
+
+/* Where a run of ASCII letters, digits and . _ + - ends in buf[0..len), or
+ * len: what the fast paths take as a plain key or a flow scalar */
+static inline size_t oylng_word_run(const char *buf, size_t len) {
+    size_t i = 0;
+#if defined(OYLNG_SSE2)
+    const __m128i x20 = _mm_set1_epi8(0x20), a = _mm_set1_epi8('a'), c25 = _mm_set1_epi8(25);
+    const __m128i d0 = _mm_set1_epi8('0'), c9 = _mm_set1_epi8(9);
+    const __m128i dot = _mm_set1_epi8('.'), us = _mm_set1_epi8('_');
+    const __m128i plus = _mm_set1_epi8('+'), minus = _mm_set1_epi8('-');
+    for (; i + 16 <= len; i += 16) {
+        __m128i v = _mm_loadu_si128((const __m128i *)(buf + i));
+        __m128i l = _mm_sub_epi8(_mm_or_si128(v, x20), a), d = _mm_sub_epi8(v, d0);
+        __m128i alnum = _mm_or_si128(_mm_cmpeq_epi8(_mm_min_epu8(l, c25), l),
+                                     _mm_cmpeq_epi8(_mm_min_epu8(d, c9), d));
+        __m128i punct = _mm_or_si128(_mm_or_si128(_mm_cmpeq_epi8(v, dot), _mm_cmpeq_epi8(v, us)),
+                                     _mm_or_si128(_mm_cmpeq_epi8(v, plus), _mm_cmpeq_epi8(v, minus)));
+        int mask = ~_mm_movemask_epi8(_mm_or_si128(alnum, punct)) & 0xFFFF;
+        if (mask) return i + oylng_ctz32((uint32_t)mask);
+    }
+#endif
+    for (; i < len; i++) {
+        unsigned c = (unsigned char)buf[i];
+        if (!((unsigned)((c | 0x20) - 'a') < 26 || c - '0' < 10 || c == '.' || c == '_' || c == '+' || c == '-'))
+            return i;
+    }
+    return len;
+}
+
 /* The first line feed or carriage return in buf[0..len), or len */
 static inline size_t oylng_find_break(const char *buf, size_t len) {
     size_t i = 0;

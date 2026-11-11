@@ -23,6 +23,17 @@
   one. Reading the benchmark's inputs as trees takes 1.4 to 2.1 times as
   long as reading their events, and goes 4.1 to 7 times as fast as libyaml's
   documents (`yaml_parser_load`).
+- **Faster on real files.** One-line plain values, and the keys and flow
+  scalars the fast paths take, are scanned 16 bytes at a time with SSE2,
+  values past the spaces between their words. The test files were 3,409
+  public files of ten kinds (Ansible, Compose, GitLab CI, Helm values,
+  Jekyll, Kubernetes, MkDocs, OpenAPI, Rails locales, workflows) that read
+  as 2.0 once `%YAML 2.0` is put in front. On them, events go 4.1 times as
+  fast as libyaml (3.3 to 5.4 by kind), up from 3.4, and trees 4.5 times as
+  fast as its documents (3.9 to 6), up from 4.0: `make bench-files`, the two
+  builds back to back. The generated inputs show no change.
+- **`make bench-files`** times the parser on directories of real files,
+  against libyaml where it can, and counts the files it refuses, by reason.
 - **`oylng --emit`** writes a stream again, its references and merges
   resolved, in block style or with `--flow` one line per document.
 - **`OYLNG_ERR_EMIT`**, the emitter's error.

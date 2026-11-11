@@ -30,7 +30,7 @@ DIFF_N     ?= 20000
 
 SAN := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-api test-emit test-suite test-plain test-diff test-asan bench fuzz clean
+.PHONY: all test test-api test-emit test-suite test-plain test-diff test-asan bench bench-files fuzz clean
 
 all: $(LIB) $(TOOL)
 
@@ -65,6 +65,9 @@ BENCH_LIBS    := $(if $(LIBYAML),$(shell pkg-config --libs yaml-0.1))
 
 $(OBJDIR)/bench_parser: bench/bench_parser.c bench/bench_gen.h $(LIB)
 	$(CC) $(OYLNG_CFLAGS) $(BENCH_LIBYAML) -Ibench $< $(LIB) $(OYLNG_LDFLAGS) $(BENCH_LIBS) -o $@
+
+$(OBJDIR)/bench_files: bench/bench_files.c $(LIB)
+	$(CC) $(OYLNG_CFLAGS) $(BENCH_LIBYAML) $< $(LIB) $(OYLNG_LDFLAGS) $(BENCH_LIBS) -o $@
 
 # The library built into each test with AddressSanitizer and UBSan
 $(OBJDIR)/%_asan: test/%.c $(SRCS) $(HDRS) tools/events.h | $(OBJDIR)
@@ -115,6 +118,11 @@ test-diff: $(OBJDIR)/test_batch
 # Pinned to one core if BENCH_CPU is set: make bench BENCH_CPU=5
 bench: $(OBJDIR)/bench_parser
 	$(if $(BENCH_CPU),taskset -c $(BENCH_CPU)) $(OBJDIR)/bench_parser
+
+# Real files, each directory of FILES a group: make bench-files FILES='dir1 dir2'
+bench-files: $(OBJDIR)/bench_files
+	$(if $(FILES),,$(error set FILES to the directories to read))
+	$(if $(BENCH_CPU),taskset -c $(BENCH_CPU)) $(OBJDIR)/bench_files $(FILES)
 
 # One worker, five minutes, seeded with the suite's streams
 FUZZ_TIME ?= 300

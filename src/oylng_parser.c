@@ -1628,7 +1628,7 @@ static bool flow_fast(parser *P) {
                 return false;
             d = q;
             z = q + 1;
-            while (z < e && ff_plain((unsigned char)*z)) z++;
+            z += oylng_word_run(z, (size_t)(e - z));
             q = z;
             while (q < e && (*q == ' ' || *q == '\t')) q++;
             if (q >= e) return false;
@@ -1784,10 +1784,13 @@ static bool fb_value(const char *q, const char *e, scal *vs, const char **nl) {
         if (!fb_value_start(q, e)) return false;
         vz = ++q;
         for (;;) {
-            while (q < e && in_run((unsigned char)*q, plain_run_lo, plain_run_hi)) q++;
-            if (q > vz && q[-1] != ' ') vz = q;
+            /* over words and the spaces between them, then back over the
+               spaces at the end */
+            q += oylng_plain_run(q, (size_t)(e - q));
+            const char *t = q;
+            while (t > vz && t[-1] == ' ') t--;
+            vz = t;
             if (q >= e) break;
-            if (*q == ' ') { q++; continue; }
             if (*q == ':' && q + 1 < e && in_run((unsigned char)q[1], plain_run_lo, plain_run_hi)) {
                 vz = ++q;
                 continue;
@@ -1825,7 +1828,7 @@ static int block_fast(parser *P, gframe *f) {
         const char *k = q;
         if (q >= e || !fb_key_start(q, e)) break;
         q++;
-        while (q < e && ff_plain((unsigned char)*q)) q++;
+        q += oylng_word_run(q, (size_t)(e - q));
         const char *kz = q;
         while (q < e && *q == ' ') q++;
         if (q >= e || *q != ':') break;
