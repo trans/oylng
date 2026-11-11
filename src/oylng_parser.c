@@ -227,6 +227,15 @@ struct oylng_parser {
     bool   stopped;
     size_t stop_offset;
 
+    /* making events for a tree: a node of the table is one OYLNG__EVT_REF,
+       which the tree copies once and shares, not its events */
+    bool   tree_mode;
+    /* for each node of the table, the tree it was copied into last
+       (high 32 bits) and its node there; kept here so a tree needn't
+       clear one of its own */
+    uint64_t *tmemo;
+    uint32_t  captmemo, tgen;
+
     oylng_status status;
     oylng_mark   errmark;
     char         errmsg[200];
@@ -350,39 +359,6 @@ static inline void set_lev(parser *P, uint32_t i, uint32_t lv) {
 
 /* ── Characters (section 3) ──────────────────────────────── */
 
-#define BAD_CP UINT32_MAX
-
-/* The code point at q, and its length; BAD_CP if it isn't UTF-8 */
-static uint32_t utf8(const unsigned char *q, const unsigned char *e, size_t *len) {
-    unsigned c = q[0];
-    if (c < 0x80) { *len = 1; return c; }
-    uint32_t cp;
-    size_t n;
-    if (c < 0xC2) return BAD_CP;
-    else if (c < 0xE0) { n = 2; cp = c & 0x1F; }
-    else if (c < 0xF0) { n = 3; cp = c & 0x0F; }
-    else if (c < 0xF5) { n = 4; cp = c & 0x07; }
-    else return BAD_CP;
-    if ((size_t)(e - q) < n) return BAD_CP;
-    for (size_t i = 1; i < n; i++) {
-        if ((q[i] & 0xC0) != 0x80) return BAD_CP;
-        cp = cp << 6 | (q[i] & 0x3F);
-    }
-    if ((n == 3 && cp < 0x800) || (n == 4 && (cp < 0x10000 || cp > 0x10FFFF))) return BAD_CP;
-    if (cp >= 0xD800 && cp < 0xE000) return BAD_CP;
-    *len = n;
-    return cp;
-}
-
-/* Whether a character may appear (dq: inside double quotes). Line feeds
- * and carriage returns are breaks, and their callers deal with them. */
-static bool allowed(uint32_t c, bool dq) {
-    if (c < 0x80) return c == 0x09 || (c >= 0x20 && c < 0x7F) || (dq && c == 0x7F);
-    if (c < 0xA0) return dq;
-    if (c == 0x2028 || c == 0x2029 || c == 0xFEFF || c == 0xFFFE || c == 0xFFFF) return dq;
-    return true;
-}
-
 static inline bool is_brk(const parser *P, const char *q) {
     return q < P->end && (*q == '\n' || (*q == '\r' && q + 1 < P->end && q[1] == '\n'));
 }
@@ -405,9 +381,9 @@ static size_t char_len(parser *P, const char *q, bool dq) {
         fail(P, q, "character U+%04X is not allowed", c);
     }
     size_t n;
-    uint32_t cp = utf8((const unsigned char *)q, (const unsigned char *)P->end, &n);
-    if (cp == BAD_CP) fail(P, q, "invalid UTF-8");
-    if (!allowed(cp, dq))
+    uint32_t cp = oylng_utf8((const unsigned char *)q, (const unsigned char *)P->end, &n);
+    if (cp == OYLNG_BAD_CP) fail(P, q, "invalid UTF-8");
+    if (!oylng_allowed(cp, dq))
         fail(P, q, "character U+%04X is not allowed%s", (unsigned)cp,
              cp < 0xA0 || cp >= 0x2028 ? " outside double quotes" : "");
     return n;
@@ -2197,20 +2173,10 @@ static void advance(parser *P) {
 static size_t name_char(const parser *P, const char *q) {
     if (q >= P->end) return 0;
     unsigned c = (unsigned char)*q;
-    if (c < 0x80)
-        return ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
-                c == '.' || c == '_' || c == '/' || c == '-') ? 1 : 0;
+    if (c < 0x80) return oylng_name_cp(c) ? 1 : 0;
     size_t n;
-    uint32_t u = utf8((const unsigned char *)q, (const unsigned char *)P->end, &n);
-    if (u == BAD_CP) return 0;
-    bool ok = u == 0xB7 || (u >= 0xC0 && u <= 0xD6) || (u >= 0xD8 && u <= 0xF6) ||
-              (u >= 0xF8 && u <= 0x37D) || (u >= 0x37F && u <= 0x1FFF) ||
-              (u >= 0x200C && u <= 0x200D) || (u >= 0x203F && u <= 0x2040) ||
-              (u >= 0x2070 && u <= 0x218F) || (u >= 0x2C00 && u <= 0x2FEF) ||
-              (u >= 0x3001 && u <= 0xD7FF) || (u >= 0xF900 && u <= 0xFDCF) ||
-              (u >= 0xFDF0 && u <= 0xFEFE) || (u >= 0xFF00 && u <= 0xFFFD) ||
-              (u >= 0x10000 && u <= 0xEFFFF);
-    return ok ? n : 0;
+    uint32_t u = oylng_utf8((const unsigned char *)q, (const unsigned char *)P->end, &n);
+    return u != OYLNG_BAD_CP && oylng_name_cp(u) ? n : 0;
 }
 
 /* After a marker: reads a table whole, false, or starts a document,
@@ -2355,6 +2321,10 @@ static void push(parser *P, uint8_t mode, uint32_t cur, uint32_t end, uint8_t cl
 static bool handle(parser *P, uint32_t i) {
     i = deref(P, i);
     const node *nd = &P->nodes[i];
+    if (P->tree_mode && i < P->table_end && nd->kind <= N_MAP) {
+        emit(P, (oylng_event_type)OYLNG__EVT_REF, NULL, i, nd->pos);
+        return true;
+    }
     switch (nd->kind) {
     case N_STR:
         emit(P, OYLNG_EVT_SCALAR, nd->data, nd->len, nd->pos);
@@ -2481,6 +2451,7 @@ static void fill(parser *P) {
             stream_start(P);
             emit(P, OYLNG_EVT_STREAM_START, NULL, 0, 0);
             P->state = ST_BETWEEN;
+            P->qstop = true;   /* so a tree can start with the first document */
             break;
         case ST_BETWEEN:
             if (next_document(P)) P->state = ST_DOC;
@@ -2544,9 +2515,107 @@ void oylng_parser_free(oylng_parser *P) {
     free(P->lix);
     free(P->stack);
     free(P->g);
+    free(P->tmemo);
     oylng_arena_free(P->strings);
     oylng_arena_free(P->vals);
     free(P);
+}
+
+/* ── For the tree (oylng_internal.h) ─────────────────────── */
+
+void oylng__parser_tree_mode(oylng_parser *P, bool on) { P->tree_mode = on; }
+
+void oylng__parser_input(const oylng_parser *P, const char **in, size_t *len) {
+    *in = P->in;
+    *len = (size_t)(P->end - P->in);
+}
+
+bool oylng__parser_between(const oylng_parser *P) {
+    if (P->qi < P->qn) {
+        oylng_event_type t = P->q[P->qi].type;
+        return t == OYLNG_EVT_STREAM_START || t == OYLNG_EVT_DOC_START || t == OYLNG_EVT_STREAM_END;
+    }
+    return P->state != ST_DOC;
+}
+
+oylng_status oylng__parser_fail(oylng_parser *P, oylng_status st, const char *msg) {
+    if (P->state == ST_ERROR) return P->status;
+    P->qi = P->qn;   /* the events not handed out go */
+    P->state = ST_ERROR;
+    P->status = st;
+    P->errmark = mark_of(P, P->p);
+    snprintf(P->errmsg, sizeof P->errmsg, "%s", msg);
+    return st;
+}
+
+uint64_t *oylng__tree_memo(oylng_parser *P, uint32_t *gen) {
+    if (P->captmemo < P->table_end) {
+        uint64_t *m = realloc(P->tmemo, (size_t)P->table_end * sizeof *m);
+        if (!m) return NULL;
+        memset(m + P->captmemo, 0, (size_t)(P->table_end - P->captmemo) * sizeof *m);
+        P->tmemo = m;
+        P->captmemo = P->table_end;
+    }
+    if (++P->tgen == 0) {   /* once in 4G trees */
+        memset(P->tmemo, 0, (size_t)P->captmemo * sizeof *P->tmemo);
+        P->tgen = 1;
+    }
+    *gen = P->tgen;
+    return P->tmemo;
+}
+
+void oylng__table_node(const oylng_parser *P, uint32_t i, oylng__tnode *out) {
+    const node *nd = &P->nodes[i];
+    out->kind = nd->kind == N_STR ? OYLNG__T_STR : nd->kind == N_SEQ ? OYLNG__T_SEQ : OYLNG__T_MAP;
+    out->data = nd->kind == N_STR ? nd->data : NULL;
+    out->len = nd->kind == N_STR ? nd->len : 0;
+    out->pos = nd->pos;
+}
+
+bool oylng__table_children(const oylng_parser *P, uint32_t i, void (*fn)(void *, uint32_t), void *ctx) {
+    const node *nd = &P->nodes[i];
+    if (nd->kind == N_MAP) {
+        if (nd->sub & F_MERGED) {
+            const plan *pl = &P->plans[nd->aux];
+            for (uint32_t k = 0; k < pl->count; k++) {
+                const pair *pr = &P->pairs[pl->start + k];
+                fn(ctx, deref(P, pr->key));
+                fn(ctx, deref(P, pr->val));
+            }
+        } else
+            for (uint32_t k = i + 1; k < nd->link; k = subtree_end(P, k + 1)) {
+                fn(ctx, deref(P, k));
+                fn(ctx, deref(P, k + 1));
+            }
+        return true;
+    }
+    /* a sequence's items, each -<< spread where it is: a splice's source
+       may hold splices too, so the sources being read are a stack */
+    uint32_t local[64][2], (*st)[2] = local, cap = 64, n = 0;
+    st[n][0] = i + 1;
+    st[n++][1] = nd->link;
+    bool ok = true;
+    while (n) {
+        uint32_t *top = st[n - 1];
+        if (top[0] >= top[1]) { n--; continue; }
+        uint32_t k = top[0];
+        top[0] = subtree_end(P, k);
+        const node *kn = &P->nodes[k];
+        if (kn->kind != N_SPLICE) { fn(ctx, deref(P, k)); continue; }
+        uint32_t src = deref(P, kn->link);
+        if (n == cap) {
+            uint32_t (*ns)[2] = malloc((size_t)cap * 2 * sizeof *ns);
+            if (!ns) { ok = false; break; }
+            memcpy(ns, st, (size_t)n * sizeof *ns);
+            if (st != local) free(st);
+            st = ns;
+            cap *= 2;
+        }
+        st[n][0] = src + 1;
+        st[n++][1] = P->nodes[src].link;
+    }
+    if (st != local) free(st);
+    return ok;
 }
 
 const char *oylng_event_type_str(oylng_event_type t) {

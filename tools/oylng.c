@@ -1,10 +1,12 @@
 /*
  * oylng — read a YAML 2.0 stream and show what it delivers
  *
- *     oylng [--events | --json] [--limit N] [FILE]
+ *     oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]
  *
  * --events (the default) writes the events in the suite's notation;
- * --json writes one line of JSON per document. With no FILE, or with -,
+ * --json writes one line of JSON per document; --emit writes the stream
+ * again as YAML 2.0, its references resolved, in block style or with
+ * --flow one line per document. With no FILE, or with -,
  * reads standard input. On an error, writes it to standard error with its
  * line and column, and exits with 1.
  */
@@ -58,15 +60,19 @@ static void json_str(strbuf *b, const char *s, size_t n) {
 }
 
 int main(int argc, char **argv) {
-    int json = 0;
+    int json = 0, emit = 0, flow = 0;
+    unsigned indent = 2;
     unsigned long long limit = 0;
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
-        if (!strcmp(argv[i], "--json")) json = 1;
-        else if (!strcmp(argv[i], "--events")) json = 0;
+        if (!strcmp(argv[i], "--json")) json = 1, emit = 0;
+        else if (!strcmp(argv[i], "--events")) json = 0, emit = 0;
+        else if (!strcmp(argv[i], "--emit")) emit = 1, json = 0;
+        else if (!strcmp(argv[i], "--flow")) flow = 1;
+        else if (!strcmp(argv[i], "--indent") && i + 1 < argc) indent = (unsigned)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--limit") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            puts("usage: oylng [--events | --json] [--limit N] [FILE]");
+            puts("usage: oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]");
             return 0;
         } else if (!path) path = argv[i];
         else { fprintf(stderr, "oylng: one file at a time\n"); return 2; }
@@ -83,6 +89,14 @@ int main(int argc, char **argv) {
     if (!p) { fputs("oylng: out of memory\n", stderr); return 2; }
     if (limit) oylng_parser_set_limit(p, limit);
 
+    oylng_emitter *em = NULL;
+    if (emit) {
+        em = oylng_emitter_new();
+        if (!em) { fputs("oylng: out of memory\n", stderr); return 2; }
+        oylng_emitter_set_indent(em, indent);
+        oylng_emitter_set_flow(em, flow);
+    }
+
     strbuf out = { 0 };
     /* for JSON: in each open collection, whether a comma is due, and for a
        mapping whether its key is out and its value next */
@@ -98,7 +112,16 @@ int main(int argc, char **argv) {
             rc = 1;
             break;
         }
-        if (!json) ev_line(&out, e);
+        if (em) {
+            if (oylng_emit(em, e) != OYLNG_OK) {
+                fprintf(stderr, "oylng: can't write it again: %s\n", oylng_emitter_error(em));
+                rc = 1;
+                break;
+            }
+            oylng_str piece;
+            oylng_emitter_take(em, &piece);
+            sb_add(&out, piece.data, piece.len);
+        } else if (!json) ev_line(&out, e);
         else {
             int closing = e->type == OYLNG_EVT_MAP_END || e->type == OYLNG_EVT_SEQ_END;
             int node = e->type == OYLNG_EVT_SCALAR || e->type == OYLNG_EVT_MAP_START ||
@@ -128,6 +151,7 @@ int main(int argc, char **argv) {
         if (out.len > 1 << 16) { fwrite(out.data, 1, out.len, stdout); out.len = 0; }
     }
     free(out.data);
+    oylng_emitter_free(em);
     oylng_parser_free(p);
     free(in);
     return rc;

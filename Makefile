@@ -30,7 +30,7 @@ DIFF_N     ?= 20000
 
 SAN := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-api test-suite test-plain test-diff test-asan bench fuzz clean
+.PHONY: all test test-api test-emit test-suite test-plain test-diff test-asan bench fuzz clean
 
 all: $(LIB) $(TOOL)
 
@@ -50,6 +50,9 @@ $(OBJDIR)/test_suite: test/test_suite.c tools/events.h $(LIB)
 	$(CC) $(OYLNG_CFLAGS) -Itools $< $(LIB) $(OYLNG_LDFLAGS) -o $@
 
 $(OBJDIR)/test_api: test/test_api.c $(LIB)
+	$(CC) $(OYLNG_CFLAGS) $< $(LIB) $(OYLNG_LDFLAGS) -o $@
+
+$(OBJDIR)/test_emit: test/test_emit.c $(LIB)
 	$(CC) $(OYLNG_CFLAGS) $< $(LIB) $(OYLNG_LDFLAGS) -o $@
 
 $(OBJDIR)/test_batch: test/test_batch.c tools/events.h $(LIB)
@@ -88,16 +91,21 @@ test-suite: $(OBJDIR)/test_suite $(SUITE_DATA)
 test-api: $(OBJDIR)/test_api
 	$(OBJDIR)/test_api
 
-test: test-api test-suite test-plain
+test-emit: $(OBJDIR)/test_emit
+	$(OBJDIR)/test_emit
+
+test: test-api test-emit test-suite test-plain
 
 # Both tests again, built for test-plain
-test-plain: $(OBJDIR)/test_api_plain $(OBJDIR)/test_suite_plain $(SUITE_DATA)
+test-plain: $(OBJDIR)/test_api_plain $(OBJDIR)/test_emit_plain $(OBJDIR)/test_suite_plain $(SUITE_DATA)
 	$(OBJDIR)/test_api_plain
+	$(OBJDIR)/test_emit_plain
 	$(OBJDIR)/test_suite_plain $(SUITE_DATA)
 
 # Both tests again with the sanitizers
-test-asan: $(OBJDIR)/test_api_asan $(OBJDIR)/test_suite_asan $(SUITE_DATA)
+test-asan: $(OBJDIR)/test_api_asan $(OBJDIR)/test_emit_asan $(OBJDIR)/test_suite_asan $(SUITE_DATA)
 	$(OBJDIR)/test_api_asan
+	$(OBJDIR)/test_emit_asan
 	$(OBJDIR)/test_suite_asan $(SUITE_DATA)
 
 # Mutated and generated streams through this parser and the draft's checker
