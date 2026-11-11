@@ -8,8 +8,9 @@
  * A stream delivers documents in order. Each is a string, a sequence or a
  * mapping, and may have a name. References and merges are already
  * resolved in what the parser delivers: the table, `<<`, `-<<` and comments
- * are not data (section 11). A document comes as events, or whole as a
- * tree, and either can be written again by the emitter.
+ * are not data (section 11). A document comes as events, while it is
+ * read, or as a tree, once it has been read to its end. Either can be
+ * written again by the emitter.
  */
 
 #ifndef OYLNG_H
@@ -211,8 +212,8 @@ OYLNG_API void oylng_emitter_free(oylng_emitter *e);
 OYLNG_API const char *oylng_event_type_str(oylng_event_type type);
 
 /* ── Tree ────────────────────────────────────────────────────
- * A document read whole into nodes: strings, sequences and mappings, with
- * the table applied as in the events. A node of the table is made once and
+ * One document of a stream, read to its end and held as nodes: strings,
+ * sequences and mappings, with the table applied as in the events. A node of the table is made once and
  * shared by every place that names it, so `*a` written twice is the same
  * node twice, and a tree takes room in proportion to what is written, not
  * to what it reads as. A program that keeps what it made of each node, by

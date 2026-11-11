@@ -51,7 +51,10 @@ until the next `oylng_parse_next`, so copy it to keep it.
 
 ## Reading a document as a tree
 
-`oylng_parse_tree` reads the next document whole:
+Events come while the parser reads. `oylng_parse_tree` instead reads the
+next document of the stream to its end and gives it as a tree, whose nodes
+can be visited in any order. Each call gives one document, and NULL after
+the last:
 
 ```c
 oylng_parser *p = oylng_parser_new(text, len);
@@ -72,12 +75,12 @@ A tree holds what the events would: strings, sequences and mappings, with
 the table applied. A node of the table is made once and shared by every
 place that names it, so `*a` written twice is the same node twice, and a
 tree takes room in proportion to what is written, not to what it reads as.
-Nodes are numbered, so a program that turns a tree into its own objects
-can keep what it made of each node and make a shared one once. A mapping of
-more than 8 pairs has an index, so `oylng_node_get` takes about the same
-time however many it has. A tree needs only the input to outlive it, not
-the parser, and `oylng_emit_tree` writes it. Documents can be read as
-trees and as events in turn.
+Nodes are numbered, so a program that turns a tree into its own objects can
+keep what it made of each node and make a shared one once. A mapping of more
+than 8 pairs has an index, so `oylng_node_get` takes about the same time
+however many it has. A document in error gives no tree. A tree needs only
+the input to outlive it, not the parser, and `oylng_emit_tree` writes it.
+Documents can be read as trees and as events in turn.
 
 ## Writing YAML 2.0
 

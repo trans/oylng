@@ -13,15 +13,16 @@
   always reads back as the events it was given. The output can be taken in
   pieces. Read and written again, the benchmark's inputs go at 80 to 120
   MB/s, 2.9 to 4.6 times libyaml's parser and emitter.
-- **The tree.** `oylng_parse_tree` reads a document whole, into strings,
-  sequences and mappings. A node of the table is made once and shared by
-  every place that names it, so a tree takes room in proportion to what is
-  written: the API tests read ten million strings, through references of
-  references, as 22 nodes. Nodes are numbered, a mapping of more than 8
-  pairs has an index for finding keys, a tree outlives its parser, and
-  `oylng_emit_tree` writes one. Reading the benchmark's inputs as trees
-  takes 1.4 to 2.1 times as long as reading their events, and goes 4.1 to
-  7 times as fast as libyaml's documents (`yaml_parser_load`).
+- **The tree.** `oylng_parse_tree` reads the next document of a stream to
+  its end, into a tree of strings, sequences and mappings: one call per
+  document. A node of the table is made once and shared by every place that
+  names it, so a tree takes room in proportion to what is written: the API
+  tests read ten million strings, through references of references, as 22
+  nodes. Nodes are numbered, a mapping of more than 8 pairs has an index for
+  finding keys, a tree outlives its parser, and `oylng_emit_tree` writes
+  one. Reading the benchmark's inputs as trees takes 1.4 to 2.1 times as
+  long as reading their events, and goes 4.1 to 7 times as fast as libyaml's
+  documents (`yaml_parser_load`).
 - **`oylng --emit`** writes a stream again, its references and merges
   resolved, in block style or with `--flow` one line per document.
 - **`OYLNG_ERR_EMIT`**, the emitter's error.
