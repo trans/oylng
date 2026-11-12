@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 (2026-11-12)
+
+The tree and the emitter, and faster reading of real files. It is still
+the parser for part 1 of YAML 2.0, Draft 1, tested against the suite in
+[trans/yaml2](https://github.com/trans/yaml2) at `213471d`. The draft's
+later changes to part 1, up to `0e2e6b3`, ask nothing new of a parser.
+Part 2 (the Easy Schema) is still to come.
 
 - **The emitter.** It writes YAML 2.0 from events, the parser's or a
   program's own: `%YAML 2.0` first, `---` or `--- !name` for each document,

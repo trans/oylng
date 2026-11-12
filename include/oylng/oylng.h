@@ -37,7 +37,7 @@ extern "C" {
  * not change. The parser is opaque, configured through functions. */
 
 #define OYLNG_VERSION_MAJOR 0
-#define OYLNG_VERSION_MINOR 1
+#define OYLNG_VERSION_MINOR 2
 #define OYLNG_VERSION_PATCH 0
 
 /** A UTF-8 string, not NUL-terminated. It points into the input, and
