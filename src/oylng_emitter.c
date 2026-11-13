@@ -536,6 +536,16 @@ oylng_status oylng_emit_doc_start(oylng_emitter *E, oylng_str name) {
         const unsigned char *u = (const unsigned char *)name.data, *ue = u + name.len;
         if (!name.len) return fail(E, OYLNG_ERR_EMIT, "a document's name can't be empty");
         for (const unsigned char *q = u; q < ue;) {
+            if (*q == '#' && q > u) {
+                /* the fragment, which ends the name */
+                const unsigned char *h = ++q;
+                while (q < ue && oylng_frag_char(*q)) q++;
+                if (q == h || q < ue)
+                    return fail(E, OYLNG_ERR_EMIT, "a document's name can end in # and one or more ASCII "
+                                "letters, digits and =, and this one has another character, at its byte %zu",
+                                (size_t)(q - u));
+                break;
+            }
             size_t n;
             uint32_t c = oylng_utf8(q, ue, &n);
             if (c == OYLNG_BAD_CP || !oylng_name_cp(c))

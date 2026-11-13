@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **A document's name may end in a fragment**: `#`, then one or more ASCII
+  letters, digits and `=`, as part 1, section 4.3, now allows (trans/yaml2
+  `afbd21f`). So `--- !a#b` is the name `a#b`, and `--- !a #b` is the name
+  `a` and a comment. The emitter writes such names, and refuses `a#`,
+  `a#b#c` and the like. The suite's six new tests pass, and the emitter has
+  9 new checks, 161 in all.
+
 ## 0.2.0 (2026-11-12)
 
 The tree and the emitter, and faster reading of real files. It is still

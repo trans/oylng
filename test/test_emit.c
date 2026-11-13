@@ -178,7 +178,8 @@ static void test_errors(void) {
     oylng_emitter_free(e);
 
     /* names */
-    const char *bad_names[] = { "a:b", "a b", "%41", "a\xC3", "x\xE2\x80\xA8" };
+    const char *bad_names[] = { "a:b", "a b", "%41", "a\xC3", "x\xE2\x80\xA8",
+                                "a#", "a#b#c", "a#b-c", "a#\xC3\xA9", "#b", "a#b c" };
     for (size_t i = 0; i < sizeof bad_names / sizeof *bad_names; i++) {
         e = started();
         CHECK(oylng_emit_doc_start(e, S(bad_names[i])) == OYLNG_ERR_EMIT, "the name %s", bad_names[i]);
@@ -190,6 +191,12 @@ static void test_errors(void) {
     e = started();
     CHECK(oylng_emit_doc_start(e, S("github.com/a/b-1_\xE9\x85\x8D\xE7\xBD\xAE")) == OYLNG_OK, "a good name");
     oylng_emitter_free(e);
+    const char *frag_names[] = { "a#b", "a.yes#sha256=0f9A", "\xE9\x85\x8D#x=" };
+    for (size_t i = 0; i < sizeof frag_names / sizeof *frag_names; i++) {
+        e = started();
+        CHECK(oylng_emit_doc_start(e, S(frag_names[i])) == OYLNG_OK, "the name %s, with a fragment", frag_names[i]);
+        oylng_emitter_free(e);
+    }
 
     /* invalid UTF-8 */
     const char *bad_text[] = { "\xC3", "\xC0\x80", "\xED\xA0\x80", "\xF4\x90\x80\x80", "a\xFF" };

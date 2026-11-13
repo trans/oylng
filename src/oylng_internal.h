@@ -45,8 +45,15 @@ static inline bool oylng_allowed(uint32_t c, bool dq) {
     return true;
 }
 
-/* Whether a character may be in a document's name (section 4.3): letters
- * and digits, . _ - /, and beyond ASCII the ranges XML 1.0 allows */
+/* Whether a byte may be in a name's fragment, after its # (section 4.3):
+ * ASCII letters, digits and = */
+static inline bool oylng_frag_char(unsigned c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '=';
+}
+
+/* Whether a character may be in a document's name before any fragment
+ * (section 4.3): letters and digits, . _ - /, and beyond ASCII the ranges
+ * XML 1.0 allows */
 static inline bool oylng_name_cp(uint32_t u) {
     if (u < 0x80)
         return (u >= 'A' && u <= 'Z') || (u >= 'a' && u <= 'z') || (u >= '0' && u <= '9') ||

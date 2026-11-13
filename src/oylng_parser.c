@@ -2222,11 +2222,19 @@ static bool document(parser *P) {
         size_t c;
         while ((c = name_char(P, P->p)) > 0) P->p += c;
         if (P->p == b) fail(P, b, "a document name, after !, is letters, digits and . _ - /");
+        /* a fragment: # right after the name, then ASCII letters, digits and = */
+        bool frag = peek(P, 0) == '#';
+        if (frag) {
+            const char *h = ++P->p;
+            while (P->p < P->end && oylng_frag_char((unsigned char)*P->p)) P->p++;
+            if (P->p == h) fail(P, h, "a name's fragment, after #, is one or more ASCII letters, digits and =");
+        }
         P->name = (oylng_str){ b, (size_t)(P->p - b) };
         count(P, b, 1 + P->name.len, 1 + P->name.len);
         j = P->p;
         n = spaces(P);
         if (!n && !sep_at(P, P->p)) {
+            if (frag) fail(P, P->p, "a name's fragment, after #, is ASCII letters, digits and =");
             if (peek(P, 0) == ':' || peek(P, 0) == '%')
                 fail(P, P->p, "a document name can't hold : or %%");
             fail(P, P->p, "a document name is letters, digits and . _ - /");
