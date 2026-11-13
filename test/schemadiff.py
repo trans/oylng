@@ -21,7 +21,7 @@ references counts it.
 Skipped, and counted: streams the checker types with a store of published
 schemas, which the engine doesn't look up, a limit of 0, which the tool
 takes as the default, and those the engine refuses because they use what
-it doesn't do yet (patterns, `!**`). Where both
+it doesn't do yet (`!**`). Where both
 refuse, the data paths are compared too, and a different one is reported
 but isn't a disagreement: the checker's path is the first fault it meets.
 Exits with 1 if there are any disagreements. With --seeds, also writes each
@@ -104,7 +104,7 @@ def checker_schema(ns, c):
 def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=None):
     sf = os.path.join(tmp, 'stream.yaml')
     with open(sf, 'w', encoding='utf-8', newline='') as f: f.write(framed(stream))
-    cmd = [tool, '--typed']
+    cmd = [tool, '--typed', '--every-entry']   # typed() checks every entry of a stream with no document
     if app:
         af = os.path.join(tmp, 'app.yaml')
         with open(af, 'w', encoding='utf-8', newline='') as f: f.write(framed(app[0]))
@@ -232,7 +232,7 @@ def main():
         print('  engine: ', short(got[1], 300), '(refuses)' if got[0] != 'ok' else '')
     for c, want, got in paths[:20] if verbose else []:
         print('PATH:', short(c['stream'], 120), '| checker', want[1][:80], '| engine', got[1][:80])
-    print(f'{n} cases: {agree} agree, {len(differ)} differ, {skipped} skipped (patterns or !**), '
+    print(f'{n} cases: {agree} agree, {len(differ)} differ, {skipped} skipped (!**, not built yet), '
           f'{store} with a store and {zero} with a limit of 0 not run; {len(paths)} refused at different paths')
     sys.exit(1 if differ else 0)
 

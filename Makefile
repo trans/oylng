@@ -31,7 +31,7 @@ SCHEMACHECK ?= $(YAML2)/.ai/memory/schemacheck.py
 
 SAN := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-api test-emit test-schema test-suite test-plain test-diff test-schema-diff test-asan bench bench-files fuzz clean
+.PHONY: all test test-api test-emit test-schema test-suite test-plain test-diff test-schema-diff test-pattern-diff test-asan bench bench-files fuzz clean
 
 all: $(LIB) $(TOOL)
 
@@ -58,6 +58,10 @@ $(OBJDIR)/test_schema: test/test_schema.c $(LIB)
 
 $(OBJDIR)/test_emit: test/test_emit.c $(LIB)
 	$(CC) $(OYLNG_CFLAGS) $< $(LIB) $(OYLNG_LDFLAGS) -o $@
+
+# Part 2's patterns, for test-pattern-diff: it uses the library's own
+$(OBJDIR)/rx_batch: test/rx_batch.c $(LIB)
+	$(CC) $(OYLNG_CFLAGS) -I$(SRCDIR) $< $(LIB) $(OYLNG_LDFLAGS) -o $@
 
 $(OBJDIR)/test_batch: test/test_batch.c tools/events.h $(LIB)
 	$(CC) $(OYLNG_CFLAGS) -Itools $< $(LIB) $(OYLNG_LDFLAGS) -o $@
@@ -130,6 +134,11 @@ test-diff: $(OBJDIR)/test_batch
 # Part 2: the schema checker's examples and edge cases through this parser
 test-schema-diff: $(TOOL)
 	python3 -I test/schemadiff.py $(SCHEMACHECK) $(SCHEMA_SPEC) $(TOOL)
+
+# Part 2's patterns: generated ones through this parser and the checker's
+PATTERN_N ?= 20000
+test-pattern-diff: $(OBJDIR)/rx_batch
+	python3 -I test/rxdiff.py $(SCHEMACHECK) $(OBJDIR)/rx_batch -n $(PATTERN_N)
 
 # Pinned to one core if BENCH_CPU is set: make bench BENCH_CPU=5
 bench: $(OBJDIR)/bench_parser

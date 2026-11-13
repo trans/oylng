@@ -15,16 +15,25 @@
   time's fraction (`oylng_parser_set_cut`). `!int` is -2^63 to 2^64-1,
   `!float` the nearest binary64 (ties to even), `!bigint` and `!decimal`
   are delivered as written, and a time holds nanoseconds, a leap second and
-  the year 0000. Not yet: patterns and `!**`, which a schema is refused for,
-  saying so, and published names. `oylng --typed` types a stream and
-  writes each value with its type.
-- Tested: 44 API checks and the draft's 42 examples without patterns or
-  `!**` (`make test`); 526 of the streams the draft's schema checker
-  (yaml2's `schemacheck.py`) types in its examples and edge cases, each
-  refused by both or accepted with the same values (`make
-  test-schema-diff`); GitHub's workflow format as a shadow schema, on the
-  490 workflow files of yaml2's public sample, with the checker's verdict
-  and refusal path on every file. The fuzzer types each stream too.
+  the year 0000. Patterns (sections 4.3 and 4.5) are I-Regexp (RFC 9485),
+  read and counted as the draft says, with Unicode 16's categories for
+  `\p{..}`, and matched without backtracking, in time linear in the text;
+  a number a pattern matched is delivered in the standard spelling. Not
+  yet: `!**`, which a schema is refused for, saying so, and published
+  names. `oylng --typed` types a stream and writes each value with its
+  type; with `--every-entry`, a stream with a table and no document is
+  checked as a schema file, every entry as a root.
+- Tested: 60 API checks and the draft's 59 examples without `!**` (`make
+  test`); 716 of the streams the draft's schema checker (yaml2's
+  `schemacheck.py`) types in its examples and edge cases, each refused by
+  both or accepted with the same values (`make test-schema-diff`, with
+  `--every-entry`, as the checker checks a stream with no document); 50,000
+  generated patterns and 199,553 strings, read, counted and matched as the
+  checker's reading run by Python's `re` does (`make test-pattern-diff`);
+  GitHub's workflow format and Compose as shadow schemas, on the 490
+  workflow and 311 Compose files of yaml2's public sample, with the
+  checker's verdict and refusal path on every file. The fuzzer types each
+  stream too.
 - `oylng_event` gains `plain`, at its end, and the tree
   `oylng_node_plain`: whether a scalar was written plain, as part 2 needs,
   since a quoted `"3"` is never an `!int`.

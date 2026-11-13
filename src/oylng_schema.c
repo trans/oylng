@@ -207,39 +207,36 @@ static size_t args_end(sctx *S, const char *s, size_t n, size_t i, size_t pos) {
 
 typedef struct { const char *s; size_t n; } span;
 
-/* s split at sep outside brackets and type parentheses, into the scratch
- * from *count on */
-static void split(sctx *S, const char *s, size_t n, const char *sep, size_t pos, span **out, size_t *count,
-                  size_t *cap) {
-    size_t sl = strlen(sep), b = 0, depth = 0;
-    for (size_t i = 0; i < n;) {
-        char c = s[i];
-        if (c == '(' && opens_args(s, i)) { i = args_end(S, s, n, i, pos); continue; }
-        if (c == '[') depth++;
-        if (c == ']' && depth) depth--;
-        if (!depth && n - i >= sl && memcmp(s + i, sep, sl) == 0) {
-            if (*count == *cap) {
-                size_t nc = *cap ? *cap * 2 : 16;
-                span *ns = realloc(*out, nc * sizeof *ns);
-                if (!ns) nomem(S);
-                *out = ns;
-                *cap = nc;
+/* s split at sep outside brackets and type parentheses, in the arena: read
+ * twice, counting and then filling, so that a refusal on the way (an
+ * unclosed parenthesis) leaves nothing on the heap */
+static span *split(sctx *S, const char *s, size_t n, const char *sep, size_t pos, size_t *count) {
+    size_t sl = strlen(sep);
+    span *out = NULL;
+    size_t k = 0;
+    for (int fill = 0; fill < 2; fill++) {
+        size_t b = 0, depth = 0;
+        k = 0;
+        for (size_t i = 0; i < n;) {
+            char c = s[i];
+            if (c == '(' && opens_args(s, i)) { i = args_end(S, s, n, i, pos); continue; }
+            if (c == '[') depth++;
+            if (c == ']' && depth) depth--;
+            if (!depth && n - i >= sl && memcmp(s + i, sep, sl) == 0) {
+                if (fill) out[k] = (span){ s + b, i - b };
+                k++;
+                i += sl;
+                b = i;
+                continue;
             }
-            (*out)[(*count)++] = (span){ s + b, i - b };
-            i += sl;
-            b = i;
-            continue;
+            i++;
         }
-        i++;
+        if (fill) out[k] = (span){ s + b, n - b };
+        k++;
+        if (!fill) out = alloc(S, k * sizeof *out);
     }
-    if (*count == *cap) {
-        size_t nc = *cap ? *cap * 2 : 16;
-        span *ns = realloc(*out, nc * sizeof *ns);
-        if (!ns) nomem(S);
-        *out = ns;
-        *cap = nc;
-    }
-    (*out)[(*count)++] = (span){ s + b, n - b };
+    *count = k;
+    return out;
 }
 
 static bool ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
@@ -289,7 +286,20 @@ static void limits(sctx *S, xt *t, const char *a, size_t n, const char *whole_te
         std != STD_NULL)
         bad(S, pos, "%.*s: !%s takes nothing in parentheses", (int)(wn > 60 ? 60 : wn), whole_text,
             oylng__std_names[std]);
-    if (memchr(a, '/', n)) bad(S, pos, "%.*s: patterns aren't supported yet", (int)(wn > 60 ? 60 : wn), whole_text);
+    /* a pattern is last, from the first /, with one space before it */
+    const char *slash = memchr(a, '/', n);
+    if (slash) {
+        size_t si = (size_t)(slash - a), pl = n - si;
+        if (pl < 2 || a[n - 1] != '/') bad(S, pos, "bad pattern: %.*s", (int)(wn > 60 ? 60 : wn), whole_text);
+        if (si && a[si - 1] != ' ') bad(S, pos, "bad limit: %.*s", (int)(wn > 60 ? 60 : wn), whole_text);
+        const char *why = NULL;
+        int r = oylng__rx_compile(S->A, slash + 1, pl - 2, CEILING, &t->u.std.rx, &t->u.std.rxcount, &why);
+        if (r == -2) nomem(S);
+        if (r < 0) bad(S, pos, "%s: %.*s", why, (int)(wn > 60 ? 60 : wn), whole_text);
+        t->flags |= XF_PAT;
+        n = si ? si - 1 : 0;
+        if (!n) return;
+    }
     bool rng = false;
     size_t k = 0;
     for (size_t i = 0; i <= n; k++) {
@@ -368,13 +378,8 @@ static xt *atom(sctx *S, span p, size_t pos, unsigned depth) {
     if (s[0] == '[') {
         if (s[n - 1] != ']') bad(S, pos, "bad sequence: %.*s", (int)(n > 60 ? 60 : n), s);
         if (depth >= MAX_TEXT_DEPTH) bad(S, pos, "sequences in a type nested more than %d deep", MAX_TEXT_DEPTH);
-        span *items = NULL;
-        size_t ni = 0, cap = 0;
-        split(S, s + 1, n - 2, ",", pos, &items, &ni, &cap);
-        /* items is the heap's: copy it to the arena before anything can fail */
-        span *it = alloc(S, ni * sizeof *it);
-        memcpy(it, items, ni * sizeof *it);
-        free(items);
+        size_t ni;
+        span *it = split(S, s + 1, n - 2, ",", pos, &ni);
         for (size_t i = 0; i < ni; i++) it[i] = strip(it[i]);
         xt *t = new_xt(S, X_SEQ, pos);
         if (it[ni - 1].n == 3 && memcmp(it[ni - 1].s, "...", 3) == 0) {
@@ -397,12 +402,8 @@ static xt *atom(sctx *S, span p, size_t pos, unsigned depth) {
 
 /* A type expression: part (" | " part)* */
 static xt *parse_expr(sctx *S, const char *s, size_t n, size_t pos, unsigned depth) {
-    span *parts = NULL;
-    size_t np = 0, cap = 0;
-    split(S, s, n, " | ", pos, &parts, &np, &cap);
-    span *ps = alloc(S, np * sizeof *ps);
-    memcpy(ps, parts, np * sizeof *ps);
-    free(parts);
+    size_t np;
+    span *ps = split(S, s, n, " | ", pos, &np);
     for (size_t i = 0; i < np; i++)
         if (ps[i].n && (ps[i].s[0] == ' ' || ps[i].s[ps[i].n - 1] == ' '))
             bad(S, pos, "a part starts or ends with a space: %.*s", (int)(n > 60 ? 60 : n), s);
@@ -519,7 +520,8 @@ static void fill(sctx *S, xt *t) {
     kids k = { S, NULL, 0, 0, false };
     bool ok = oylng__table_children(S->P, t->node, kid, &k);
     if (!ok || k.oom) { free(k.v); nomem(S); }
-    uint32_t *c = alloc(S, (size_t)k.n * sizeof *c);
+    uint32_t *c = oylng_arena_alloc(S->A, k.n ? (size_t)k.n * sizeof *c : 1, 8);
+    if (!c) { free(k.v); nomem(S); }
     if (k.n) memcpy(c, k.v, (size_t)k.n * sizeof *c);
     uint32_t n = k.n;
     free(k.v);
@@ -666,9 +668,19 @@ static uint64_t full_of(const xt *t) {
         return sat(1, t->u.name->full);
     case X_MAP:
         return 1 + (uint64_t)t->u.map.nf + t->u.map.nrows + (t->u.map.other != NULL);
+    case X_STD:
+        return (t->flags & XF_PAT) ? t->u.std.rxcount : 1;   /* a pattern its count */
     default:
         return 1;
     }
+}
+
+/* Positions in a union (section 9): a literal none, a type with a pattern
+ * its pattern's count, any other 1 */
+static uint64_t positions(const xt *x) {
+    if (x->kind == X_LIT) return 0;
+    if (x->kind == X_STD && (x->flags & XF_PAT)) return x->u.std.rxcount;
+    return 1;
 }
 
 /* The names an entry's type is, written bare or in a union: the edges of
@@ -816,18 +828,20 @@ static void expand(sctx *S, xt *t) {
     if (no) memcpy(a->p, out, (size_t)no * sizeof *a->p);
     a->n = no;
     a->seq = a->any = NONE;
-    uint32_t nlit = 0, count = 0;
+    uint32_t nlit = 0;
+    uint64_t count = 0;
     for (uint32_t i = 0; i < no; i++) {
         xt *x = a->p[i].t;
         if (x->kind == X_LIT) { nlit++; continue; }
-        count++;
+        count = sat(count, positions(x));
         if (x->kind == X_SEQ) {
             if (a->seq != NONE) bad(S, t->pos, "more than one sequence alternative");
             a->seq = i;
         } else if (x->kind == X_MAP) a->nmaps++;
         else if (x->std == STD_ANY && a->any == NONE) a->any = i;
     }
-    if (count > CEILING) bad(S, t->pos, "a union of %u positions, past the ceiling of %d", count, CEILING);
+    if (count > CEILING)
+        bad(S, t->pos, "a union of %llu positions, past the ceiling of %d", (unsigned long long)count, CEILING);
     a->all_lits = no && nlit == no;
     if (a->nmaps) {
         a->maps = alloc(S, a->nmaps * sizeof *a->maps);
@@ -855,25 +869,27 @@ static void expand(sctx *S, xt *t) {
 }
 
 /* The type keys of mappings, which a key is tried against as one union */
-static uint32_t key_count(const xt *m) {
-    uint32_t n = 0;
+static uint64_t key_count(const xt *m) {
+    uint64_t n = 0;
     for (uint32_t i = 0; i < m->u.map.nrows; i++) {
         const xalts *a = m->u.map.rows[i].key->alts;
-        for (uint32_t j = 0; j < a->n; j++) n += a->p[j].t->kind != X_LIT;
+        for (uint32_t j = 0; j < a->n; j++) n = sat(n, positions(a->p[j].t));
     }
     return n;
 }
 
 static void key_ceilings(sctx *S, xt *t) {
     const xalts *a = t->alts;
-    uint32_t all = 0;
+    uint64_t all = 0;
     for (uint32_t i = 0; i < a->nmaps; i++) {
-        uint32_t k = key_count(a->p[a->maps[i]].t);
-        if (k > CEILING) bad(S, a->p[a->maps[i]].t->pos, "type keys of %u positions, past the ceiling of %d", k, CEILING);
-        all += k;
+        uint64_t k = key_count(a->p[a->maps[i]].t);
+        if (k > CEILING)
+            bad(S, a->p[a->maps[i]].t->pos, "type keys of %llu positions, past the ceiling of %d",
+                (unsigned long long)k, CEILING);
+        all = sat(all, k);
         if (all > CEILING && a->nmaps > 1)
-            bad(S, t->pos, "the type keys of a union's mappings have %u positions, past the ceiling of %d", all,
-                CEILING);
+            bad(S, t->pos, "the type keys of a union's mappings have %llu positions, past the ceiling of %d",
+                (unsigned long long)all, CEILING);
     }
 }
 

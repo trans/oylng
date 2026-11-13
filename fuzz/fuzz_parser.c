@@ -125,8 +125,7 @@ static void check_value(const oylng_typed *t, oylng_value v, size_t *budget) {
             !(s.len == 5 && !memcmp(s.data, "false", 5) && !oylng_value_bool(t, v)))
             abort();
         break;
-    case OYLNG_T_NULL:
-        if (s.len && !(s.len == 4 && !memcmp(s.data, "null", 4))) abort();
+    case OYLNG_T_NULL:   /* "null", empty for an optional key, or what a pattern took */
         break;
     case OYLNG_T_DATE: case OYLNG_T_DATETIME:
         if (!oylng_value_datetime(t, v, &dt) || dt.year < 0 || dt.year > 9999 || dt.month < 1 ||

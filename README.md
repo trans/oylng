@@ -118,9 +118,11 @@ named and recursive types, references and merges in a schema, section 11's
 typed count, and an application's cut of a time's fraction. `!int` is
 -2^63 to 2^64-1, `!float` the nearest binary64, and `!bigint` and
 `!decimal` are delivered as written; a time holds nanoseconds, a leap
-second and the year 0000. Not yet: patterns (`!str(/.../)` and the like)
-and `!**`, for which a schema is refused, saying so, and published names,
-which stamp nothing. `include/oylng/schema.h` documents the rest.
+second and the year 0000. Patterns (`!str(/[a-z][a-z0-9-]*/)` and the like)
+are I-Regexp, matched without backtracking, so in time linear in the
+text, with Unicode 16's categories for `\p{..}`. Not yet: `!**`, for which
+a schema is refused, saying so, and published names, which stamp nothing.
+`include/oylng/schema.h` documents the rest.
 
 `oylng --typed` types a stream and writes each document as JSON, each
 value with its type:
@@ -128,6 +130,7 @@ value with its type:
 ```sh
 build/oylng --typed file.yaml                      # by its stamps
 build/oylng --typed --schema app.yaml svc file.yaml
+build/oylng --typed --every-entry app.yaml         # a schema file: every entry checked
 ```
 
 ## Writing YAML 2.0
@@ -170,12 +173,15 @@ build/oylng --emit --flow file.yaml      # one line per document
 
 ## Building and testing
 
-`make` builds `build/liboylng.a` and `build/oylng`.
+`make` builds `build/liboylng.a` and `build/oylng`. `src/oylng_ucd.c`, the
+Unicode categories part 2's patterns use, is written by
+`python3 -I tools/gen_ucd.py > src/oylng_ucd.c`, from Python's Unicode 16
+or later.
 
 - `make test` runs the API tests, the emitter's tests, part 2's tests and
   the YAML 2.0 test suite. Part 2's run the draft's examples, read from
   `../yaml2/spec/yaml-easy-schema.md` (`SCHEMA_SPEC=`), skipping those with
-  patterns or `!**`. The emitter's write every string of up to three characters
+  `!**`. The emitter's write every string of up to three characters
   from the ones that matter to YAML, and random longer ones, in each place
   a scalar can go, and read them back; and each suite test that passes is
   written again four ways and must read back the same. Each suite test is
@@ -193,8 +199,12 @@ build/oylng --emit --flow file.yaml      # one line per document
 - `make test-schema-diff` runs part 2's checker, yaml2's `schemacheck.py`
   on its `ai` branch (`SCHEMACHECK=`), on its examples and edge cases, and
   gives each stream it types to `oylng --typed`: both must refuse it, or
-  both accept it with the same values. It skips those with patterns or
-  `!**`.
+  both accept it with the same values. It skips those with `!**`.
+- `make test-pattern-diff` generates patterns (`PATTERN_N=`, 20,000 by
+  default), with strings that match them and strings that nearly do, and
+  some patterns broken on purpose, and gives each to this parser and to
+  the checker's reading of it, run by Python's `re`: both must refuse the
+  pattern, or count it the same and match each string the same.
 - `make fuzz` runs libFuzzer for five minutes (`FUZZ_TIME=` seconds), with
   one worker, seeded from the suite, and from the schema checker's streams
   if it is there. Each stream read without error is written again by the

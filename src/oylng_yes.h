@@ -51,6 +51,32 @@ int  oylng__date(const char *s, size_t n, bool full, bool cut, oylng_datetime *o
  * out isn't NULL (n * 3 / 4 bytes are enough), and how many */
 bool oylng__base64(const char *s, size_t n, unsigned char *out, size_t *outlen);
 
+/* ── Patterns (oylng_regex.c, oylng_ucd.c) ───────────────────
+ * I-Regexp (RFC 9485) as section 4.3 has it, matched whole. */
+
+typedef struct oylng__rx oylng__rx;
+
+/* What matching needs, kept by the caller between matches */
+typedef struct {
+    uint32_t *buf;
+    size_t    cap;
+    uint32_t  gen;
+} oylng__rxscr;
+
+/* Reads the pattern p, n bytes of UTF-8 between the slashes: 0 if it is
+ * I-Regexp, with *count its count (section 9, saturating) and *out its
+ * matcher, in A, if the count is no more than build_max (else NULL); -1 if
+ * it isn't, *why saying why; -2 if memory runs out. */
+int  oylng__rx_compile(oylng_arena *A, const char *p, size_t n, uint64_t build_max, oylng__rx **out,
+                       uint64_t *count, const char **why);
+/* 1 if the whole of s matches, 0 if not, -1 if memory runs out */
+int  oylng__rx_match(const oylng__rx *rx, const char *s, size_t n, oylng__rxscr *scr);
+void oylng__rxscr_free(oylng__rxscr *scr);
+
+/* A code point's general category: 0 Lu to 29 Cn, in oylng_regex.c's order */
+unsigned oylng__ucd_cat(uint32_t cp);
+extern const char oylng__ucd_version[];
+
 /* ── A compiled schema (oylng_schema.c) ──────────────────────
  * A type expression is an xt. A schema is compiled from a table's nodes,
  * each once, so a node pasted in two places is one type. A place is an xt
@@ -69,6 +95,7 @@ enum { STD_STR, STD_INT, STD_BIGINT, STD_FLOAT, STD_DECIMAL, STD_BOOL, STD_NULL,
 #define XF_PLACE  16u    /* counted in the schema's full size */
 #define XF_TYPES  32u    /* values are typed with it, so it has its alternatives */
 #define XF_FILLED 64u    /* X_SEQ, X_MAP: its children are compiled */
+#define XF_PAT   128u    /* X_STD: a pattern */
 
 typedef struct oylng__xt    xt;
 typedef struct oylng__entry centry;
@@ -119,7 +146,12 @@ struct oylng__xt {
     union {
         struct { xt **v; uint32_t n; } alt;
         xstr lit;
-        struct { oylng__num lo, hi; uint64_t prec, scale; } std;
+        struct {
+            oylng__num lo, hi;
+            uint64_t   prec, scale;
+            oylng__rx *rx;        /* XF_PAT: its matcher, if within the ceiling */
+            uint64_t   rxcount;   /* XF_PAT: its count (section 9) */
+        } std;
         centry *name;
         struct { xt **items; uint32_t n; xt *rest; } seq;
         struct {

@@ -25,15 +25,18 @@
 typedef struct {
     uint8_t  type;     /* oylng_type */
     uint8_t  neg;      /* OYLNG_T_INT: below 0 */
-    uint16_t unused;
+    uint16_t own;      /* BIGINT, DECIMAL: its text is in bytes, at a, x.n
+                          long: a number a pattern matched, in the standard
+                          spelling (section 4.5) */
     uint32_t node;     /* the tree's node */
     uint32_t name;     /* in names, or NONE */
     uint32_t a;        /* SEQUENCE, MAPPING: where its children start in kids;
-                          BINARY: where its bytes start */
+                          BINARY, and BIGINT and DECIMAL with own: where its
+                          bytes start */
     union {
         uint64_t u;    /* INT: its magnitude */
         double   f;
-        uint64_t n;    /* BINARY: how many bytes */
+        uint64_t n;    /* BINARY, and BIGINT and DECIMAL with own: how many bytes */
     } x;
 } tval;
 
@@ -78,6 +81,9 @@ typedef struct {
     uint8_t          *ok;
     uint32_t         *req;
     size_t            capok;
+    oylng__rxscr      rxs;        /* for matching patterns */
+    char             *canon;      /* a number a pattern matched, as spelled */
+    size_t            capcanon;
     jmp_buf           jb;
     oylng_status      st;
 } typer;
@@ -195,6 +201,8 @@ typedef struct {
     bool       neg;
     uint64_t   u;
     double     f;
+    const char *text;   /* BIGINT, DECIMAL: a pattern's number, as spelled */
+    size_t     textlen;
     char       why[120];
 } scalar;
 
@@ -234,14 +242,76 @@ static bool outside(const xt *x, const oylng__num *v) {
 
 #define SHOW(n) (int)((n) > 40 ? 40 : (n))
 
-static int match_std(const typer *R, const xt *x, const char *s, size_t n, bool plain, scalar *out) {
+/* Whether the whole of s matches x's pattern */
+static bool pat_match(typer *R, const xt *x, const char *s, size_t n) {
+    if (!x->u.std.rx) return false;   /* past the ceiling: never compiled into a schema */
+    int r = oylng__rx_match(x->u.std.rx, s, n, &R->rxs);
+    if (r < 0) nomem(R);
+    return r == 1;
+}
+
+/* Section 4.5: what a pattern on a number matched, read as the number and
+ * written in the standard spelling, into R->canon: no +, no leading zeros, a
+ * digit on each side of a point, the exponent as written. For !int and
+ * !bigint, [-+]? digits; for !float and !decimal, [-+]? digits with at most
+ * one point and an exponent. False if it isn't that. */
+static bool pat_number(typer *R, bool integer, const char *s, size_t n, size_t *len) {
+    size_t i = 0;
+    bool neg = false;
+    if (i < n && (s[i] == '-' || s[i] == '+')) neg = s[i++] == '-';
+    size_t ib = i;
+    while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+    size_t ie = i, fb = i, fe = i;
+    if (!integer && i < n && s[i] == '.') {
+        fb = ++i;
+        while (i < n && s[i] >= '0' && s[i] <= '9') i++;
+        fe = i;
+    }
+    if (ie == ib && fe == fb) return false;
+    size_t eb = i;
+    if (!integer && i < n && (s[i] == 'e' || s[i] == 'E')) {
+        size_t j = i + 1;
+        if (j < n && (s[j] == '-' || s[j] == '+')) j++;
+        size_t d = j;
+        while (j < n && s[j] >= '0' && s[j] <= '9') j++;
+        if (j == d) return false;
+        i = j;
+    }
+    if (i != n) return false;
+    while (ib < ie && s[ib] == '0') ib++;
+    if (integer && ib == ie) neg = false;   /* -0 is 0 */
+    R->canon = room(R, R->canon, &R->capcanon, n + 2, 1);
+    char *o = R->canon;
+    size_t k = 0;
+    if (neg) o[k++] = '-';
+    if (ib == ie) o[k++] = '0';
+    memcpy(o + k, s + ib, ie - ib);
+    k += ie - ib;
+    if (fe > fb) {
+        o[k++] = '.';
+        memcpy(o + k, s + fb, fe - fb);
+        k += fe - fb;
+    }
+    memcpy(o + k, s + eb, n - eb);
+    k += n - eb;
+    *len = k;
+    return true;
+}
+
+static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain, scalar *out) {
     const char *name = oylng__std_names[x->std];
     oylng__num num;
     out->neg = false;   /* what a match doesn't set is 0 */
     out->u = 0;
     out->f = 0;
+    out->text = NULL;
+    out->textlen = 0;
     switch (x->std) {
     case STD_STR:
+        if ((x->flags & XF_PAT) && !pat_match(R, x, s, n)) {
+            snprintf(out->why, sizeof out->why, "'%.*s' does not match", SHOW(n), s);
+            return NO_MATCH;
+        }
         if (x->flags & (XF_LO | XF_HI)) {
             uint64_t cps = 0;
             for (size_t i = 0; i < n; i++) cps += ((unsigned char)s[i] & 0xC0) != 0x80;
@@ -287,6 +357,25 @@ static int match_std(const typer *R, const xt *x, const char *s, size_t n, bool 
     }
     default:
         break;
+    }
+    if ((x->flags & XF_PAT) && x->std != STD_STR) {
+        /* section 4.5: the pattern replaces the spelling */
+        if (!pat_match(R, x, s, n)) {
+            snprintf(out->why, sizeof out->why, "'%.*s' does not match", SHOW(n), s);
+            return NO_MATCH;
+        }
+        if (x->std == STD_NULL) { out->type = OYLNG_T_NULL; return MATCH; }
+        bool integer = x->std == STD_INT || x->std == STD_BIGINT;
+        size_t len;
+        if (!pat_number(R, integer, s, n, &len)) {
+            snprintf(out->why, sizeof out->why, "'%.*s' matched, and is not %s", SHOW(n), s,
+                     integer ? "an integer" : "a number");
+            return REFUSED;
+        }
+        s = R->canon;
+        n = len;
+        out->text = s;
+        out->textlen = n;
     }
     switch (x->std) {
     case STD_INT:
@@ -388,9 +477,23 @@ static uint32_t scalar_val(typer *R, uint32_t node, const scalar *sc, const cent
     t->neg = sc->neg;
     if (sc->type == OYLNG_T_FLOAT) t->x.f = sc->f;
     else t->x.u = sc->u;
+    if ((sc->type == OYLNG_T_BIGINT || sc->type == OYLNG_T_DECIMAL) && sc->text) {
+        oylng_typed *Y = R->Y;
+        if (Y->nb > UINT32_MAX - sc->textlen)
+            refuse_as(R, OYLNG_ERR_LIMIT, node, "a typed document of 4 GiB of bytes or more");
+        ROOM(R, Y->bytes, Y->capb, Y->nb + sc->textlen);
+        memcpy(Y->bytes + Y->nb, sc->text, sc->textlen);
+        t = &Y->v[v];
+        t->own = 1;
+        t->a = (uint32_t)Y->nb;
+        t->x.n = sc->textlen;
+        Y->nb += sc->textlen;
+    }
     if (sc->type == OYLNG_T_BINARY) {
         oylng_typed *Y = R->Y;
         oylng_str s = oylng_node_text(R->T, node);
+        if (Y->nb > UINT32_MAX - (s.len / 4 * 3 + 3))
+            refuse_as(R, OYLNG_ERR_LIMIT, node, "a typed document of 4 GiB of bytes or more");
         ROOM(R, Y->bytes, Y->capb, Y->nb + s.len / 4 * 3 + 3);
         size_t len;
         oylng__base64(s.data, s.len, Y->bytes + Y->nb, &len);
@@ -728,6 +831,8 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
     free(R.nms);
     free(R.ok);
     free(R.req);
+    free(R.canon);
+    oylng__rxscr_free(&R.rxs);
     if (!ok) {
         oylng_typed_free(Y);
         return R.st;
@@ -767,6 +872,7 @@ oylng_node oylng_value_node(const oylng_typed *Y, oylng_value v) {
 
 oylng_str oylng_value_text(const oylng_typed *Y, oylng_value v) {
     const tval *t = val(Y, v);
+    if (t && t->own) return (oylng_str){ (const char *)Y->bytes + t->a, (size_t)t->x.n };
     return t ? oylng_node_text(Y->T, t->node) : (oylng_str){ NULL, 0 };
 }
 

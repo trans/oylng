@@ -2,15 +2,17 @@
  * oylng — read a YAML 2.0 stream and show what it delivers
  *
  *     oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]
- *     oylng --typed [--schema SCHEMA ROOT] [--cut] [--limit N] [FILE]
+ *     oylng --typed [--schema SCHEMA ROOT] [--cut] [--every-entry] [--limit N] [FILE]
  *
  * --events (the default) writes the events in the suite's notation;
  * --json writes one line of JSON per document; --emit writes the stream
  * again as YAML 2.0, its references resolved, in block style or with
  * --flow one line per document. --typed types each document (part 2, YAML
  * Easy Schema) by its stamp, or else by the entry ROOT of the file SCHEMA,
- * and writes one line of JSON per document, each value [type, value]; a
- * stream with a table and no documents has every entry checked as a root.
+ * and writes one line of JSON per document, each value [type, value]. As
+ * section 2 has it, only what a document reaches is checked, so a stream
+ * with a table and no documents loads, empty; with --every-entry, it is
+ * checked as a schema file is, every entry as a root.
  * --cut cuts a time's fraction to the digits the engine holds;
  * --typed-limit N, for tests, sets the size limit for part 2's counts
  * alone (a schema's full size, and typed), as yaml2's checker has them,
@@ -183,7 +185,7 @@ static void typed_json(strbuf *b, const oylng_typed *t, oylng_value v) {
 
 /* --typed */
 static int run_typed(oylng_parser *p, const char *in, size_t len, const char *path,
-                     const oylng_schema *app, uint64_t limit, uint64_t counts_limit) {
+                     const oylng_schema *app, uint64_t limit, uint64_t counts_limit, int every) {
     strbuf out = { 0 };
     oylng_typed *t;
     size_t docs = 0;
@@ -207,7 +209,7 @@ static int run_typed(oylng_parser *p, const char *in, size_t len, const char *pa
     }
     fwrite(out.data, 1, out.len, stdout);
     free(out.data);
-    if (!rc && !docs) {
+    if (!rc && !docs && every) {
         /* a schema file: every entry as a root */
         oylng_schema *all = oylng__schema_new(in, len, (oylng_str){ NULL, 0 }, limit, counts_limit);
         if (!all) { fputs("oylng: out of memory\n", stderr); return 2; }
@@ -222,7 +224,7 @@ static int run_typed(oylng_parser *p, const char *in, size_t len, const char *pa
 }
 
 int main(int argc, char **argv) {
-    int json = 0, emit = 0, flow = 0, typed = 0, cut = 0;
+    int json = 0, emit = 0, flow = 0, typed = 0, cut = 0, every = 0;
     const char *schema_path = NULL, *schema_root = NULL;
     unsigned indent = 2;
     unsigned long long limit = 0, counts_limit = 0;
@@ -235,12 +237,13 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--typed")) typed = 1, json = 0, emit = 0;
         else if (!strcmp(argv[i], "--schema") && i + 2 < argc) schema_path = argv[++i], schema_root = argv[++i];
         else if (!strcmp(argv[i], "--cut")) cut = 1;
+        else if (!strcmp(argv[i], "--every-entry")) every = 1;
         else if (!strcmp(argv[i], "--typed-limit") && i + 1 < argc) counts_limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--indent") && i + 1 < argc) indent = (unsigned)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--limit") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             puts("usage: oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]\n"
-                 "       oylng --typed [--schema SCHEMA ROOT] [--cut] [--limit N] [FILE]");
+                 "       oylng --typed [--schema SCHEMA ROOT] [--cut] [--every-entry] [--limit N] [FILE]");
             return 0;
         } else if (!path) path = argv[i];
         else { fprintf(stderr, "oylng: one file at a time\n"); return 2; }
@@ -280,7 +283,7 @@ int main(int argc, char **argv) {
         }
         oylng_parser_set_cut(p, cut);
         oylng__parser_set_counts_limit(p, counts_limit);
-        int rc = run_typed(p, in, len, path, app, limit, counts_limit);
+        int rc = run_typed(p, in, len, path, app, limit, counts_limit, every);
         oylng_schema_free(app);
         oylng_parser_free(p);
         free(in);

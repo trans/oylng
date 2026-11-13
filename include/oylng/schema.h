@@ -10,9 +10,11 @@
  * error is: the stream ends with OYLNG_ERR_SCHEMA, and the parser's error
  * gives the path to the value, with the line and column of the value.
  *
- * Not yet: patterns (`!str(/.../)` and the like) and `!**`, which make a
- * schema OYLNG_ERR_SCHEMA, saying so. A published name is never looked up,
- * as section 3.1 has it unless the application asks, so it stamps nothing.
+ * Patterns are I-Regexp (RFC 9485), matched in time linear in the text,
+ * with Unicode 16's categories for \p{..}; groups nest at most 256 deep.
+ * Not yet: `!**`, which makes a schema OYLNG_ERR_SCHEMA, saying so. A
+ * published name is never looked up, as section 3.1 has it unless the
+ * application asks, so it stamps nothing.
  */
 
 #ifndef OYLNG_SCHEMA_H
@@ -61,9 +63,12 @@ typedef enum {
                              and as a document no schema types is */
     OYLNG_T_STR,
     OYLNG_T_INT,        /**< -2^63 to 2^64-1 */
-    OYLNG_T_BIGINT,     /**< an integer of any size, its text as written */
+    OYLNG_T_BIGINT,     /**< an integer of any size, its text as written,
+                             or, matched by a pattern, as !int spells it */
     OYLNG_T_FLOAT,      /**< the nearest binary64 */
-    OYLNG_T_DECIMAL,    /**< a number exactly as written, its text */
+    OYLNG_T_DECIMAL,    /**< a number exactly as written, its text; matched
+                             by a pattern, in the standard spelling: no +,
+                             no leading zeros, a digit each side of a point */
     OYLNG_T_BOOL,
     OYLNG_T_NULL,
     OYLNG_T_DATE,
@@ -119,7 +124,9 @@ OYLNG_API oylng_type oylng_value_type(const oylng_typed *t, oylng_value v);
  *  read; for others, its mark and its text */
 OYLNG_API oylng_node oylng_value_node(const oylng_typed *t, oylng_value v);
 
-/** A scalar's text, as the tree has it; data NULL for a collection */
+/** A scalar's text, as the tree has it, but for a number a pattern matched
+ *  (OYLNG_T_BIGINT, OYLNG_T_DECIMAL), in the standard spelling; data NULL
+ *  for a collection */
 OYLNG_API oylng_str oylng_value_text(const oylng_typed *t, oylng_value v);
 
 /** The named type the value took, the nearest entry of the schema a type

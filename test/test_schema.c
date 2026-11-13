@@ -10,7 +10,7 @@
  * typed, and one with only a table has each entry checked as a root. A
  * typed value is compared with the JSON read as YAML 2.0, where a JSON
  * number, true, false and null are plain and a string is quoted. Examples
- * with what the engine doesn't do yet, patterns and !**, are skipped.
+ * with what the engine doesn't do yet, !**, are skipped.
  */
 
 #include "oylng/schema.h"
@@ -245,10 +245,8 @@ static const char *run_example(const char *s, size_t n, const char *want, size_t
 }
 
 static bool not_yet(const char *s, size_t n) {
-    for (size_t i = 0; i + 1 < n; i++) {
-        if ((s[i] == '(' || s[i] == '/') && s[i + 1] == (s[i] == '(' ? '/' : ')')) return true;
-        if (i + 2 < n && s[i] == '!' && s[i + 1] == '*' && s[i + 2] == '*') return true;
-    }
+    for (size_t i = 0; i + 2 < n; i++)
+        if (s[i] == '!' && s[i + 1] == '*' && s[i + 2] == '*') return true;
     return false;
 }
 
@@ -305,7 +303,7 @@ static void examples(const char *path) {
             fprintf(stderr, "FAIL the draft's example at line %zu: %s\n", b[i].line, r);
         } else pass++;
     }
-    printf("draft: %d examples pass, %d fail, %d skipped (patterns or !**)\n", pass, fail, skip);
+    printf("draft: %d examples pass, %d fail, %d skipped (!**)\n", pass, fail, skip);
     failed += fail;
     checks += pass + fail;
     free(b);
@@ -483,6 +481,63 @@ static void api(void) {
     CHECK(oylng_parse_typed(p, NULL, &y) == OYLNG_OK, "typed 28, under the limit: %s", oylng_parser_error(p));
     oylng_typed_free(y);
     oylng_parser_free(p);
+
+    /* patterns (sections 4.3 and 4.5): a number a pattern matched, in the
+       standard spelling */
+    y = typed(&p, "%YAML 2.0\n--- &\nb: !bigint(/[-+][0-9]+/)\nd: !decimal(/[-+]?[0-9]*\\.?[0-9]*/)\n"
+                  "i: !int(/[-+][0-9]+/)\nu: !str(/\\p{Lu}\\P{L}*/)\nr: [!b, !b, !d, !d, !d, !i, !u]\n--- !r\n"
+                  "[+0012, -000, +.5, -00.50, 7., -0, \"A1 \"]\n", NULL, &err);
+    CHECK(y != NULL, "patterns: %s", err ? err : "");
+    if (y) {
+        oylng_value r = oylng_typed_root(y);
+        static const char *const want[] = { "12", "0", "0.5", "-0.50", "7" };
+        for (size_t i = 0; i < 5; i++) {
+            oylng_str t = oylng_value_text(y, oylng_value_item(y, r, i));
+            CHECK(eq(t, want[i], strlen(want[i])), "the standard spelling of item %zu: %.*s", i, (int)t.len,
+                  t.data);
+        }
+        int64_t i64;
+        CHECK(oylng_value_int(y, oylng_value_item(y, r, 5), &i64) && i64 == 0, "-0 by a pattern is 0");
+        CHECK(oylng_value_type(y, oylng_value_item(y, r, 6)) == OYLNG_T_STR, "a quoted string matches");
+        oylng_typed_free(y);
+    }
+    oylng_parser_free(p);
+    y = typed(&p, "%YAML 2.0\n--- &\nn: !int(/[0-9_]+/) | !str\n--- !n\n1_000\n", NULL, &err);
+    CHECK(!y && err && strstr(err, "matched, and is not an integer"), "matched and unread refuses: %s",
+          err ? err : "accepted");
+    oylng_parser_free(p);
+    y = typed(&p, "%YAML 2.0\n--- &\nm:\n  !str(/x-.*/): !any\n  name: !str\n--- !m\nname: a\nx-b: [1]\n"
+                  "x-: c\n", NULL, &err);
+    CHECK(y != NULL, "a pattern as a type key: %s", err ? err : "");
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    y = typed(&p, "%YAML 2.0\n--- &\nm:\n  !str(/x-.*/): !any\n--- !m\ny-b: 1\n", NULL, &err);
+    CHECK(!y && err && strstr(err, "unknown key y-b"), "a key no pattern takes: %s", err ? err : "accepted");
+    oylng_parser_free(p);
+    /* a pattern counts its positions in the ceiling and the full size */
+    const char *wide = "%YAML 2.0\n--- &\na: !str(/(a|b){512}/)\n";
+    sc = oylng_schema_new(wide, strlen(wide), (oylng_str){ NULL, 0 }, 0);
+    CHECK(oylng_schema_status(sc) == OYLNG_OK, "1,024 positions load: %s", oylng_schema_error(sc));
+    oylng_schema_free(sc);
+    sc = oylng_schema_new(wide, strlen(wide), (oylng_str){ NULL, 0 }, 1023);
+    CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "full size 1024"),
+          "a pattern's full size: %s", oylng_schema_error(sc));
+    oylng_schema_free(sc);
+    const char *wider = "%YAML 2.0\n--- &\na: !str(/(a|b){512}c/)\n";
+    sc = oylng_schema_new(wider, strlen(wider), (oylng_str){ NULL, 0 }, 0);
+    CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "1025 positions"),
+          "1,025 don't: %s", oylng_schema_error(sc));
+    oylng_schema_free(sc);
+    /* refused part way through a union or a sequence (ASan sees a leak here) */
+    const char *unclosed = "%YAML 2.0\n--- &\na: !int | !int(1\nb: [!int, !str | !str(/x/, !int]\n";
+    sc = oylng_schema_new(unclosed, strlen(unclosed), S("a"), 0);
+    CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "unclosed parentheses"),
+          "unclosed in a union: %s", oylng_schema_error(sc));
+    oylng_schema_free(sc);
+    sc = oylng_schema_new(unclosed, strlen(unclosed), S("b"), 0);
+    CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "unclosed pattern"),
+          "unclosed in a sequence: %s", oylng_schema_error(sc));
+    oylng_schema_free(sc);
 
     /* an untyped document */
     y = typed(&p, "%YAML 2.0\n--- !elsewhere.com/x.yes\na: 1\n", NULL, &err);
