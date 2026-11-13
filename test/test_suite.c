@@ -161,9 +161,10 @@ static const char *round_trip(const char *in, size_t len, const char *limit, con
  * a lookup of a key doesn't give its value */
 static bool tree_events(const oylng_tree *t, oylng_node n, strbuf *ev, strbuf *offs) {
     oylng_kind k = oylng_node_kind(t, n);
-    oylng_event e = { OYLNG_EVT_SCALAR, oylng_node_text(t, n), oylng_node_mark(t, n).offset };
+    oylng_event e = { OYLNG_EVT_SCALAR, oylng_node_text(t, n), oylng_node_mark(t, n).offset,
+                      oylng_node_plain(t, n) };
     char o[32];
-    snprintf(o, sizeof o, "%zu\n", e.offset);
+    snprintf(o, sizeof o, k == OYLNG_NODE_STRING ? "%zu %c\n" : "%zu\n", e.offset, e.plain ? 'p' : 'q');
     sb_str(offs, o);
     if (k == OYLNG_NODE_STRING) {
         ev_line(ev, &e);
@@ -202,7 +203,7 @@ static const char *tree_check(const char *in, size_t len, const char *limit, con
     oylng_tree *t;
     oylng_status st;
     while ((st = oylng_parse_tree(p, &t)) == OYLNG_OK && t) {
-        oylng_event d = { OYLNG_EVT_DOC_START, oylng_tree_name(t), 0 };
+        oylng_event d = { OYLNG_EVT_DOC_START, oylng_tree_name(t), 0, false };
         ev_line(&ev, &d);
         if (!tree_events(t, oylng_tree_root(t), &ev, &of)) why = "a key's lookup is wrong";
         d.type = OYLNG_EVT_DOC_END;
@@ -279,7 +280,8 @@ static void run(const char *dir) {
         ev_line(&got, e);
         if (e->type == OYLNG_EVT_SCALAR || e->type == OYLNG_EVT_MAP_START || e->type == OYLNG_EVT_SEQ_START) {
             char o[32];
-            snprintf(o, sizeof o, "%zu\n", e->offset);
+            snprintf(o, sizeof o, e->type == OYLNG_EVT_SCALAR ? "%zu %c\n" : "%zu\n", e->offset,
+                     e->plain ? 'p' : 'q');
             sb_str(&offs, o);
         }
         if (e->type == OYLNG_EVT_STREAM_END) break;

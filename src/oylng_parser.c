@@ -93,6 +93,7 @@ typedef struct {
 typedef struct {
     uint32_t key, val, tdoc;
     uint64_t full;
+    bool     reached;   /* a type has reached it, so it can't be replaced */
 } entry;
 
 /* Reading events off the array */
@@ -158,6 +159,7 @@ struct oylng_parser {
     jmp_buf     jb;
 
     uint64_t limit;
+    uint64_t counts_limit;   /* part 2's, for tests: 0 for limit */
     unsigned max_levels;
 
     int      state;
@@ -235,6 +237,12 @@ struct oylng_parser {
        clear one of its own */
     uint64_t *tmemo;
     uint32_t  captmemo, tgen;
+
+    /* for the typed reader (oylng_typed.c): the table's schemas, let go
+       when the table is, and whether a time may be cut */
+    void     *sctx;
+    void    (*sctx_free)(void *);
+    bool      cut;
 
     oylng_status status;
     oylng_mark   errmark;
@@ -591,9 +599,16 @@ static inline size_t pos(const parser *P, const char *at) { return (size_t)(at -
 static void emit(parser *P, oylng_event_type t, const char *data, size_t len, size_t at) {
     oylng_event *e = &P->q[P->qn++];
     e->type = t;
+    e->plain = false;
     e->value.data = data;
     e->value.len = len;
     e->offset = at;
+}
+
+/* A scalar's event, plain if it was written plain or not at all */
+static void emit_scalar(parser *P, const char *data, size_t len, size_t at, int style) {
+    emit(P, OYLNG_EVT_SCALAR, data, len, at);
+    P->q[P->qn - 1].plain = style == S_PLAIN || style == S_EMPTY;
 }
 
 /* Lets the strings after m go, once the events made so far, which may
@@ -607,7 +622,7 @@ static void release_later(parser *P, oylng_arena_mark m) {
 }
 
 static void emit_str(parser *P, const scal *s) {
-    emit(P, OYLNG_EVT_SCALAR, s->data, s->len, pos(P, s->at));
+    emit_scalar(P, s->data, s->len, pos(P, s->at), s->style);
 }
 
 /* Counts a scalar (section 10), and makes its node if building */
@@ -1561,8 +1576,10 @@ static inline bool ff_plain(unsigned c) {
     return ff_alnum(c) || c == '.' || c == '_' || c == '+' || c == '-';
 }
 
-static inline void ff_emit(oylng_event *e, oylng_event_type t, const char *data, size_t len, size_t at) {
+static inline void ff_emit(oylng_event *e, oylng_event_type t, const char *data, size_t len, size_t at,
+                           bool plain) {
     e->type = t;
+    e->plain = plain;
     e->value.data = data;
     e->value.len = len;
     e->offset = at;
@@ -1598,7 +1615,7 @@ static bool flow_fast(parser *P) {
         if (c == '}' || c == ']') {
             if (st == VALUE || (c == '}') != map[depth - 1]) return false;
             q++;
-            ff_emit(&out[n++], c == '}' ? OYLNG_EVT_MAP_END : OYLNG_EVT_SEQ_END, NULL, 0, pos(P, q));
+            ff_emit(&out[n++], c == '}' ? OYLNG_EVT_MAP_END : OYLNG_EVT_SEQ_END, NULL, 0, pos(P, q), false);
             nk = k0[--depth];
             if (!depth) break;
             st = SEP;
@@ -1610,7 +1627,7 @@ static bool flow_fast(parser *P) {
             if (is_key || P->depth + depth + 1 > P->max_levels) return false;
             map[depth] = c == '{';
             k0[depth++] = nk;
-            ff_emit(&out[n++], c == '{' ? OYLNG_EVT_MAP_START : OYLNG_EVT_SEQ_START, NULL, 0, pos(P, q));
+            ff_emit(&out[n++], c == '{' ? OYLNG_EVT_MAP_START : OYLNG_EVT_SEQ_START, NULL, 0, pos(P, q), false);
             add++;
             q++;
             st = ITEM;
@@ -1643,7 +1660,7 @@ static bool flow_fast(parser *P) {
             keys[nk].k = d;
             keys[nk++].len = len;
         }
-        ff_emit(&out[n++], OYLNG_EVT_SCALAR, d, len, pos(P, a));
+        ff_emit(&out[n++], OYLNG_EVT_SCALAR, d, len, pos(P, a), *a != '"');
         add = sat(add, 1 + (uint64_t)len);
         st = is_key ? COLON : SEP;
     }
@@ -2046,6 +2063,9 @@ static uint32_t entry_key(parser *P, uint32_t k) {
     if (e->tdoc == P->tdoc)
         fail(P, P->in + kn->pos, "the key \"%.*s\" is repeated in this --- & document",
              (int)(kn->len > 60 ? 60 : kn->len), kn->data);
+    if (e->reached)   /* part 2, section 8 */
+        fail_as(P, OYLNG_ERR_SCHEMA, P->in + kn->pos, "the entry \"%.*s\" is replaced after a type reached it",
+                (int)(kn->len > 60 ? 60 : kn->len), kn->data);
     P->t_full = P->t_full > e->full ? P->t_full - e->full : 0;
     return s->val;
 }
@@ -2053,7 +2073,7 @@ static uint32_t entry_key(parser *P, uint32_t k) {
 static void entry_set(parser *P, uint32_t k, uint32_t v, uint32_t e) {
     if (P->nodes[v].lev > P->max_levels)
         fail_limit(P, P->in + P->nodes[k].pos, "this entry goes more than %u levels deep", P->max_levels);
-    entry en = { k, v, P->tdoc, sat(P->full[k], P->full[v]) };
+    entry en = { k, v, P->tdoc, sat(P->full[k], P->full[v]), false };
     if (e != NONE) { P->entries[e] = en; return; }
     P->entries = grow(P, P->entries, &P->capentries, P->nentries + 1, sizeof *P->entries);
     P->entries[P->nentries] = en;
@@ -2131,6 +2151,8 @@ static void reset_table(parser *P) {
     ix_clear(&P->tix);
     P->t_held = P->t_full = 0;
     oylng_arena_reset(P->strings);
+    if (P->sctx) P->sctx_free(P->sctx);
+    P->sctx = NULL;
 }
 
 static void discard_doc(parser *P) {
@@ -2338,7 +2360,7 @@ static bool handle(parser *P, uint32_t i) {
     }
     switch (nd->kind) {
     case N_STR:
-        emit(P, OYLNG_EVT_SCALAR, nd->data, nd->len, nd->pos);
+        emit_scalar(P, nd->data, nd->len, nd->pos, nd->sub);
         return true;
     case N_SEQ:
         emit(P, OYLNG_EVT_SEQ_START, NULL, 0, nd->pos);
@@ -2383,7 +2405,7 @@ static bool walk(parser *P) {
         if (f->mode == W_PLAN) {
             const node *k = &P->nodes[P->pairs[f->cur].key];
             f->want_val = 1;
-            emit(P, OYLNG_EVT_SCALAR, k->data, k->len, k->pos);
+            emit_scalar(P, k->data, k->len, k->pos, k->sub);
             return true;
         }
         uint32_t i = f->cur;
@@ -2527,6 +2549,7 @@ void oylng_parser_free(oylng_parser *P) {
     free(P->stack);
     free(P->g);
     free(P->tmemo);
+    if (P->sctx) P->sctx_free(P->sctx);
     oylng_arena_free(P->strings);
     oylng_arena_free(P->vals);
     free(P);
@@ -2581,6 +2604,52 @@ void oylng__table_node(const oylng_parser *P, uint32_t i, oylng__tnode *out) {
     out->data = nd->kind == N_STR ? nd->data : NULL;
     out->len = nd->kind == N_STR ? nd->len : 0;
     out->pos = nd->pos;
+    out->plain = nd->kind == N_STR && (nd->sub == S_PLAIN || nd->sub == S_EMPTY);
+}
+
+uint32_t oylng__table_entry(oylng_parser *P, const char *k, size_t kl, uint32_t *e) {
+    if (!P->nentries) return NONE;
+    slot *s = ix_find(P, &P->tix, ROOT, k, kl, key_hash(P, ROOT, k, kl));
+    if (!s) return NONE;
+    *e = s->val;
+    return deref(P, P->entries[s->val].val);
+}
+
+void oylng__entry_reach(oylng_parser *P, uint32_t e) { P->entries[e].reached = true; }
+
+uint32_t oylng__table_count(const oylng_parser *P) { return P->nentries; }
+
+void oylng__table_entry_at(const oylng_parser *P, uint32_t e, const char **k, size_t *kl) {
+    const node *kn = &P->nodes[P->entries[e].key];
+    *k = kn->data;
+    *kl = kn->len;
+}
+
+uint64_t oylng__parser_limit(const oylng_parser *P) { return P->limit; }
+
+uint64_t oylng__parser_counts_limit(const oylng_parser *P) { return P->counts_limit ? P->counts_limit : P->limit; }
+
+void oylng__parser_set_counts_limit(oylng_parser *P, uint64_t limit) { P->counts_limit = limit; }
+
+bool oylng__parser_cut(const oylng_parser *P) { return P->cut; }
+
+void oylng_parser_set_cut(oylng_parser *P, bool cut) {
+    if (P) P->cut = cut;
+}
+
+void *oylng__parser_ctx(const oylng_parser *P) { return P->sctx; }
+
+void oylng__parser_set_ctx(oylng_parser *P, void *ctx, void (*free_fn)(void *)) {
+    if (P->sctx && P->sctx != ctx) P->sctx_free(P->sctx);
+    P->sctx = ctx;
+    P->sctx_free = free_fn;
+}
+
+oylng_status oylng__parser_fail_at(oylng_parser *P, oylng_status st, size_t offset, const char *msg) {
+    if (P->state == ST_ERROR) return P->status;
+    oylng_status r = oylng__parser_fail(P, st, msg);
+    P->errmark = mark_of(P, P->in + offset);
+    return r;
 }
 
 bool oylng__table_children(const oylng_parser *P, uint32_t i, void (*fn)(void *, uint32_t), void *ctx) {

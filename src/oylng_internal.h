@@ -183,6 +183,7 @@ typedef struct {
     const char *data;   /* a string's text, valid while the parser's table is */
     size_t      len;
     size_t      pos;    /* where the table holds it */
+    bool        plain;  /* a string written plain, or an empty value */
 } oylng__tnode;
 
 void         oylng__parser_tree_mode(oylng_parser *p, bool on);
@@ -203,6 +204,44 @@ void         oylng__table_node(const oylng_parser *p, uint32_t i, oylng__tnode *
  * alternating, its merges applied. False if memory runs out. */
 bool         oylng__table_children(const oylng_parser *p, uint32_t i,
                                    void (*fn)(void *, uint32_t), void *ctx);
+
+/* ── Between the parser and the typed reader (part 2) ────────
+ * A schema is read from the table's nodes. A type that reaches an entry
+ * marks it, so that the parser refuses to replace it (part 2, section 8).
+ * The typed reader keeps the table's compiled schemas with the parser,
+ * which lets them go when it lets the table go. */
+
+/* The node of the table's entry named k, references followed, and in *e
+ * the entry's number; UINT32_MAX if the table has none */
+uint32_t     oylng__table_entry(oylng_parser *p, const char *k, size_t kl, uint32_t *e);
+void         oylng__entry_reach(oylng_parser *p, uint32_t e);
+/* The table's entries, numbered in the order first defined: how many, and
+ * entry e's name */
+uint32_t     oylng__table_count(const oylng_parser *p);
+void         oylng__table_entry_at(const oylng_parser *p, uint32_t e, const char **k, size_t *kl);
+uint64_t     oylng__parser_limit(const oylng_parser *p);
+/* The limit for part 2's counts, a schema's full size and typed: the
+ * parser's limit, unless a test sets one for them alone (0 to unset) */
+uint64_t     oylng__parser_counts_limit(const oylng_parser *p);
+void         oylng__parser_set_counts_limit(oylng_parser *p, uint64_t limit);
+/* oylng_schema_new, with counts_limit as above */
+struct oylng_schema *oylng__schema_new(const char *yaml, size_t len, oylng_str root, uint64_t limit,
+                                       uint64_t counts_limit);
+bool         oylng__parser_cut(const oylng_parser *p);
+void        *oylng__parser_ctx(const oylng_parser *p);
+void         oylng__parser_set_ctx(oylng_parser *p, void *ctx, void (*free_fn)(void *));
+/* As oylng__parser_fail, at an offset in the input */
+oylng_status oylng__parser_fail_at(oylng_parser *p, oylng_status st, size_t offset, const char *msg);
+
+/* The tree's side (oylng_tree.c). oylng__tree_read is oylng_parse_tree,
+ * calling at_start with the document's name before reading the rest of
+ * it: an error it gives ends the read. */
+oylng_status oylng__tree_read(oylng_parser *p, oylng_tree **out,
+                              oylng_status (*at_start)(void *ctx, oylng_str name), void *ctx);
+/* Whether node n was copied from the table, so that it may be shared */
+bool         oylng__node_shared(const oylng_tree *t, oylng_node n);
+/* The number of the pair whose key is key in mapping map, or UINT32_MAX */
+uint32_t     oylng__node_find(const oylng_tree *t, oylng_node map, oylng_str key);
 
 /* Fails the emitter, as its own errors do (oylng_emitter.c) */
 oylng_status oylng__emitter_fail(oylng_emitter *e, oylng_status st, const char *msg);

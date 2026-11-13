@@ -10,12 +10,18 @@
  * without error is written again by the emitter, which must accept it, and
  * what it writes must read back as the same events. Read as trees, the
  * stream must give the same events, or the same error, each key's value
- * must be found, and the trees must be written as the events were.
+ * must be found, and the trees must be written as the events were. Typed
+ * (part 2), by its stamps, and by the stream's own table as an application's
+ * schema rooted at `a` when it compiles as one, the stream must be refused
+ * where the events were, or for a schema; each typed value must be what its
+ * type says, each key's value found. The flow bit also turns on the cut.
  *
  *     clang -fsanitize=fuzzer,address,undefined -Iinclude src/oylng_*.c fuzz/fuzz_parser.c
  */
 
 #include "oylng/oylng.h"
+#include "oylng/schema.h"
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -61,6 +67,82 @@ static uint64_t tree_hash(uint64_t h, const oylng_tree *t, oylng_node n) {
     }
     if (oylng_node_item(t, n, c) != OYLNG_NO_NODE || oylng_node_key(t, n, c) != OYLNG_NO_NODE) abort();
     return tv_hash(h, map ? OYLNG_EVT_MAP_END : OYLNG_EVT_SEQ_END, none);
+}
+
+/* Each typed value is what its type says. A typed document shares a value
+ * reached twice, so the walk stops after a budget of visits. */
+static void check_value(const oylng_typed *t, oylng_value v, size_t *budget) {
+    if (!*budget) return;
+    --*budget;
+    oylng_type ty = oylng_value_type(t, v);
+    oylng_node n = oylng_value_node(t, v);
+    const oylng_tree *tr = oylng_typed_tree(t);
+    oylng_kind k = oylng_node_kind(tr, n);
+    oylng_str s = oylng_value_text(t, v);
+    size_t c = oylng_value_count(t, v);
+    int64_t i64;
+    uint64_t u64;
+    oylng_datetime dt;
+    switch (ty) {
+    case OYLNG_T_ANY:
+        if (k == OYLNG_NODE_NONE) abort();
+        return;
+    case OYLNG_T_SEQUENCE:
+        if (k != OYLNG_NODE_SEQUENCE || c != oylng_node_count(tr, n)) abort();
+        for (size_t i = 0; i < c; i++) {
+            oylng_value x = oylng_value_item(t, v, i);
+            if (x == OYLNG_NO_VALUE) abort();
+            check_value(t, x, budget);
+        }
+        if (oylng_value_item(t, v, c) != OYLNG_NO_VALUE) abort();
+        return;
+    case OYLNG_T_MAPPING:
+        if (k != OYLNG_NODE_MAPPING || c != oylng_node_count(tr, n)) abort();
+        for (size_t i = 0; i < c; i++) {
+            oylng_str key = oylng_value_key(t, v, i);
+            oylng_value x = oylng_value_at(t, v, i);
+            if (!key.data || x == OYLNG_NO_VALUE || oylng_value_get(t, v, key) != x) abort();
+            check_value(t, x, budget);
+        }
+        if (oylng_value_at(t, v, c) != OYLNG_NO_VALUE) abort();
+        return;
+    default:
+        break;
+    }
+    /* a scalar */
+    if (k != OYLNG_NODE_STRING || !s.data || c) abort();
+    if (s.len) { volatile char last = s.data[s.len - 1]; (void)last; }
+    switch (ty) {
+    case OYLNG_T_STR: case OYLNG_T_BIGINT: case OYLNG_T_DECIMAL: break;
+    case OYLNG_T_INT:
+        if (!oylng_value_int(t, v, &i64) && !oylng_value_uint(t, v, &u64)) abort();
+        break;
+    case OYLNG_T_FLOAT:
+        if (!isfinite(oylng_value_float(t, v))) abort();
+        break;
+    case OYLNG_T_BOOL:
+        if (!(s.len == 4 && !memcmp(s.data, "true", 4) && oylng_value_bool(t, v)) &&
+            !(s.len == 5 && !memcmp(s.data, "false", 5) && !oylng_value_bool(t, v)))
+            abort();
+        break;
+    case OYLNG_T_NULL:
+        if (s.len && !(s.len == 4 && !memcmp(s.data, "null", 4))) abort();
+        break;
+    case OYLNG_T_DATE: case OYLNG_T_DATETIME:
+        if (!oylng_value_datetime(t, v, &dt) || dt.year < 0 || dt.year > 9999 || dt.month < 1 ||
+            dt.month > 12 || dt.day < 1 || dt.day > 31 || dt.hour > 23 || dt.minute > 59 ||
+            dt.second > 60 || dt.nanosecond >= 1000000000u)
+            abort();
+        break;
+    case OYLNG_T_BINARY: {
+        oylng_str b = oylng_value_bytes(t, v);
+        if (!b.data && b.len) abort();
+        if (b.len) { volatile char last = b.data[b.len - 1]; (void)last; }
+        break;
+    }
+    default:
+        abort();
+    }
 }
 
 static oylng_parser *parser_for(const char *in, size_t size, unsigned opt) {
@@ -187,6 +269,43 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     oylng_emitter_free(te);
     oylng_parser_free(tp);
+
+    /* typed: refused where the events were, or for a schema */
+    static const uint64_t limits[8] = { 0, 4, 16, 64, 256, 4096, 1 << 16, 0 };
+    oylng_schema *app = oylng_schema_new(in, size, (oylng_str){ "a", 1 }, limits[opt & 7]);
+    if (app && oylng_schema_status(app) != OYLNG_OK) {
+        if (!oylng_schema_error(app)) abort();
+        oylng_schema_free(app);
+        app = NULL;
+    }
+    oylng_parser *yp = parser_for(in, size, opt);
+    if (yp) {
+        oylng_parser_set_cut(yp, (opt & 0x40) != 0);
+        oylng_typed *y;
+        oylng_status st;
+        size_t budget = 1 << 16;
+        while ((st = oylng_parse_typed(yp, app, &y)) == OYLNG_OK && y) {
+            oylng_typed_by how = oylng_typed_how(y);
+            oylng_value root = oylng_typed_root(y);
+            if (root == OYLNG_NO_VALUE) abort();
+            if (how == OYLNG_TYPED_NOT && oylng_value_type(y, root) != OYLNG_T_ANY) abort();
+            if (how == OYLNG_TYPED_APP && !app) abort();
+            check_value(y, root, &budget);
+            oylng_typed_free(y);
+        }
+        if (st == OYLNG_OK) {
+            if (!clean && pst != OYLNG_ERR_MEMORY) abort();
+        } else {
+            if (!oylng_parser_error(yp)) abort();
+            if (st != OYLNG_ERR_SCHEMA && st != OYLNG_ERR_LIMIT && st != OYLNG_ERR_MEMORY &&
+                pst != OYLNG_ERR_MEMORY) {
+                /* not for a schema: the events' error */
+                if (clean || pst != st || strcmp(oylng_parser_error(p), oylng_parser_error(yp)) != 0) abort();
+            }
+        }
+        oylng_parser_free(yp);
+    }
+    oylng_schema_free(app);
     oylng_parser_free(p);
 
     /* written again, it reads back the same */

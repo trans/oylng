@@ -14,7 +14,7 @@ OBJDIR := build
 
 SRCS := $(wildcard $(SRCDIR)/*.c)
 OBJS := $(SRCS:$(SRCDIR)/%.c=$(OBJDIR)/%.o)
-HDRS := include/oylng/oylng.h $(SRCDIR)/oylng_internal.h $(SRCDIR)/oylng_simd.h
+HDRS := include/oylng/oylng.h include/oylng/schema.h $(SRCDIR)/oylng_internal.h $(SRCDIR)/oylng_simd.h $(SRCDIR)/oylng_yes.h
 
 LIB  := $(OBJDIR)/liboylng.a
 TOOL := $(OBJDIR)/oylng
@@ -27,10 +27,11 @@ SUITE_DATA := $(OBJDIR)/suite-data
 YAML2      ?= ../yaml2
 DRAFTCHECK ?= $(YAML2)/.ai/memory/draftcheck.py
 DIFF_N     ?= 20000
+SCHEMACHECK ?= $(YAML2)/.ai/memory/schemacheck.py
 
 SAN := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-api test-emit test-suite test-plain test-diff test-asan bench bench-files fuzz clean
+.PHONY: all test test-api test-emit test-schema test-suite test-plain test-diff test-schema-diff test-asan bench bench-files fuzz clean
 
 all: $(LIB) $(TOOL)
 
@@ -43,7 +44,7 @@ $(OBJDIR)/%.o: $(SRCDIR)/%.c $(HDRS) | $(OBJDIR)
 $(LIB): $(OBJS)
 	$(AR) rcs $@ $^
 
-$(TOOL): tools/oylng.c tools/events.h $(LIB)
+$(TOOL): tools/oylng.c tools/events.h include/oylng/schema.h $(LIB)
 	$(CC) $(OYLNG_CFLAGS) -Itools $< $(LIB) $(OYLNG_LDFLAGS) -o $@
 
 $(OBJDIR)/test_suite: test/test_suite.c tools/events.h $(LIB)
@@ -51,6 +52,9 @@ $(OBJDIR)/test_suite: test/test_suite.c tools/events.h $(LIB)
 
 $(OBJDIR)/test_api: test/test_api.c $(LIB)
 	$(CC) $(OYLNG_CFLAGS) $< $(LIB) $(OYLNG_LDFLAGS) -o $@
+
+$(OBJDIR)/test_schema: test/test_schema.c $(LIB)
+	$(CC) $(OYLNG_CFLAGS) $< $(LIB) -lm -o $@
 
 $(OBJDIR)/test_emit: test/test_emit.c $(LIB)
 	$(CC) $(OYLNG_CFLAGS) $< $(LIB) $(OYLNG_LDFLAGS) -o $@
@@ -97,23 +101,35 @@ test-api: $(OBJDIR)/test_api
 test-emit: $(OBJDIR)/test_emit
 	$(OBJDIR)/test_emit
 
-test: test-api test-emit test-suite test-plain
+# Part 2: the draft's examples, beside the suite
+SCHEMA_SPEC ?= $(SUITE)/../spec/yaml-easy-schema.md
+
+test-schema: $(OBJDIR)/test_schema
+	$(OBJDIR)/test_schema $(SCHEMA_SPEC)
+
+test: test-api test-emit test-schema test-suite test-plain
 
 # Both tests again, built for test-plain
-test-plain: $(OBJDIR)/test_api_plain $(OBJDIR)/test_emit_plain $(OBJDIR)/test_suite_plain $(SUITE_DATA)
+test-plain: $(OBJDIR)/test_api_plain $(OBJDIR)/test_emit_plain $(OBJDIR)/test_schema_plain $(OBJDIR)/test_suite_plain $(SUITE_DATA)
 	$(OBJDIR)/test_api_plain
 	$(OBJDIR)/test_emit_plain
+	$(OBJDIR)/test_schema_plain $(SCHEMA_SPEC)
 	$(OBJDIR)/test_suite_plain $(SUITE_DATA)
 
 # Both tests again with the sanitizers
-test-asan: $(OBJDIR)/test_api_asan $(OBJDIR)/test_emit_asan $(OBJDIR)/test_suite_asan $(SUITE_DATA)
+test-asan: $(OBJDIR)/test_api_asan $(OBJDIR)/test_emit_asan $(OBJDIR)/test_schema_asan $(OBJDIR)/test_suite_asan $(SUITE_DATA)
 	$(OBJDIR)/test_api_asan
 	$(OBJDIR)/test_emit_asan
+	$(OBJDIR)/test_schema_asan $(SCHEMA_SPEC)
 	$(OBJDIR)/test_suite_asan $(SUITE_DATA)
 
 # Mutated and generated streams through this parser and the draft's checker
 test-diff: $(OBJDIR)/test_batch
 	python3 -I test/diffcheck.py $(DRAFTCHECK) $(YAML2)/spec/yaml-2.0.md $(SUITE) $(OBJDIR)/test_batch -n $(DIFF_N)
+
+# Part 2: the schema checker's examples and edge cases through this parser
+test-schema-diff: $(TOOL)
+	python3 -I test/schemadiff.py $(SCHEMACHECK) $(SCHEMA_SPEC) $(TOOL)
 
 # Pinned to one core if BENCH_CPU is set: make bench BENCH_CPU=5
 bench: $(OBJDIR)/bench_parser
@@ -124,11 +140,13 @@ bench-files: $(OBJDIR)/bench_files
 	$(if $(FILES),,$(error set FILES to the directories to read))
 	$(if $(BENCH_CPU),taskset -c $(BENCH_CPU)) $(OBJDIR)/bench_files $(FILES)
 
-# One worker, five minutes, seeded with the suite's streams
+# One worker, five minutes, seeded with the suite's streams and the schema
+# checker's
 FUZZ_TIME ?= 300
-fuzz: $(OBJDIR)/fuzz_parser $(SUITE_DATA)
+fuzz: $(OBJDIR)/fuzz_parser $(SUITE_DATA) $(TOOL)
 	mkdir -p $(OBJDIR)/fuzz-corpus $(OBJDIR)/fuzz-crashes
 	sh fuzz/seed.sh $(SUITE_DATA) $(OBJDIR)/fuzz-corpus
+	-test -f $(SCHEMACHECK) && python3 -I test/schemadiff.py $(SCHEMACHECK) $(SCHEMA_SPEC) $(TOOL) --seeds $(OBJDIR)/fuzz-corpus > /dev/null
 	cd $(OBJDIR)/fuzz-crashes && ../fuzz_parser -dict=../../fuzz/yaml2.dict -max_len=4096 \
 	    -timeout=10 -max_total_time=$(FUZZ_TIME) ../fuzz-corpus
 

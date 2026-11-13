@@ -58,6 +58,8 @@ typedef enum {
                              this parser goes to (section 10). */
     OYLNG_ERR_EMIT,     /**< The emitter was given what YAML 2.0 can't hold,
                              or events out of order. */
+    OYLNG_ERR_SCHEMA,   /**< A schema is bad, or a document doesn't fit its
+                             schema (part 2, oylng/schema.h). */
 } oylng_status;
 
 /** A place in the input. Lines and columns count from 1, and a column
@@ -88,6 +90,10 @@ typedef struct {
     size_t           offset;  /**< Where the node is written in the input.
                                    A node reached through a reference is
                                    where the table holds it. */
+    bool             plain;   /**< SCALAR: written plain, or an empty value.
+                                   How a scalar was written isn't data
+                                   (section 11), but a schema reads it
+                                   (part 2, section 3). */
 } oylng_event;
 
 /* ── Parser ──────────────────────────────────────────────── */
@@ -265,6 +271,10 @@ OYLNG_API oylng_kind oylng_node_kind(const oylng_tree *t, oylng_node n);
 
 /** A string's text, valid while the tree is; data NULL for a collection. */
 OYLNG_API oylng_str oylng_node_text(const oylng_tree *t, oylng_node n);
+
+/** Whether a string was written plain, or is an empty value, as an event's
+ *  plain says. */
+OYLNG_API bool oylng_node_plain(const oylng_tree *t, oylng_node n);
 
 /** A sequence's items or a mapping's pairs; 0 for a string. */
 OYLNG_API size_t oylng_node_count(const oylng_tree *t, oylng_node n);

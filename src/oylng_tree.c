@@ -23,6 +23,8 @@
 
 #define SMALL 8          /* up to this many pairs, keys are compared one by one */
 #define F_POOLED 1u      /* a string's text is in the pool */
+#define F_PLAIN  2u      /* a string written plain, or an empty value */
+#define F_TABLE  4u      /* copied from the table, so it may be shared */
 
 typedef struct {
     uint32_t a;          /* STR: where its text starts. SEQ, MAP: where its kids start */
@@ -119,7 +121,7 @@ static bool place_text(builder *B, const char *data, size_t len, uint32_t *a, ui
     return true;
 }
 
-static oylng_node new_str(builder *B, const char *data, size_t len, size_t pos) {
+static oylng_node new_str(builder *B, const char *data, size_t len, size_t pos, uint8_t flags) {
     if (len > UINT32_MAX) { oops(B, OYLNG_ERR_LIMIT, "a string of 4 GiB or more"); return OYLNG_NO_NODE; }
     oylng_node id = new_node(B, OYLNG_NODE_STRING, pos);
     if (id == OYLNG_NO_NODE) return id;
@@ -129,7 +131,7 @@ static oylng_node new_str(builder *B, const char *data, size_t len, size_t pos) 
     tnode *nd = &B->T->nodes[id];
     nd->a = a;
     nd->n = (uint32_t)len;
-    nd->flags = fl;
+    nd->flags = fl | flags;
     return id;
 }
 
@@ -197,9 +199,10 @@ static oylng_node table_node(builder *B, uint32_t i) {
     oylng__tnode tn;
     oylng__table_node(B->P, i, &tn);
     oylng_node id;
-    if (tn.kind == OYLNG__T_STR) id = new_str(B, tn.data, tn.len, tn.pos);
+    if (tn.kind == OYLNG__T_STR) id = new_str(B, tn.data, tn.len, tn.pos, F_TABLE | (tn.plain ? F_PLAIN : 0));
     else {
         id = new_node(B, tn.kind == OYLNG__T_SEQ ? OYLNG_NODE_SEQUENCE : OYLNG_NODE_MAPPING, tn.pos);
+        if (id != OYLNG_NO_NODE) B->T->nodes[id].flags = F_TABLE;
         if (id != OYLNG_NO_NODE && ROOM(B, B->todo, B->capt, B->nt + 1))
             B->todo[B->nt++] = (struct todo){ i, id };
     }
@@ -237,7 +240,7 @@ static void read_doc(builder *B) {
         oylng_node id;
         switch ((int)e->type) {
         case OYLNG_EVT_SCALAR:
-            id = new_str(B, e->value.data, e->value.len, e->offset);
+            id = new_str(B, e->value.data, e->value.len, e->offset, e->plain ? F_PLAIN : 0);
             break;
         case OYLNG__EVT_REF:
             id = from_table(B, (uint32_t)e->value.len);
@@ -284,6 +287,11 @@ void oylng_tree_free(oylng_tree *T) {
 }
 
 oylng_status oylng_parse_tree(oylng_parser *P, oylng_tree **out) {
+    return oylng__tree_read(P, out, NULL, NULL);
+}
+
+oylng_status oylng__tree_read(oylng_parser *P, oylng_tree **out,
+                              oylng_status (*at_start)(void *ctx, oylng_str name), void *ctx) {
     if (!out) return OYLNG_ERR_INPUT;
     *out = NULL;
     if (!P || !oylng__parser_between(P)) return OYLNG_ERR_INPUT;
@@ -310,6 +318,10 @@ oylng_status oylng_parse_tree(oylng_parser *P, oylng_tree **out) {
             B.T->has_name = true;
             B.T->name_n = (uint32_t)e->value.len;
             place_text(&B, e->value.data, e->value.len, &B.T->name_a, &B.T->name_flags);
+        }
+        if (B.st == OYLNG_OK && at_start) {
+            st = at_start(ctx, e->value);
+            if (st != OYLNG_OK) B.st = st;
         }
         if (B.st == OYLNG_OK) read_doc(&B);
     }
@@ -351,6 +363,16 @@ oylng_str oylng_node_text(const oylng_tree *T, oylng_node n) {
     return text_of(T, nd);
 }
 
+bool oylng_node_plain(const oylng_tree *T, oylng_node n) {
+    const tnode *nd = get(T, n);
+    return nd && nd->kind == OYLNG_NODE_STRING && (nd->flags & F_PLAIN);
+}
+
+bool oylng__node_shared(const oylng_tree *T, oylng_node n) {
+    const tnode *nd = get(T, n);
+    return nd && (nd->flags & F_TABLE);
+}
+
 size_t oylng_node_count(const oylng_tree *T, oylng_node n) {
     const tnode *nd = get(T, n);
     return nd && nd->kind != OYLNG_NODE_STRING ? nd->n : 0;
@@ -378,22 +400,27 @@ static bool same(oylng_str a, oylng_str b) {
     return a.len == b.len && (!a.len || memcmp(a.data, b.data, a.len) == 0);
 }
 
-oylng_node oylng_node_get(const oylng_tree *T, oylng_node map, oylng_str key) {
+uint32_t oylng__node_find(const oylng_tree *T, oylng_node map, oylng_str key) {
     const tnode *nd = get(T, map);
-    if (!nd || nd->kind != OYLNG_NODE_MAPPING || !nd->n || (key.len && !key.data)) return OYLNG_NO_NODE;
+    if (!nd || nd->kind != OYLNG_NODE_MAPPING || !nd->n || (key.len && !key.data)) return UINT32_MAX;
     const uint32_t *k = T->kids + nd->a;
     if (nd->n <= SMALL) {
         for (uint32_t i = 0; i < nd->n; i++)
-            if (same(text_of(T, &T->nodes[k[2 * i]]), key)) return k[2 * i + 1];
-        return OYLNG_NO_NODE;
+            if (same(text_of(T, &T->nodes[k[2 * i]]), key)) return i;
+        return UINT32_MAX;
     }
     size_t cap = index_cap(nd->n);
     const uint32_t *slot = k + 2 * (size_t)nd->n;
     for (size_t h = (size_t)key_hash(T, key) & (cap - 1); slot[h]; h = (h + 1) & (cap - 1)) {
         uint32_t i = slot[h] - 1;
-        if (same(text_of(T, &T->nodes[k[2 * i]]), key)) return k[2 * i + 1];
+        if (same(text_of(T, &T->nodes[k[2 * i]]), key)) return i;
     }
-    return OYLNG_NO_NODE;
+    return UINT32_MAX;
+}
+
+oylng_node oylng_node_get(const oylng_tree *T, oylng_node map, oylng_str key) {
+    uint32_t i = oylng__node_find(T, map, key);
+    return i == UINT32_MAX ? OYLNG_NO_NODE : T->kids[T->nodes[map].a + 2 * (size_t)i + 1];
 }
 
 oylng_mark oylng_node_mark(const oylng_tree *T, oylng_node n) {

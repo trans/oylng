@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- **Part 2, the Easy Schema, begun**, a work in progress as the draft is
+  (trans/yaml2 `57407f1`). `include/oylng/schema.h`: `oylng_parse_typed`
+  types each document by its stamp, `--- !name` with an entry of the
+  stream's own table, or else by an application's schema
+  (`oylng_schema_new`: a table, a root and a size limit). A document that
+  doesn't fit is refused, as a syntax error is, with `OYLNG_ERR_SCHEMA` and
+  the data path of the value. It has the eleven standard types with limits
+  and a decimal's precision, literals, optional keys, type keys, `!*`,
+  unions, sequences, named and recursive types, references and merges in a
+  schema, a schema's full size, section 11's typed count, and the cut of a
+  time's fraction (`oylng_parser_set_cut`). `!int` is -2^63 to 2^64-1,
+  `!float` the nearest binary64 (ties to even), `!bigint` and `!decimal`
+  are delivered as written, and a time holds nanoseconds, a leap second and
+  the year 0000. Not yet: patterns and `!**`, which a schema is refused for,
+  saying so, and published names. `oylng --typed` types a stream and
+  writes each value with its type.
+- Tested: 44 API checks and the draft's 42 examples without patterns or
+  `!**` (`make test`); 526 of the streams the draft's schema checker
+  (yaml2's `schemacheck.py`) types in its examples and edge cases, each
+  refused by both or accepted with the same values (`make
+  test-schema-diff`); GitHub's workflow format as a shadow schema, on the
+  490 workflow files of yaml2's public sample, with the checker's verdict
+  and refusal path on every file. The fuzzer types each stream too.
+- `oylng_event` gains `plain`, at its end, and the tree
+  `oylng_node_plain`: whether a scalar was written plain, as part 2 needs,
+  since a quoted `"3"` is never an `!int`.
+
 - **A document's name may end in a fragment**: `#`, then one or more ASCII
   letters, digits and `=`, as part 1, section 4.3, now allows (trans/yaml2
   `afbd21f`). So `--- !a#b` is the name `a#b`, and `--- !a #b` is the name
