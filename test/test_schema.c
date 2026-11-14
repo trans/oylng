@@ -503,8 +503,9 @@ static void api(void) {
     y = typed(&p, "%YAML 2.0\n--- &\nm:\n  !str(/x-.*/): !any\n--- !m\ny-b: 1\n", NULL, &err);
     CHECK(!y && err && strstr(err, "unknown key y-b"), "a key no pattern takes: %s", err ? err : "accepted");
     oylng_parser_free(p);
-    /* a pattern counts its positions in the ceiling and the full size */
-    const char *wide = "%YAML 2.0\n--- &\na: !str(/(a|b){512}/)\n";
+    /* a pattern counts its positions in the ceiling and the full size: a group
+       1 more than it holds, and every part at least 1 (section 9) */
+    const char *wide = "%YAML 2.0\n--- &\na: !str(/(a|b|c){256}/)\n";
     sc = oylng_schema_new(wide, strlen(wide), (oylng_str){ NULL, 0 }, 0);
     CHECK(oylng_schema_status(sc) == OYLNG_OK, "1,024 positions load: %s", oylng_schema_error(sc));
     oylng_schema_free(sc);
@@ -512,7 +513,7 @@ static void api(void) {
     CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "full size 1024"),
           "a pattern's full size: %s", oylng_schema_error(sc));
     oylng_schema_free(sc);
-    const char *wider = "%YAML 2.0\n--- &\na: !str(/(a|b){512}c/)\n";
+    const char *wider = "%YAML 2.0\n--- &\na: !str(/(a|b|c){256}c/)\n";
     sc = oylng_schema_new(wider, strlen(wider), (oylng_str){ NULL, 0 }, 0);
     CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "1025 positions"),
           "1,025 don't: %s", oylng_schema_error(sc));
@@ -526,6 +527,19 @@ static void api(void) {
     sc = oylng_schema_new(unclosed, strlen(unclosed), S("b"), 0);
     CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "unclosed pattern"),
           "unclosed in a sequence: %s", oylng_schema_error(sc));
+    oylng_schema_free(sc);
+    const char *empties = "%YAML 2.0\n--- &\na: !str(/(|||){205}/)\nb: !str(/(x{0}){1024}/)\n"
+                          "c: !str(/(|||){204}/)\n";
+    sc = oylng_schema_new(empties, strlen(empties), S("a"), 0);
+    CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "1025 positions"),
+          "an empty branch counts 1, a group 1 more: %s", oylng_schema_error(sc));
+    oylng_schema_free(sc);
+    sc = oylng_schema_new(empties, strlen(empties), S("c"), 0);
+    CHECK(oylng_schema_status(sc) == OYLNG_OK, "(|||){204} counts 1,020: %s", oylng_schema_error(sc));
+    oylng_schema_free(sc);
+    sc = oylng_schema_new(empties, strlen(empties), S("b"), 0);
+    CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "2048 positions"),
+          "a part repeated 0 times counts 1: %s", oylng_schema_error(sc));
     oylng_schema_free(sc);
 
     /* !** (section 10): what it walks is typed, a scalar no rule picks out

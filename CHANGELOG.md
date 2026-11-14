@@ -16,7 +16,8 @@
   `!float` the nearest binary64 (ties to even), `!bigint` and `!decimal`
   are delivered as written, and a time holds nanoseconds, a leap second and
   the year 0000. Patterns (sections 4.3 and 4.5) are I-Regexp (RFC 9485),
-  read and counted as the draft says, with Unicode 16's categories for
+  read and counted as the draft says (section 9 at yaml2 `c6ba341`: every
+  part counts at least 1, and a group 1 more), with Unicode 16's categories for
   `\p{..}`, and matched without backtracking, in time linear in the text;
   a number a pattern matched is delivered in the standard spelling. `!**`
   (section 10) types what it reaches at every level below, by its rules or
@@ -25,10 +26,10 @@
   3, yaml2 `425db57`). Not yet: published names. `oylng --typed` types a stream and writes each value with its
   type; with `--every-entry`, a stream with a table and no document is
   checked as a schema file, every entry as a root.
-- Tested: 75 API checks and the draft's 68 examples (`make test`); part 2's
-  suite (yaml2 `a7e2df6`), 736 of its 808 tests passed and none failed, the
+- Tested: 78 API checks and the draft's 68 examples (`make test`); part 2's
+  suite (yaml2 `c6ba341`), 743 of its 815 tests passed and none failed, the
   rest skipped for times held otherwise (25), `keep` (24) and published
-  names (23) (`make test-yes`); all 798 of the streams the draft's schema
+  names (23) (`make test-yes`); all 805 of the streams the draft's schema
   checker (yaml2's `schemacheck.py`) types in its examples and edge cases
   that the engine can run, each refused by both or accepted with the same
   values (`make test-schema-diff`, with `--every-entry`, as the checker

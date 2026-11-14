@@ -12,11 +12,13 @@
  * times the program's, and the program is a few instructions for each
  * position the count counts.
  *
- * The tree is kept small whatever is written: a part that counts 0, such
- * as `x{0}`, matches only the empty string and is dropped as it is read,
- * and so is a group's tree past a budget, which only a part multiplied by 0
- * can reach once the whole counts no more than the ceiling. Counts that
- * multiply by 1 (`?`, `*`, `+`) written one round another become one.
+ * The count bounds the program: every part counts at least 1, and a group
+ * 1 more than it holds. The tree is kept small whatever is written: a part
+ * repeated 0 times, such as `x{0}`, matches only the empty string and is
+ * dropped as it is read, and so is a group's tree past a budget, which
+ * only a part repeated 0 times can reach once the whole counts no more
+ * than the ceiling. Counts that multiply by 1 (`?`, `*`, `+`) written one
+ * round another become one.
  */
 
 #include "oylng_yes.h"
@@ -26,7 +28,7 @@
 
 #define NONE      UINT32_MAX
 #define INF       UINT32_MAX     /* a count with no upper end */
-#define DISCARD   (UINT32_MAX - 1)   /* a part not built: it must count 0 */
+#define DISCARD   (UINT32_MAX - 1)   /* a part not built: it must be repeated 0 times */
 #define MAX_DEPTH 256            /* groups inside groups */
 #define BUDGET    (1u << 16)     /* tree nodes, past which a part isn't built */
 #define MAX_PROG  (1u << 20)     /* instructions: never reached within the ceiling */
@@ -309,7 +311,8 @@ typedef struct {
 
 static part regexp(reader *R, bool build);
 
-/* Section 9: a pattern's count, as written */
+/* Section 9: a pattern's count, as written. Each character, class, . and
+ * \p{..} counts 1, and a group 1 more than what it holds. */
 static part atom(reader *R, bool build) {
     const unsigned char *p = R->p;
     unsigned char c = p[R->i];
@@ -324,6 +327,7 @@ static part atom(reader *R, bool build) {
         if (R->i >= R->n || p[R->i] != ')') fail(R, "not I-Regexp");
         R->i++;
         R->depth--;
+        out.count = add_sat(out.count, 1);
         return out;
     case '.':
         R->i++;
@@ -364,7 +368,8 @@ static part atom(reader *R, bool build) {
 /* Whether a count multiplies by 1: ?, *, + or {1} */
 static bool by_one(uint32_t lo, uint32_t hi) { return lo <= 1 && (hi == 1 || hi == INF); }
 
-/* An atom and its count */
+/* An atom and its count, which multiplies it: {n} and {n,m} by their
+ * upper end, {n,} by n, ?, * and + by 1; and at least 1 */
 static part piece(reader *R, bool build) {
     uint32_t mark = R->nv, cmark = R->ncl;
     bool b = build && R->nv < BUDGET;
@@ -402,9 +407,11 @@ static part piece(reader *R, bool build) {
         hi = open ? INF : h > INF - 1 ? INF - 1 : (uint32_t)h;
     }
     part out = { mul_sat(a.count, mult), a.node };
+    if (!out.count) out.count = 1;
     if (!build) return out;
-    if (!out.count) {
-        /* matches only the empty string: drop what it built */
+    if (!mult) {
+        /* repeated 0 times, it matches only the empty string: drop what it
+           built */
         R->nv = mark;
         for (uint32_t k = cmark; k < R->ncl; k++) { free(R->cl[k].r); free(R->cl[k].negs); }
         R->ncl = cmark;
@@ -426,7 +433,7 @@ static part piece(reader *R, bool build) {
     return out;
 }
 
-/* Pieces up to | or ) */
+/* Pieces up to | or ): what they count, and an empty branch 1 */
 static part branch(reader *R, bool build) {
     part out = { 0, NONE };
     uint32_t first = NONE, last = NONE, kids = 0;
@@ -442,6 +449,7 @@ static part branch(reader *R, bool build) {
         last = q.node;
         kids++;
     }
+    if (!out.count) out.count = 1;
     if (!build) return out;
     if (discard) { out.node = DISCARD; return out; }
     if (kids <= 1) { out.node = first; return out; }
