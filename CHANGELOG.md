@@ -10,7 +10,8 @@
   doesn't fit is refused, as a syntax error is, with `OYLNG_ERR_SCHEMA` and
   the data path of the value. It has the eleven standard types with limits
   and a decimal's precision, literals, optional keys, type keys, `!*`,
-  unions, sequences, named and recursive types, references and merges in a
+  unions (a mapping whose one key is `!|`, section 9 at yaml2 `0b88244`;
+  ` | ` in a plain scalar is refused), sequences, named and recursive types, references and merges in a
   schema, a schema's full size, section 11's typed count, and the cut of a
   time's fraction (`oylng_parser_set_cut`). `!int` is -2^63 to 2^64-1,
   `!float` the nearest binary64 (ties to even), `!bigint` and `!decimal`
@@ -20,16 +21,17 @@
   part counts at least 1, and a group 1 more), with Unicode 16's categories for
   `\p{..}`, and matched without backtracking, in time linear in the text;
   a number a pattern matched is delivered in the standard spelling. `!**`
-  (section 10) types what it reaches at every level below, by its rules or
-  its `!*`, and walks the rest. An application's schema is read under the
+  (section 10) types what a mapping holds at every level below it, by its
+  rules or its `!*`, and walks the rest; a type with `!**` takes a mapping
+  only (yaml2 `e75a203`). An application's schema is read under the
   size limit as a stream of its own, and its full size held to it (section
   3, yaml2 `425db57`). Not yet: published names. `oylng --typed` types a stream and writes each value with its
   type; with `--every-entry`, a stream with a table and no document is
   checked as a schema file, every entry as a root.
-- Tested: 78 API checks and the draft's 68 examples (`make test`); part 2's
-  suite (yaml2 `c6ba341`), 743 of its 815 tests passed and none failed, the
+- Tested: 89 API checks and the draft's 70 examples (`make test`); part 2's
+  suite (yaml2 `0b88244`), 770 of its 842 tests passed and none failed, the
   rest skipped for times held otherwise (25), `keep` (24) and published
-  names (23) (`make test-yes`); all 805 of the streams the draft's schema
+  names (23) (`make test-yes`); all 832 of the streams the draft's schema
   checker (yaml2's `schemacheck.py`) types in its examples and edge cases
   that the engine can run, each refused by both or accepted with the same
   values (`make test-schema-diff`, with `--every-entry`, as the checker

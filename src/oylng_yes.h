@@ -79,9 +79,10 @@ extern const char oylng__ucd_version[];
 
 /* ── A compiled schema (oylng_schema.c) ──────────────────────
  * A type expression is an xt. A schema is compiled from a table's nodes,
- * each once, so a node pasted in two places is one type. A place is an xt
- * a value is typed with; each has its alternatives, with names expanded
- * (section 9). */
+ * each once, so a node pasted in two places is one type. A union is a
+ * mapping whose one key is `!|` (section 9), its alternatives the sequence
+ * it holds. A place is an xt a value is typed with; each has its
+ * alternatives, with names and unions expanded. */
 
 enum { X_ALT, X_LIT, X_STD, X_NAME, X_SEQ, X_MAP };
 
@@ -94,7 +95,7 @@ enum { STD_STR, STD_INT, STD_BIGINT, STD_FLOAT, STD_DECIMAL, STD_BOOL, STD_NULL,
 #define XF_SEEN    8u    /* compile: gone through */
 #define XF_PLACE  16u    /* counted in the schema's full size */
 #define XF_TYPES  32u    /* values are typed with it, so it has its alternatives */
-#define XF_FILLED 64u    /* X_SEQ, X_MAP: its children are compiled */
+#define XF_FILLED 64u    /* X_SEQ, X_MAP, X_ALT: its children are compiled */
 #define XF_PAT   128u    /* X_STD: a pattern */
 #define XF_BARE  256u    /* X_MAP: the rules of a `!**` written as a type, its
                             only rule !* (section 10) */
@@ -147,7 +148,7 @@ struct oylng__xt {
     xt      *kind_of;     /* XF_TYPES: the type it is, for the typed count
                              (section 11): a name is its entry's */
     union {
-        struct { xt **v; uint32_t n; } alt;
+        struct { xt **v; uint32_t n; bool has_full; uint64_t full; } alt;   /* a union (section 9) */
         xstr lit;
         struct {
             oylng__num lo, hi;
@@ -182,6 +183,9 @@ struct oylng__entry {
     uint64_t full;
     xt      *kind_of;
     uint32_t tname_gen, tname;   /* its name in the typed document gen */
+    centry **bare;        /* the names its type is, written bare or in a union */
+    uint32_t nbare;
+    bool     bare_known;
     centry  *next;        /* in the hash chain */
 };
 

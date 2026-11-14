@@ -113,16 +113,18 @@ oylng_schema_free(sc);
 ```
 
 It has the eleven standard types with their limits and a decimal's
-precision, literals, optional keys, type keys, `!*`, unions, sequences,
+precision, literals, optional keys, type keys, `!*`, unions (a mapping
+whose one key is `!|`: `{!|: [!int, !str]}`), sequences,
 named and recursive types, references and merges in a schema, section 11's
 typed count, and an application's cut of a time's fraction. `!int` is
 -2^63 to 2^64-1, `!float` the nearest binary64, and `!bigint` and
 `!decimal` are delivered as written; a time holds nanoseconds, a leap
 second and the year 0000. Patterns (`!str(/[a-z][a-z0-9-]*/)` and the like)
 are I-Regexp, matched without backtracking, so in time linear in the
-text, with Unicode 16's categories for `\p{..}`. `!**` types what it
-reaches at every level below, by its rules or by its `!*`, and walks the
-rest, so `json: {!**: !null | !bool | !int | !float | !str}` reads JSON.
+text, with Unicode 16's categories for `\p{..}`. `!**` types what a
+mapping holds at every level below it, by its rules or by its `!*`, and
+walks the rest. A union reads any JSON value:
+`json: {!|: [!null, !bool, !int, !float, !str, {!*: !json}, [!json, ...]]}`.
 Not yet: published names, which stamp nothing.
 `include/oylng/schema.h` documents the rest.
 

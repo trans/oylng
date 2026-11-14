@@ -240,14 +240,6 @@ static span *split(sctx *S, const char *s, size_t n, const char *sep, size_t pos
     return out;
 }
 
-static bool ws(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\v' || c == '\f'; }
-
-static span strip(span p) {
-    while (p.n && ws(p.s[0])) { p.s++; p.n--; }
-    while (p.n && ws(p.s[p.n - 1])) p.n--;
-    return p;
-}
-
 /* A number of a limit: -? digits (. digits)? ([eE] [-+]? digits)? at s,
  * its length, 0 if none */
 static size_t limit_number(const char *s, size_t n) {
@@ -339,23 +331,10 @@ static void limits(sctx *S, xt *t, const char *a, size_t n, const char *whole_te
     }
 }
 
-#define MAX_TEXT_DEPTH 256
-
-static xt *parse_expr(sctx *S, const char *s, size_t n, size_t pos, unsigned depth);
-
-static xt *atom(sctx *S, span p, size_t pos, unsigned depth) {
-    const char *s = p.s;
-    size_t n = p.n;
-    if (!n) bad(S, pos, "an empty part");
-    if (n == 2 && s[0] == '\'' && s[1] == '\'') {
-        xt *t = new_xt(S, X_LIT, pos);
-        t->u.lit = (xstr){ "", 0 };
-        return t;
-    }
-    if (n == 2 && s[0] == '[' && s[1] == ']') return new_xt(S, X_SEQ, pos);
-    if (s[0] == '"' || s[0] == '\'')
-        bad(S, pos, "a part can only start with a quote as two single quotes: %.*s", (int)(n > 60 ? 60 : n), s);
-    if (s[0] == '!') {
+/* A plain scalar of a schema: one type, with what its parentheses hold, or
+ * a literal (sections 5 and 14) */
+static xt *atom(sctx *S, const char *s, size_t n, size_t pos) {
+    if (n && s[0] == '!') {
         size_t j = 1;
         while (j < n && name_char(s[j])) j++;
         bool args = j < n;
@@ -376,44 +355,18 @@ static xt *atom(sctx *S, span p, size_t pos, unsigned depth) {
         if (args) limits(S, t, s + j + 1, n - j - 2, s, n, pos);
         return t;
     }
-    if (s[0] == '[') {
-        if (s[n - 1] != ']') bad(S, pos, "bad sequence: %.*s", (int)(n > 60 ? 60 : n), s);
-        if (depth >= MAX_TEXT_DEPTH) bad(S, pos, "sequences in a type nested more than %d deep", MAX_TEXT_DEPTH);
-        size_t ni;
-        span *it = split(S, s + 1, n - 2, ",", pos, &ni);
-        for (size_t i = 0; i < ni; i++) it[i] = strip(it[i]);
-        xt *t = new_xt(S, X_SEQ, pos);
-        if (it[ni - 1].n == 3 && memcmp(it[ni - 1].s, "...", 3) == 0) {
-            ni--;
-            if (!ni) bad(S, pos, "`...` repeats the item before it");
-            ni--;
-            t->u.seq.rest = parse_expr(S, it[ni].s, it[ni].n, pos, depth + 1);
-        }
-        t->u.seq.items = alloc(S, ni * sizeof *t->u.seq.items);
-        t->u.seq.n = (uint32_t)ni;
-        for (size_t i = 0; i < ni; i++) t->u.seq.items[i] = parse_expr(S, it[i].s, it[i].n, pos, depth + 1);
-        t->flags |= XF_FILLED;
-        return t;
-    }
-    if (s[0] == '{') bad(S, pos, "a mapping in a union must be named: %.*s", (int)(n > 60 ? 60 : n), s);
     xt *t = new_xt(S, X_LIT, pos);
     t->u.lit = (xstr){ s, (uint32_t)n };
     return t;
 }
 
-/* A type expression: part (" | " part)* */
-static xt *parse_expr(sctx *S, const char *s, size_t n, size_t pos, unsigned depth) {
+/* A plain scalar as a type. ` | ` outside a type's parentheses was once a
+ * union, and is refused, so that it isn't read as text (section 14). */
+static xt *scalar_type(sctx *S, const char *s, size_t n, size_t pos) {
     size_t np;
-    span *ps = split(S, s, n, " | ", pos, &np);
-    for (size_t i = 0; i < np; i++)
-        if (ps[i].n && (ps[i].s[0] == ' ' || ps[i].s[ps[i].n - 1] == ' '))
-            bad(S, pos, "a part starts or ends with a space: %.*s", (int)(n > 60 ? 60 : n), s);
-    if (np == 1) return atom(S, ps[0], pos, depth);
-    xt *t = new_xt(S, X_ALT, pos);
-    t->u.alt.v = alloc(S, np * sizeof *t->u.alt.v);
-    t->u.alt.n = (uint32_t)np;
-    for (size_t i = 0; i < np; i++) t->u.alt.v[i] = atom(S, ps[i], pos, depth);
-    return t;
+    split(S, s, n, " | ", pos, &np);
+    if (np > 1) bad(S, pos, "a union is written {!|: [...]}, not with ` | `: %.*s", (int)(n > 60 ? 60 : n), s);
+    return atom(S, s, n, pos);
 }
 
 /* ── Nodes of the table ──────────────────────────────────── */
@@ -451,27 +404,6 @@ static void memo_put(sctx *S, uint32_t node, xt *t) {
         }
 }
 
-/* Node i of the table as a type: a string as an expression, a collection
- * with its children left until something reaches it (fill) */
-static xt *compile_node(sctx *S, uint32_t i) {
-    xt *t = memo_get(S, i);
-    if (t) return t;
-    oylng__tnode tn;
-    oylng__table_node(S->P, i, &tn);
-    if (tn.kind == OYLNG__T_STR) {
-        xstr text = copy(S, tn.data, tn.len);
-        if (!tn.plain || !tn.len) {   /* a quoted scalar is a literal (section 5) */
-            t = new_xt(S, X_LIT, tn.pos);
-            t->u.lit = text;
-        } else t = parse_expr(S, text.s, text.len, tn.pos, 0);
-    } else {
-        t = new_xt(S, tn.kind == OYLNG__T_SEQ ? X_SEQ : X_MAP, tn.pos);
-        t->node = i;
-    }
-    memo_put(S, i, t);
-    return t;
-}
-
 typedef struct {
     sctx     *S;
     uint32_t *v;
@@ -490,6 +422,67 @@ static void kid(void *ctx, uint32_t i) {
         k->cap = nc;
     }
     k->v[k->n++] = i;
+}
+
+/* The children of the table's collection node, references followed and
+ * merges applied, into k: its v the caller frees */
+static void children(sctx *S, uint32_t node, kids *k) {
+    *k = (kids){ S, NULL, 0, 0, false };
+    bool ok = oylng__table_children(S->P, node, kid, k);
+    if (!ok || k->oom) { free(k->v); nomem(S); }
+}
+
+/* The same, in the arena */
+static uint32_t *arena_children(sctx *S, uint32_t node, uint32_t *n) {
+    kids k;
+    children(S, node, &k);
+    uint32_t *c = oylng_arena_alloc(S->A, k.n ? (size_t)k.n * sizeof *c : 1, 8);
+    if (!c) { free(k.v); nomem(S); }
+    if (k.n) memcpy(c, k.v, (size_t)k.n * sizeof *c);
+    *n = k.n;
+    free(k.v);
+    return c;
+}
+
+static bool plain_is(const oylng__tnode *t, const char *s, size_t n) {
+    return t->kind == OYLNG__T_STR && t->plain && t->len == n && memcmp(t->data, s, n) == 0;
+}
+
+/* Whether the table's mapping node is a union: a plain key `!|` (section 9) */
+static bool is_union(sctx *S, uint32_t node) {
+    kids k;
+    children(S, node, &k);
+    bool u = false;
+    for (uint32_t p = 0; p + 1 < k.n && !u; p += 2) {
+        oylng__tnode kn;
+        oylng__table_node(S->P, k.v[p], &kn);
+        u = plain_is(&kn, "!|", 2);
+    }
+    free(k.v);
+    return u;
+}
+
+/* Node i of the table as a type: a plain scalar a type or a literal, a
+ * quoted one a literal, a collection, or a union, its children left until
+ * something reaches it (fill) */
+static xt *compile_node(sctx *S, uint32_t i) {
+    xt *t = memo_get(S, i);
+    if (t) return t;
+    oylng__tnode tn;
+    oylng__table_node(S->P, i, &tn);
+    if (tn.kind == OYLNG__T_STR) {
+        xstr text = copy(S, tn.data, tn.len);
+        if (!tn.plain || !tn.len) {   /* a quoted scalar is a literal (section 5) */
+            t = new_xt(S, X_LIT, tn.pos);
+            t->u.lit = text;
+        } else t = scalar_type(S, text.s, text.len, tn.pos);
+    } else {
+        int kind = tn.kind == OYLNG__T_SEQ ? X_SEQ : is_union(S, i) ? X_ALT : X_MAP;
+        t = new_xt(S, kind, tn.pos);
+        t->node = i;
+    }
+    memo_put(S, i, t);
+    return t;
 }
 
 static uint32_t field_slot(const sctx *S, const xt *m, const char *k, size_t n, bool *found) {
@@ -512,8 +505,8 @@ const xfield *oylng__field(const sctx *S, const xt *m, const char *k, size_t n) 
     return found ? &m->u.map.f[m->u.map.ix[h] - 1] : NULL;
 }
 
-/* What a `!**` holds (section 10): a mapping of rules, or a type, which is
- * read as rules whose only rule is !* */
+/* What a `!**` holds (section 10): a mapping of rules, or a type (a union
+ * among them), which is read as rules whose only rule is !* */
 static xt *rules_of(sctx *S, uint32_t node, size_t pos) {
     xt *v = compile_node(S, node);
     if (v->kind == X_MAP) return v;
@@ -523,26 +516,37 @@ static xt *rules_of(sctx *S, uint32_t node, size_t pos) {
     return r;
 }
 
-/* A collection's children, compiled: a sequence's items and the type
- * `...` repeats, a mapping's fields, type keys, !* (section 7) and !**
- * (section 10) */
+/* A collection's children, compiled: a union's alternatives (section 9),
+ * a sequence's items and the type `...` repeats, a mapping's fields, type
+ * keys, !* (section 7) and !** (section 10) */
 static void fill(sctx *S, xt *t) {
     if (t->flags & XF_FILLED) return;
     t->flags |= XF_FILLED;
-    if (t->node == NONE) return;   /* [] */
-    kids k = { S, NULL, 0, 0, false };
-    bool ok = oylng__table_children(S->P, t->node, kid, &k);
-    if (!ok || k.oom) { free(k.v); nomem(S); }
-    uint32_t *c = oylng_arena_alloc(S->A, k.n ? (size_t)k.n * sizeof *c : 1, 8);
-    if (!c) { free(k.v); nomem(S); }
-    if (k.n) memcpy(c, k.v, (size_t)k.n * sizeof *c);
-    uint32_t n = k.n;
-    free(k.v);
+    if (t->node == NONE) return;   /* a `!**`'s rules written as a type */
+    uint32_t n;
+    uint32_t *c = arena_children(S, t->node, &n);
+    if (t->kind == X_ALT) {
+        /* section 9: one key, `!|`, and a sequence of alternatives */
+        if (n != 2) bad(S, t->pos, "a `!|` mapping holds no other key");
+        oylng__tnode vn;
+        oylng__table_node(S->P, c[1], &vn);
+        uint32_t m = 0, *items = vn.kind == OYLNG__T_SEQ ? arena_children(S, c[1], &m) : NULL;
+        if (!m) bad(S, vn.pos, "`!|` holds a sequence of one or more alternatives");
+        t->u.alt.v = alloc(S, (size_t)m * sizeof *t->u.alt.v);
+        t->u.alt.n = m;
+        for (uint32_t j = 0; j < m; j++) {
+            oylng__tnode in;
+            oylng__table_node(S->P, items[j], &in);
+            if (plain_is(&in, "...", 3)) bad(S, in.pos, "`...` repeats an item in a sequence, not in `!|`");
+        }
+        for (uint32_t j = 0; j < m; j++) t->u.alt.v[j] = compile_node(S, items[j]);
+        return;
+    }
     if (t->kind == X_SEQ) {
         if (n) {
             oylng__tnode last;
             oylng__table_node(S->P, c[n - 1], &last);
-            if (last.kind == OYLNG__T_STR && last.plain && last.len == 3 && memcmp(last.data, "...", 3) == 0) {
+            if (plain_is(&last, "...", 3)) {
                 if (n == 1) bad(S, last.pos, "`...` repeats the item before it");
                 n -= 2;
                 t->u.seq.rest = compile_node(S, c[n]);
@@ -576,7 +580,7 @@ static void fill(sctx *S, xt *t) {
             xt *v = compile_node(S, c[2 * p + 1]);
             if (kl == 2 && ks[1] == '*') { t->u.map.other = v; continue; }
             xstr kt = copy(S, ks, kl);
-            t->u.map.rows[nrows].key = parse_expr(S, kt.s, kt.len, kn.pos, 0);
+            t->u.map.rows[nrows].key = scalar_type(S, kt.s, kt.len, kn.pos);
             t->u.map.rows[nrows++].val = v;
             continue;
         }
@@ -638,6 +642,7 @@ static void go_through(sctx *S, xt *root) {
         t->flags |= XF_SEEN;
         switch (t->kind) {
         case X_ALT:
+            fill(S, t);
             for (uint32_t i = 0; i < t->u.alt.n; i++)
                 if (!(t->u.alt.v[i]->flags & XF_SEEN)) push(S, t->u.alt.v[i]);
             break;
@@ -680,13 +685,17 @@ static inline uint64_t sat(uint64_t a, uint64_t b) {
     return s < a ? UINT64_MAX : s;
 }
 
-/* What one type expression adds to the full size (section 9), its names'
- * entries' sizes known */
-static uint64_t full_of(const xt *t) {
+/* What one type adds to the full size (section 9), its names' entries'
+ * sizes known: a union what its alternatives add, kept, since a union can
+ * be pasted into others many times */
+static uint64_t full_of(xt *t) {
     switch (t->kind) {
     case X_ALT: {
+        if (t->u.alt.has_full) return t->u.alt.full;
         uint64_t n = 0;
         for (uint32_t i = 0; i < t->u.alt.n; i++) n = sat(n, full_of(t->u.alt.v[i]));
+        t->u.alt.full = n;
+        t->u.alt.has_full = true;
         return n;
     }
     case X_NAME:
@@ -713,13 +722,32 @@ static uint64_t positions(const xt *x) {
     return 1;
 }
 
-/* The names an entry's type is, written bare or in a union: the edges of
- * the graph a name that only names itself goes round */
-static uint32_t bare_count(const xt *t) { return t->kind == X_NAME ? 1 : t->kind == X_ALT ? t->u.alt.n : 0; }
-
-static centry *bare_at(const xt *t, uint32_t i) {
-    const xt *x = t->kind == X_NAME ? t : t->u.alt.v[i];
-    return x->kind == X_NAME ? x->u.name : NULL;
+/* The names an entry's type is, written bare or in a union, unions inside
+ * unions included: the edges of the graph a name that only names itself
+ * goes round. Each union is gone through once. */
+static void bare_names(sctx *S, centry *e) {
+    if (e->bare_known) return;
+    e->bare_known = true;
+    for (int fill_in = 0; fill_in < 2; fill_in++) {
+        uint32_t gen = ++S->gen, k = 0;
+        S->nstk = 0;
+        push(S, e->top);
+        while (S->nstk) {
+            xt *x = S->stk[--S->nstk];
+            if (x->kind == X_NAME) {
+                if (fill_in) e->bare[k] = x->u.name;
+                k++;
+                continue;
+            }
+            if (x->kind != X_ALT || x->mark == gen) continue;
+            x->mark = gen;
+            for (uint32_t i = x->u.alt.n; i-- > 0;) push(S, x->u.alt.v[i]);
+        }
+        if (!fill_in) {
+            e->bare = alloc(S, (size_t)k * sizeof *e->bare);
+            e->nbare = k;
+        }
+    }
 }
 
 enum { E_NEW, E_ON_PATH, E_DONE };
@@ -732,17 +760,18 @@ static void check_names(sctx *S, centry *start) {
     grow(S, &S->scr32, &S->capscr32, 1, sizeof *st);
     st = S->scr32;
     cap = S->capscr32;
+    bare_names(S, start);
     st[n++] = (struct dfs){ start, 0 };
     start->state = E_ON_PATH;
     while (n) {
         struct dfs *d = &st[n - 1];
         xt *top = d->e->top;
-        if (d->i < bare_count(top)) {
-            centry *f = bare_at(top, d->i++);
-            if (!f) continue;
+        if (d->i < d->e->nbare) {
+            centry *f = d->e->bare[d->i++];
             if (f->state == E_ON_PATH) bad(S, top->pos, "!%.*s only names itself", (int)f->name.len, f->name.s);
             if (f->state == E_DONE) continue;
             if (!f->top) reach(S, f);
+            bare_names(S, f);
             if (n == cap) {
                 S->capscr32 = cap;
                 grow(S, &S->scr32, &S->capscr32, n + 1, sizeof *st);
@@ -831,13 +860,16 @@ static xt *kind_of(sctx *S, xt *t) {
     return k;
 }
 
-/* t's alternatives: names expanded, each counted once in the union, at its
- * first place (section 9) */
+/* t's alternatives: names and unions expanded, each name counted once in
+ * the union, at its first place (section 9). A literal pasted again is
+ * left out, since it changes nothing; anything else counts, and the
+ * ceiling is checked as it adds up. */
 static void expand(sctx *S, xt *t) {
     struct item { xt *t; centry *from; } *st;
     uint32_t n = 0, gen = ++S->gen;
     xpos *out = NULL;
     uint32_t no = 0;
+    uint64_t count = 0;
     grow(S, &S->scr32, &S->capscr32, 1, sizeof *st);
     st = S->scr32;
     st[n++] = (struct item){ t, NULL };
@@ -858,6 +890,15 @@ static void expand(sctx *S, xt *t) {
             st[n++] = (struct item){ e->top, e };
             continue;
         }
+        if (it.t->kind == X_LIT) {
+            if (it.t->mark == gen) continue;
+            it.t->mark = gen;
+        } else {
+            count = sat(count, positions(it.t));
+            if (count > CEILING)
+                bad(S, t->pos, "a union of %llu positions, past the ceiling of %d", (unsigned long long)count,
+                    CEILING);
+        }
         grow(S, &S->scrpos, &S->capscrpos, no + 1, sizeof *out);
         out = S->scrpos;
         out[no++] = (xpos){ it.t, it.from };
@@ -868,19 +909,15 @@ static void expand(sctx *S, xt *t) {
     a->n = no;
     a->seq = a->any = NONE;
     uint32_t nlit = 0;
-    uint64_t count = 0;
     for (uint32_t i = 0; i < no; i++) {
         xt *x = a->p[i].t;
         if (x->kind == X_LIT) { nlit++; continue; }
-        count = sat(count, positions(x));
         if (x->kind == X_SEQ) {
             if (a->seq != NONE) bad(S, t->pos, "more than one sequence alternative");
             a->seq = i;
         } else if (x->kind == X_MAP) a->nmaps++;
         else if (x->std == STD_ANY && a->any == NONE) a->any = i;
     }
-    if (count > CEILING)
-        bad(S, t->pos, "a union of %llu positions, past the ceiling of %d", (unsigned long long)count, CEILING);
     a->all_lits = no && nlit == no;
     if (a->nmaps) {
         a->maps = alloc(S, a->nmaps * sizeof *a->maps);

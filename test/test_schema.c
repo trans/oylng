@@ -345,7 +345,7 @@ static void api(void) {
         oylng_typed_free(y);
     }
     oylng_parser_free(p);
-    y = typed(&p, "%YAML 2.0\n--- &\nn: !int | !str\n--- !n\n18446744073709551616\n", NULL, &err);
+    y = typed(&p, "%YAML 2.0\n--- &\nn: {!|: [!int, !str]}\n--- !n\n18446744073709551616\n", NULL, &err);
     CHECK(!y && err && strstr(err, "outside !int"), "past !int refuses: %s", err ? err : "accepted");
     oylng_parser_free(p);
     y = typed(&p, "%YAML 2.0\n--- &\nf: [!float, ...]\n--- !f\n[1e-999, -1e-999, 9007199254740993, "
@@ -360,7 +360,7 @@ static void api(void) {
         oylng_typed_free(y);
     }
     oylng_parser_free(p);
-    y = typed(&p, "%YAML 2.0\n--- &\nf: !float(0..) | !str\n--- !f\n1.8e308\n", NULL, &err);
+    y = typed(&p, "%YAML 2.0\n--- &\nf: {!|: [!float(0..), !str]}\n--- !f\n1.8e308\n", NULL, &err);
     CHECK(!y && err && strstr(err, "binary64"), "too large refuses: %s", err ? err : "accepted");
     oylng_parser_free(p);
 
@@ -370,7 +370,7 @@ static void api(void) {
                               { "5:3", "0.0015", "n" }, { "1:0", "0e999999999999999999999", "y" } };
     for (size_t i = 0; i < sizeof prec / sizeof *prec; i++) {
         char s[200];
-        snprintf(s, sizeof s, "%%YAML 2.0\n--- &\nd: !decimal(%s) | !str\n--- !d\n%s\n", prec[i][0], prec[i][1]);
+        snprintf(s, sizeof s, "%%YAML 2.0\n--- &\nd: {!|: [!decimal(%s), !str]}\n--- !d\n%s\n", prec[i][0], prec[i][1]);
         y = typed(&p, s, NULL, &err);
         CHECK(y && oylng_value_type(y, oylng_typed_root(y)) == (prec[i][2][0] == 'y' ? OYLNG_T_DECIMAL : OYLNG_T_STR),
               "%s under %s", prec[i][1], prec[i][0]);
@@ -386,7 +386,7 @@ static void api(void) {
                              { "-1..", "-1.0000000000000000000000001", "n" } };
     for (size_t i = 0; i < sizeof lim / sizeof *lim; i++) {
         char s[300];
-        snprintf(s, sizeof s, "%%YAML 2.0\n--- &\nd: !decimal(%s) | !str\n--- !d\n%s\n", lim[i][0], lim[i][1]);
+        snprintf(s, sizeof s, "%%YAML 2.0\n--- &\nd: {!|: [!decimal(%s), !str]}\n--- !d\n%s\n", lim[i][0], lim[i][1]);
         y = typed(&p, s, NULL, &err);
         CHECK(y && oylng_value_type(y, oylng_typed_root(y)) == (lim[i][2][0] == 'y' ? OYLNG_T_DECIMAL : OYLNG_T_STR),
               "%s in %s: %s", lim[i][1], lim[i][0], err ? err : "");
@@ -491,7 +491,7 @@ static void api(void) {
         oylng_typed_free(y);
     }
     oylng_parser_free(p);
-    y = typed(&p, "%YAML 2.0\n--- &\nn: !int(/[0-9_]+/) | !str\n--- !n\n1_000\n", NULL, &err);
+    y = typed(&p, "%YAML 2.0\n--- &\nn:\n  !|:\n    - !int(/[0-9_]+/)\n    - !str\n--- !n\n1_000\n", NULL, &err);
     CHECK(!y && err && strstr(err, "matched, and is not an integer"), "matched and unread refuses: %s",
           err ? err : "accepted");
     oylng_parser_free(p);
@@ -575,6 +575,45 @@ static void api(void) {
               "!** refused for %s: %s", deep_bad[i][1], oylng_schema_error(sc) ? oylng_schema_error(sc) : "loaded");
         oylng_schema_free(sc);
     }
+    /* a union is a mapping with one key, `!|`, and a sequence (section 9) */
+    static const char *const union_bad[][2] = {
+        { "a: !int | !str\n", "not with ` | `" },
+        { "a: {!|: [!int], x: 1}\n", "no other key" },
+        { "a: {!|: []}\n", "one or more" },
+        { "a: {!|: !int}\n", "one or more" },
+        { "a: {!|: [!int, ...]}\n", "repeats an item" },
+        { "u: {!|: [!int]}\na: {<<: *u, x: !int}\n", "no other key" },
+        { "a: {!|: [{!|: [!a]}, !int]}\n", "only names itself" },
+        { "a:\n  !**: {!|: [!int, {x: !int}]}\n", "takes a scalar type" },
+    };
+    for (size_t i = 0; i < sizeof union_bad / sizeof *union_bad; i++) {
+        char text[200];
+        snprintf(text, sizeof text, "%%YAML 2.0\n--- &\n%s", union_bad[i][0]);
+        sc = oylng_schema_new(text, strlen(text), S("a"), 0);
+        CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), union_bad[i][1]),
+              "a union refused, %s: %s", union_bad[i][1], oylng_schema_error(sc) ? oylng_schema_error(sc) : "loaded");
+        oylng_schema_free(sc);
+    }
+    /* a union pasted into itself, level on level: literals pasted again
+       change nothing, and types add up to the ceiling */
+    for (int lits = 1; lits >= 0; lits--) {
+        char text[2000];
+        int k = snprintf(text, sizeof text, "%%YAML 2.0\n--- &\nu0: {!|: [%s]}\n", lits ? "x, y" : "!int, !str");
+        int levels = lits ? 20 : 11;
+        for (int l = 1; l <= levels; l++) k += snprintf(text + k, sizeof text - k, "u%d: {!|: [*u%d, *u%d]}\n", l, l - 1, l - 1);
+        snprintf(text + k, sizeof text - k, "a: !u%d\n", levels);
+        sc = oylng_schema_new(text, strlen(text), S("a"), 0);
+        if (lits) CHECK(oylng_schema_status(sc) == OYLNG_OK, "2^21 literals pasted: %s", oylng_schema_error(sc));
+        else
+            CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "past the ceiling"),
+                  "4,096 types pasted: %s", oylng_schema_error(sc) ? oylng_schema_error(sc) : "loaded");
+        oylng_schema_free(sc);
+    }
+    y = typed(&p, "%YAML 2.0\n--- &\nu: {!|: [!int, !str]}\na: {<<: *u}\n--- !a\nx\n", NULL, &err);
+    CHECK(y && oylng_value_type(y, oylng_typed_root(y)) == OYLNG_T_STR, "a union merged alone: %s", err ? err : "");
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+
     /* a node shared under two `!**` is typed under each (section 11) */
     y = typed(&p, "%YAML 2.0\n--- &\nv: {x: 1}\nleaf: {}\nroot:\n  a:\n    child: !leaf\n    !**: !int\n"
                   "  b:\n    child: !leaf\n    !**: !str\n--- !root\na:\n  child: *v\nb:\n  child: *v\n", NULL, &err);
@@ -592,7 +631,7 @@ static void api(void) {
     y = typed(&p, "%YAML 2.0\n--- &\na:\n  x: !str\n  !**: !int\n--- !a\n5\n", NULL, &err);
     CHECK(!y && err && strstr(err, "expected a mapping"), "a key required: %s", err ? err : "accepted");
     oylng_parser_free(p);
-    y = typed(&p, "%YAML 2.0\n--- &\nj:\n  !**: !int\nu: !j | !bool\n--- !u\n[1]\n", NULL, &err);
+    y = typed(&p, "%YAML 2.0\n--- &\nj:\n  !**: !int\nu: {!|: [!j, !bool]}\n--- !u\n[1]\n", NULL, &err);
     CHECK(!y && err && strstr(err, "sequence is not allowed"), "in a union: %s", err ? err : "accepted");
     oylng_parser_free(p);
 

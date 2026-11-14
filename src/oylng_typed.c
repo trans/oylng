@@ -606,8 +606,6 @@ static uint32_t choose(typer *R, const xalts *a, uint32_t node, const xt *scope,
     return *count == 1 ? fit : NONE;
 }
 
-static uint32_t anywhere(typer *R, uint32_t node, const xt *scope);
-
 /* The value at node, typed with the position p of a union */
 static uint32_t one(typer *R, const xpos *p, uint32_t node, const xt *scope) {
     const xt *x = p->t;
@@ -620,13 +618,8 @@ static uint32_t one(typer *R, const xpos *p, uint32_t node, const xt *scope) {
         scalar sc = { .type = OYLNG_T_STR };
         return scalar_val(R, node, &sc, p->from);
     }
-    case X_MAP:
-        if (k != OYLNG_NODE_MAPPING) {
-            /* a `!**` covers its own node: with no key required, it takes
-               any value (section 10) */
-            if (x->u.map.deep && !x->u.map.nreq) return anywhere(R, node, x->u.map.deep);
-            refuse(R, node, "expected a mapping");
-        }
+    case X_MAP:   /* with a `!**` too: a mapping only (section 10) */
+        if (k != OYLNG_NODE_MAPPING) refuse(R, node, "expected a mapping");
         return open_map(R, p, node, scope);
     case X_SEQ:
         if (k != OYLNG_NODE_SEQUENCE) refuse(R, node, "expected a sequence");
