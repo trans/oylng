@@ -9,8 +9,7 @@
  * here as the draft's checker reads it: a stream with documents is read
  * typed, and one with only a table has each entry checked as a root. A
  * typed value is compared with the JSON read as YAML 2.0, where a JSON
- * number, true, false and null are plain and a string is quoted. Examples
- * with what the engine doesn't do yet, !**, are skipped.
+ * number, true, false and null are plain and a string is quoted.
  */
 
 #include "oylng/schema.h"
@@ -244,12 +243,6 @@ static const char *run_example(const char *s, size_t n, const char *want, size_t
     return res;
 }
 
-static bool not_yet(const char *s, size_t n) {
-    for (size_t i = 0; i + 2 < n; i++)
-        if (s[i] == '!' && s[i + 1] == '*' && s[i + 2] == '*') return true;
-    return false;
-}
-
 static void examples(const char *path) {
     size_t len;
     char *spec = slurp(path, &len);
@@ -258,7 +251,7 @@ static void examples(const char *path) {
         failed++;
         return;
     }
-    int pass = 0, fail = 0, skip = 0;
+    int pass = 0, fail = 0;
     char *q = spec;
     struct block { int kind; char *body; size_t n; size_t line; } *b = NULL;
     size_t nb = 0, cap = 0;
@@ -288,10 +281,6 @@ static void examples(const char *path) {
             want = b[i + 1].body;
             wn = b[i + 1].n;
         }
-        if (not_yet(b[i].body, b[i].n)) {
-            skip++;
-            continue;
-        }
         size_t n;
         char *s = framed(b[i].body, b[i].n, &n);
         char why[600] = "";
@@ -303,7 +292,7 @@ static void examples(const char *path) {
             fprintf(stderr, "FAIL the draft's example at line %zu: %s\n", b[i].line, r);
         } else pass++;
     }
-    printf("draft: %d examples pass, %d fail, %d skipped (!**)\n", pass, fail, skip);
+    printf("draft: %d examples pass, %d fail\n", pass, fail);
     failed += fail;
     checks += pass + fail;
     free(b);
@@ -538,6 +527,60 @@ static void api(void) {
     CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), "unclosed pattern"),
           "unclosed in a sequence: %s", oylng_schema_error(sc));
     oylng_schema_free(sc);
+
+    /* !** (section 10): what it walks is typed, a scalar no rule picks out
+       a string, and what it reaches has no name */
+    y = typed(&p, "%YAML 2.0\n--- &\ncfg:\n  name: !str\n  !**:\n    port: !int\n--- !cfg\nname: web\n"
+                  "x: {port: 80, host: h}\nl: [1, {port: 81}]\n", NULL, &err);
+    CHECK(y != NULL, "!**: %s", err ? err : "");
+    if (y) {
+        oylng_value r = oylng_typed_root(y), x = oylng_value_get(y, r, S("x")), l = oylng_value_get(y, r, S("l"));
+        uint64_t u;
+        CHECK(oylng_value_type(y, x) == OYLNG_T_MAPPING && !oylng_value_name(y, x).data, "a mapping it walks");
+        CHECK(oylng_value_uint(y, oylng_value_get(y, x, S("port")), &u) && u == 80, "a rule at depth");
+        CHECK(oylng_value_type(y, oylng_value_get(y, x, S("host"))) == OYLNG_T_STR, "a key no rule takes");
+        CHECK(oylng_value_type(y, l) == OYLNG_T_SEQUENCE && oylng_value_count(y, l) == 2, "a sequence it walks");
+        CHECK(oylng_value_type(y, oylng_value_item(y, l, 0)) == OYLNG_T_STR, "an item is no key");
+        CHECK(oylng_value_uint(y, oylng_value_get(y, oylng_value_item(y, l, 1), S("port")), &u) && u == 81,
+              "a rule in a sequence's mapping");
+        oylng_typed_free(y);
+    }
+    oylng_parser_free(p);
+    static const char *const deep_bad[][2] = {
+        { "a:\n  !**:\n    !**: !int\n", "holds no `!**`" },
+        { "a:\n  !**: !b\nb:\n  x: !int\n", "takes a scalar type" },
+        { "a:\n  !**:\n    !*: [!int, ...]\n", "takes a scalar type" },
+        { "a:\n  !**:\n    !str(/a{400}/): !int\n    !str(/b{400}/): !int\n    !str(/c{400}/): !int\n",
+          "1200 positions" },
+    };
+    for (size_t i = 0; i < sizeof deep_bad / sizeof *deep_bad; i++) {
+        char text[200];
+        snprintf(text, sizeof text, "%%YAML 2.0\n--- &\n%s", deep_bad[i][0]);
+        sc = oylng_schema_new(text, strlen(text), S("a"), 0);
+        CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && strstr(oylng_schema_error(sc), deep_bad[i][1]),
+              "!** refused for %s: %s", deep_bad[i][1], oylng_schema_error(sc) ? oylng_schema_error(sc) : "loaded");
+        oylng_schema_free(sc);
+    }
+    /* a node shared under two `!**` is typed under each (section 11) */
+    y = typed(&p, "%YAML 2.0\n--- &\nv: {x: 1}\nleaf: {}\nroot:\n  a:\n    child: !leaf\n    !**: !int\n"
+                  "  b:\n    child: !leaf\n    !**: !str\n--- !root\na:\n  child: *v\nb:\n  child: *v\n", NULL, &err);
+    CHECK(y != NULL, "shared under two !**: %s", err ? err : "");
+    if (y) {
+        oylng_value r = oylng_typed_root(y);
+        oylng_value ax = oylng_value_get(y, oylng_value_get(y, oylng_value_get(y, r, S("a")), S("child")), S("x"));
+        oylng_value bx = oylng_value_get(y, oylng_value_get(y, oylng_value_get(y, r, S("b")), S("child")), S("x"));
+        CHECK(oylng_value_type(y, ax) == OYLNG_T_INT && oylng_value_type(y, bx) == OYLNG_T_STR,
+              "each under its own !**: %d, %d", (int)oylng_value_type(y, ax), (int)oylng_value_type(y, bx));
+        oylng_typed_free(y);
+    }
+    oylng_parser_free(p);
+    /* a `!**` with a key required takes only a mapping; in a union, any */
+    y = typed(&p, "%YAML 2.0\n--- &\na:\n  x: !str\n  !**: !int\n--- !a\n5\n", NULL, &err);
+    CHECK(!y && err && strstr(err, "expected a mapping"), "a key required: %s", err ? err : "accepted");
+    oylng_parser_free(p);
+    y = typed(&p, "%YAML 2.0\n--- &\nj:\n  !**: !int\nu: !j | !bool\n--- !u\n[1]\n", NULL, &err);
+    CHECK(!y && err && strstr(err, "sequence is not allowed"), "in a union: %s", err ? err : "accepted");
+    oylng_parser_free(p);
 
     /* an untyped document */
     y = typed(&p, "%YAML 2.0\n--- !elsewhere.com/x.yes\na: 1\n", NULL, &err);

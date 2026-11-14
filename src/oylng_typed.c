@@ -9,9 +9,13 @@
  * is a frame on a stack, which types its children in turn.
  *
  * The tree shares a node of the table at every place that names it. A
- * shared node is typed once for each type that reaches it (section 11),
- * and each time adds its own size to typed, which the size limit applies
- * to. A typed value isn't shared between types.
+ * shared node is typed once for each type and nearest `!**` that reach it
+ * (section 11), and each time adds its own size to typed, which the size
+ * limit applies to. A typed value isn't shared between types.
+ *
+ * Below a `!**` (section 10), its rules are the scope: a key the mapping
+ * type at its place doesn't take is looked up in them, and a value no rule
+ * picks out is walked, its scalars typed with the rules' !*, or strings.
  */
 
 #include "oylng_yes.h"
@@ -61,8 +65,10 @@ struct oylng_typed {
 typedef struct {
     uint32_t node;   /* the collection */
     uint32_t val;
-    const xt *x;     /* its type: a sequence or a mapping */
+    const xt *x;     /* its type: a sequence or a mapping, or NULL if walked */
+    const xt *scope; /* the rules of the nearest `!**`, or NULL */
     uint32_t i, n;   /* the child being typed, and how many */
+    bool     seq;
 } frame;
 
 typedef struct {
@@ -74,7 +80,7 @@ typedef struct {
     uint64_t          limit, typed;
     frame            *f;
     size_t            nf, capf;
-    struct memo { uint32_t node, val; const xt *k; } *memo;   /* shared nodes typed */
+    struct memo { uint32_t node, val; const xt *k, *scope; } *memo;   /* shared nodes typed */
     size_t            nmemo, capmemo;
     struct nm { const centry *e; uint32_t i; } *nms;          /* names copied */
     size_t            nnms, capnms;
@@ -505,9 +511,10 @@ static uint32_t scalar_val(typer *R, uint32_t node, const scalar *sc, const cent
     return v;
 }
 
-/* ── Collections (sections 6, 7 and 9) ───────────────────── */
+/* ── Collections (sections 6, 7, 9 and 10) ───────────────── */
 
-static uint32_t open_coll(typer *R, oylng_type type, uint32_t node, const xt *x, const centry *from) {
+static uint32_t open_coll(typer *R, oylng_type type, uint32_t node, const xt *x, const xt *scope,
+                          const centry *from) {
     uint32_t v = new_val(R, type, node, from);
     oylng_typed *Y = R->Y;
     size_t n = oylng_node_count(R->T, node);
@@ -517,11 +524,12 @@ static uint32_t open_coll(typer *R, oylng_type type, uint32_t node, const xt *x,
     for (size_t i = 0; i < n; i++) Y->kids[Y->nk + i] = NONE;
     Y->nk += n;
     ROOM(R, R->f, R->capf, R->nf + 1);
-    R->f[R->nf++] = (frame){ node, v, x, 0, (uint32_t)n };
+    R->f[R->nf++] = (frame){ node, v, x, scope, 0, (uint32_t)n, type == OYLNG_T_SEQUENCE };
     return v;
 }
 
-static uint32_t open_map(typer *R, const xpos *p, uint32_t node) {
+/* A mapping typed with p: below it, its own `!**` replaces the one above */
+static uint32_t open_map(typer *R, const xpos *p, uint32_t node, const xt *scope) {
     const xt *m = p->t;
     if (m->u.map.nreq) {
         size_t n = oylng_node_count(R->T, node);
@@ -538,19 +546,20 @@ static uint32_t open_map(typer *R, const xpos *p, uint32_t node) {
                     refuse(R, node, "missing %.*s", SHOW(f->name.len), f->name.s);
             }
     }
-    return open_coll(R, OYLNG_T_MAPPING, node, m, p->from);
+    return open_coll(R, OYLNG_T_MAPPING, node, m, m->u.map.deep ? m->u.map.deep : scope, p->from);
 }
 
-static uint32_t open_seq(typer *R, const xpos *p, uint32_t node) {
+static uint32_t open_seq(typer *R, const xpos *p, uint32_t node, const xt *scope) {
     const xt *q = p->t;
     size_t n = oylng_node_count(R->T, node);
     if (n < q->u.seq.n || (!q->u.seq.rest && n != q->u.seq.n)) refuse(R, node, "wrong length: %zu", n);
-    return open_coll(R, OYLNG_T_SEQUENCE, node, q, p->from);
+    return open_coll(R, OYLNG_T_SEQUENCE, node, q, scope, p->from);
 }
 
 /* Which of a union's mappings fits the mapping at node, by its own keys
- * (section 9): the one, or NONE, and how many in *count */
-static uint32_t choose(typer *R, const xalts *a, uint32_t node, uint32_t *count) {
+ * (section 9): the one, or NONE, and how many in *count. Where a `!**`
+ * reaches, every mapping takes every key (section 10). */
+static uint32_t choose(typer *R, const xalts *a, uint32_t node, const xt *scope, uint32_t *count) {
     uint32_t nm = a->nmaps;
     if (nm > R->capok) {
         uint8_t *ok = realloc(R->ok, nm);
@@ -581,7 +590,7 @@ static uint32_t choose(typer *R, const xalts *a, uint32_t node, uint32_t *count)
                 }
                 continue;
             }
-            if (m->u.map.other) continue;
+            if (m->u.map.other || m->u.map.deep || scope) continue;
             bool taken = false;
             for (uint32_t r = 0; r < m->u.map.nrows && !taken; r++) taken = key_fits(R, m->u.map.rows[r].key, kn, k);
             if (!taken) R->ok[j] = 0;
@@ -597,8 +606,10 @@ static uint32_t choose(typer *R, const xalts *a, uint32_t node, uint32_t *count)
     return *count == 1 ? fit : NONE;
 }
 
+static uint32_t anywhere(typer *R, uint32_t node, const xt *scope);
+
 /* The value at node, typed with the position p of a union */
-static uint32_t one(typer *R, const xpos *p, uint32_t node) {
+static uint32_t one(typer *R, const xpos *p, uint32_t node, const xt *scope) {
     const xt *x = p->t;
     oylng_kind k = oylng_node_kind(R->T, node);
     switch (x->kind) {
@@ -610,11 +621,16 @@ static uint32_t one(typer *R, const xpos *p, uint32_t node) {
         return scalar_val(R, node, &sc, p->from);
     }
     case X_MAP:
-        if (k != OYLNG_NODE_MAPPING) refuse(R, node, "expected a mapping");
-        return open_map(R, p, node);
+        if (k != OYLNG_NODE_MAPPING) {
+            /* a `!**` covers its own node: with no key required, it takes
+               any value (section 10) */
+            if (x->u.map.deep && !x->u.map.nreq) return anywhere(R, node, x->u.map.deep);
+            refuse(R, node, "expected a mapping");
+        }
+        return open_map(R, p, node, scope);
     case X_SEQ:
         if (k != OYLNG_NODE_SEQUENCE) refuse(R, node, "expected a sequence");
-        return open_seq(R, p, node);
+        return open_seq(R, p, node, scope);
     default:
         break;
     }
@@ -627,19 +643,19 @@ static uint32_t one(typer *R, const xpos *p, uint32_t node) {
     return scalar_val(R, node, &sc, p->from);
 }
 
-static uint32_t convert(typer *R, const xt *t, uint32_t node) {
+static uint32_t convert(typer *R, const xt *t, uint32_t node, const xt *scope) {
     const xalts *a = t->alts;
-    if (a->n == 1) return one(R, &a->p[0], node);
+    if (a->n == 1) return one(R, &a->p[0], node, scope);
     oylng_kind k = oylng_node_kind(R->T, node);
     if (k == OYLNG_NODE_MAPPING) {
         uint32_t count;
-        uint32_t fit = a->nmaps ? choose(R, a, node, &count) : (count = 0, NONE);
-        if (fit != NONE) return open_map(R, &a->p[fit], node);
+        uint32_t fit = a->nmaps ? choose(R, a, node, scope, &count) : (count = 0, NONE);
+        if (fit != NONE) return open_map(R, &a->p[fit], node, scope);
         if (!count && a->any != NONE) return new_val(R, OYLNG_T_ANY, node, a->p[a->any].from);
         refuse(R, node, "%u of %u mapping alternatives fit", count, a->nmaps);
     }
     if (k == OYLNG_NODE_SEQUENCE) {
-        if (a->seq != NONE) return open_seq(R, &a->p[a->seq], node);
+        if (a->seq != NONE) return open_seq(R, &a->p[a->seq], node, scope);
         if (a->any != NONE) return new_val(R, OYLNG_T_ANY, node, a->p[a->any].from);
         refuse(R, node, "a sequence is not allowed here");
     }
@@ -662,25 +678,39 @@ static uint64_t own_size(const oylng_tree *T, uint32_t node) {
     return n;
 }
 
-static size_t memo_slot(const typer *R, uint32_t node, const xt *k) {
-    uint64_t h = ((uint64_t)node * 0x9E3779B97F4A7C15u) ^ ((uintptr_t)k >> 4) * 0xC2B2AE3D27D4EB4Fu;
+static size_t memo_slot(const typer *R, uint32_t node, const xt *k, const xt *scope) {
+    uint64_t h = ((uint64_t)node * 0x9E3779B97F4A7C15u) ^ ((uintptr_t)k >> 4) * 0xC2B2AE3D27D4EB4Fu ^
+                 ((uintptr_t)scope >> 4) * 0x165667B19E3779F9u;
     return (size_t)(h >> 17) & (R->capmemo - 1);
 }
 
-/* The value at node typed with t: once for each type, if node is shared */
-static uint32_t conv(typer *R, const xt *t, uint32_t node) {
-    const xt *k = t->kind_of;
+/* The kind a value a `!**` walks is typed as, for the typed count */
+static const xt WALK = { 0 };
+
+static uint32_t walk(typer *R, uint32_t node, const xt *scope) {
+    oylng_kind k = oylng_node_kind(R->T, node);
+    if (k == OYLNG_NODE_STRING) {
+        scalar sc = { .type = OYLNG_T_STR };
+        return scalar_val(R, node, &sc, NULL);
+    }
+    return open_coll(R, k == OYLNG_NODE_MAPPING ? OYLNG_T_MAPPING : OYLNG_T_SEQUENCE, node, NULL, scope, NULL);
+}
+
+/* The value at node typed with t, or walked if t is NULL: once for each
+ * type and nearest `!**`, if node is shared */
+static uint32_t conv(typer *R, const xt *t, uint32_t node, const xt *scope) {
+    const xt *k = t ? t->kind_of : &WALK;
     bool shared = oylng__node_shared(R->T, node);
     if (shared && R->capmemo) {
-        for (size_t i = memo_slot(R, node, k);; i = (i + 1) & (R->capmemo - 1)) {
+        for (size_t i = memo_slot(R, node, k, scope);; i = (i + 1) & (R->capmemo - 1)) {
             if (!R->memo[i].k) break;
-            if (R->memo[i].node == node && R->memo[i].k == k) return R->memo[i].val;
+            if (R->memo[i].node == node && R->memo[i].k == k && R->memo[i].scope == scope) return R->memo[i].val;
         }
     }
     R->typed += own_size(R->T, node);
     if (R->typed > R->limit)
         refuse_as(R, OYLNG_ERR_LIMIT, node, "typed passes the size limit of %llu", (unsigned long long)R->limit);
-    uint32_t v = convert(R, t, node);
+    uint32_t v = t ? convert(R, t, node, scope) : walk(R, node, scope);
     if (shared) {
         if (2 * (R->nmemo + 1) > R->capmemo) {
             size_t nc = R->capmemo ? R->capmemo * 2 : 256;
@@ -691,46 +721,74 @@ static uint32_t conv(typer *R, const xt *t, uint32_t node) {
             R->capmemo = nc;
             for (size_t i = 0; i < oc; i++)
                 if (old[i].k) {
-                    size_t j = memo_slot(R, old[i].node, old[i].k);
+                    size_t j = memo_slot(R, old[i].node, old[i].k, old[i].scope);
                     while (R->memo[j].k) j = (j + 1) & (nc - 1);
                     R->memo[j] = old[i];
                 }
             free(old);
         }
-        size_t j = memo_slot(R, node, k);
+        size_t j = memo_slot(R, node, k, scope);
         while (R->memo[j].k) j = (j + 1) & (R->capmemo - 1);
-        R->memo[j] = (struct memo){ node, v, k };
+        R->memo[j] = (struct memo){ node, v, k, scope };
         R->nmemo++;
     }
     return v;
 }
 
+/* A value a `!**` reaches that no rule picks out (section 10): a scalar
+ * takes the rules' !*, if they have one, and anything else is walked */
+static uint32_t anywhere(typer *R, uint32_t node, const xt *scope) {
+    if (scope->u.map.other && oylng_node_kind(R->T, node) == OYLNG_NODE_STRING)
+        return conv(R, scope->u.map.other, node, scope);
+    return conv(R, NULL, node, scope);
+}
+
+/* An optional key written with no value: null (section 7) */
+static bool no_value(const typer *R, uint32_t vn) {
+    return oylng_node_kind(R->T, vn) == OYLNG_NODE_STRING && oylng_node_plain(R->T, vn) &&
+           !oylng_node_text(R->T, vn).len;
+}
+
+/* A key the mapping type at its place doesn't take, below a `!**`: looked
+ * up in its rules, the closest, and nowhere else (section 10) */
+static uint32_t under(typer *R, uint32_t kn, oylng_str k, uint32_t vn, const xt *scope) {
+    const xfield *fd = oylng__field(R->S, scope, k.data, k.len);
+    if (fd) {
+        if (fd->opt && no_value(R, vn)) return new_val(R, OYLNG_T_NULL, vn, NULL);
+        return conv(R, fd->type, vn, scope);
+    }
+    for (uint32_t r = 0; r < scope->u.map.nrows; r++)
+        if (key_fits(R, scope->u.map.rows[r].key, kn, k)) return conv(R, scope->u.map.rows[r].val, vn, scope);
+    return anywhere(R, vn, scope);
+}
+
 /* The next child of the innermost collection being typed */
 static uint32_t child(typer *R, frame *f) {
-    const xt *x = f->x;
-    if (x->kind == X_SEQ) {
+    const xt *x = f->x, *scope = f->scope;
+    if (f->seq) {
         uint32_t item = oylng_node_item(R->T, f->node, f->i);
-        return conv(R, f->i < x->u.seq.n ? x->u.seq.items[f->i] : x->u.seq.rest, item);
+        if (!x) return anywhere(R, item, scope);
+        return conv(R, f->i < x->u.seq.n ? x->u.seq.items[f->i] : x->u.seq.rest, item, scope);
     }
     uint32_t kn = oylng_node_key(R->T, f->node, f->i), vn = oylng_node_value(R->T, f->node, f->i);
     oylng_str k = oylng_node_text(R->T, kn);
-    const xfield *fd = oylng__field(R->S, x, k.data, k.len);
-    if (fd) {
-        /* an optional key with no value is null (section 7) */
-        if (fd->opt && oylng_node_kind(R->T, vn) == OYLNG_NODE_STRING && oylng_node_plain(R->T, vn) &&
-            !oylng_node_text(R->T, vn).len)
-            return new_val(R, OYLNG_T_NULL, vn, NULL);
-        return conv(R, fd->type, vn);
+    if (x) {
+        const xfield *fd = oylng__field(R->S, x, k.data, k.len);
+        if (fd) {
+            if (fd->opt && no_value(R, vn)) return new_val(R, OYLNG_T_NULL, vn, NULL);
+            return conv(R, fd->type, vn, scope);
+        }
+        for (uint32_t r = 0; r < x->u.map.nrows; r++)
+            if (key_fits(R, x->u.map.rows[r].key, kn, k)) return conv(R, x->u.map.rows[r].val, vn, scope);
+        if (x->u.map.other) return conv(R, x->u.map.other, vn, scope);
+        if (!scope) refuse(R, kn, "unknown key %.*s", SHOW(k.len), k.data);
     }
-    for (uint32_t r = 0; r < x->u.map.nrows; r++)
-        if (key_fits(R, x->u.map.rows[r].key, kn, k)) return conv(R, x->u.map.rows[r].val, vn);
-    if (x->u.map.other) return conv(R, x->u.map.other, vn);
-    refuse(R, kn, "unknown key %.*s", SHOW(k.len), k.data);
+    return under(R, kn, k, vn, scope);
 }
 
 static bool type_tree(typer *R, const xt *root) {
     if (setjmp(R->jb)) return false;
-    R->Y->root = conv(R, root, oylng_tree_root(R->T));
+    R->Y->root = conv(R, root, oylng_tree_root(R->T), NULL);
     while (R->nf) {
         size_t fi = R->nf - 1;
         frame *f = &R->f[fi];

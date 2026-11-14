@@ -16,7 +16,9 @@
  * --cut cuts a time's fraction to the digits the engine holds;
  * --typed-limit N, for tests, sets the size limit for part 2's counts
  * alone (a schema's full size, and typed), as yaml2's checker has them,
- * where --limit sets it for the stream too. With no
+ * where --limit sets it for the stream too; --schema-limit N sets it for
+ * SCHEMA alone, which is read under it as a stream and held to it for its
+ * full size (section 3), as an application's schema is. With no
  * FILE, or with -, reads standard input. On an error, writes it to
  * standard error with its line and column, and exits with 1.
  */
@@ -227,7 +229,7 @@ int main(int argc, char **argv) {
     int json = 0, emit = 0, flow = 0, typed = 0, cut = 0, every = 0;
     const char *schema_path = NULL, *schema_root = NULL;
     unsigned indent = 2;
-    unsigned long long limit = 0, counts_limit = 0;
+    unsigned long long limit = 0, counts_limit = 0, schema_limit = 0;
     const char *path = NULL;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--json")) json = 1, emit = 0;
@@ -239,6 +241,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--cut")) cut = 1;
         else if (!strcmp(argv[i], "--every-entry")) every = 1;
         else if (!strcmp(argv[i], "--typed-limit") && i + 1 < argc) counts_limit = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--schema-limit") && i + 1 < argc) schema_limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--indent") && i + 1 < argc) indent = (unsigned)strtoul(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--limit") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
@@ -269,7 +272,9 @@ int main(int argc, char **argv) {
             char *stext = read_all(sf, &slen);
             fclose(sf);
             if (!stext) { fprintf(stderr, "oylng: can't read %s\n", schema_path); return 2; }
-            app = oylng__schema_new(stext, slen, (oylng_str){ schema_root, strlen(schema_root) }, limit, counts_limit);
+            oylng_str root = { schema_root, strlen(schema_root) };
+            app = schema_limit ? oylng_schema_new(stext, slen, root, schema_limit)
+                               : oylng__schema_new(stext, slen, root, limit, counts_limit);
             free(stext);
             if (!app) { fputs("oylng: out of memory\n", stderr); return 2; }
             if (oylng_schema_status(app) != OYLNG_OK) {

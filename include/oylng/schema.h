@@ -12,7 +12,10 @@
  *
  * Patterns are I-Regexp (RFC 9485), matched in time linear in the text,
  * with Unicode 16's categories for \p{..}; groups nest at most 256 deep.
- * Not yet: `!**`, which makes a schema OYLNG_ERR_SCHEMA, saying so. A
+ * Below a `!**` (section 10), what no rule picks out is walked: a mapping
+ * or a sequence is typed OYLNG_T_MAPPING or OYLNG_T_SEQUENCE, its children
+ * looked up in turn, and a scalar takes the rules' `!*`, or is
+ * OYLNG_T_STR; what is walked has no name (oylng_value_name). Not yet: a
  * published name is never looked up, as section 3.1 has it unless the
  * application asks, so it stamps nothing.
  */
@@ -34,9 +37,9 @@ typedef struct oylng_schema oylng_schema;
  *  of @p len bytes at @p yaml, and the entry @p root, which types each
  *  document that has no stamp. With root.data NULL, every entry is checked
  *  as a root, and the schema types nothing: a check of a schema file.
- *  @p limit is the size limit, for the stream (section 10) and the
- *  schema's full size (section 11); 0 for the default, UINT64_MAX for
- *  none. The text needn't outlive the call. NULL if memory runs out;
+ *  @p limit is the size limit: the schema is a stream of its own, read
+ *  under it (part 1, section 10), and its full size (section 9) is held to
+ *  it, as section 3 has it; 0 for the default, UINT64_MAX for none. The text needn't outlive the call. NULL if memory runs out;
  *  otherwise see oylng_schema_status. */
 OYLNG_API oylng_schema *oylng_schema_new(const char *yaml, size_t len, oylng_str root, uint64_t limit);
 

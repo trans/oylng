@@ -12,15 +12,14 @@
  * refused, as refused says: the schema, or a document, whose path is
  * compared with at (a different one is counted, not failed: the suite's is
  * the first fault its checker meets). The limit applies to the stream, and
- * to an application's schema for part 2's counts (its full size), not to
- * the schema's text as a stream, as the suite has it.
+ * to an application's schema, which is read under it as a stream and then
+ * held to it for its full size (section 3).
  *
  * Skipped, and counted: keep and together, interfaces this parser doesn't
  * offer; store, since it looks up no published name; holds other than its
  * own (9 fraction digits, a second 60, the year 0000), and a test without
- * holds that it refuses for a time it can't hold; and what it refuses
- * because it doesn't do it yet (!**); a limit of 0, which the library takes
- * as the default. Exits with 1 if any test fails.
+ * holds that it refuses for a time it can't hold; a limit of 0, which
+ * the library takes as the default. Exits with 1 if any test fails.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -34,11 +33,7 @@
 #include <sys/stat.h>
 
 static int passed, failed, verbose, paths;
-static int skip_keep, skip_store, skip_holds, skip_yet, skip_zero;
-
-/* The library's own: a schema with the limit for part 2's counts alone */
-oylng_schema *oylng__schema_new(const char *yaml, size_t len, oylng_str root, uint64_t limit,
-                                uint64_t counts_limit);
+static int skip_keep, skip_store, skip_holds, skip_zero;
 
 static char *slurp(const char *dir, const char *name, size_t *len) {
     char path[4096];
@@ -214,13 +209,11 @@ static void run(const char *dir) {
     oylng_schema *app = NULL;
     if (limit && !lim) { skip_zero++; goto done; }   /* the library's 0 is the default */
     if (schema) {
-        /* the suite applies the limit to the schema's counts, not to its text as a stream */
-        app = oylng__schema_new(schema, slen, root ? (oylng_str){ root, strlen(root) } : (oylng_str){ NULL, 0 }, 0,
-                                lim);
+        app = oylng_schema_new(schema, slen, root ? (oylng_str){ root, strlen(root) } : (oylng_str){ NULL, 0 }, lim);
         if (oylng_schema_status(app) != OYLNG_OK) {
             err = oylng_schema_error(app);
             m = oylng_schema_error_mark(app);
-            schema_err = oylng_schema_status(app) == OYLNG_ERR_SCHEMA;
+            schema_err = true;   /* whatever refused it: its text, its size or its types */
         }
     }
     if (!err) {
@@ -251,7 +244,6 @@ static void run(const char *dir) {
     /* the engine's path, where it refused a document: its error up to ": " */
     bool doc_err = schema_err && err && err[0] == '/';
     size_t plen = doc_err ? strcspn(err, ":") : 0;
-    if (err && strstr(err, "supported yet")) { skip_yet++; goto done; }
     if (err && !holds && strstr(err, "can't hold")) { skip_holds++; goto done; }
     if (want_error) {
         if (!err) why = "not refused";
@@ -329,8 +321,8 @@ int main(int argc, char **argv) {
     }
     if (!data) { fprintf(stderr, "usage: test_yes DATA [-v]\n"); return 2; }
     walk(data);
-    printf("yes: %d passed, %d failed; skipped %d with keep, %d with a store, %d holding more, %d not built yet (!**),"
+    printf("yes: %d passed, %d failed; skipped %d with keep, %d with a store, %d holding more,"
            " %d with a limit of 0; %d refused at another path\n",
-           passed, failed, skip_keep, skip_store, skip_holds, skip_yet, skip_zero, paths);
+           passed, failed, skip_keep, skip_store, skip_holds, skip_zero, paths);
     return failed ? 1 : 0;
 }

@@ -120,8 +120,10 @@ typed count, and an application's cut of a time's fraction. `!int` is
 `!decimal` are delivered as written; a time holds nanoseconds, a leap
 second and the year 0000. Patterns (`!str(/[a-z][a-z0-9-]*/)` and the like)
 are I-Regexp, matched without backtracking, so in time linear in the
-text, with Unicode 16's categories for `\p{..}`. Not yet: `!**`, for which
-a schema is refused, saying so, and published names, which stamp nothing.
+text, with Unicode 16's categories for `\p{..}`. `!**` types what it
+reaches at every level below, by its rules or by its `!*`, and walks the
+rest, so `json: {!**: !null | !bool | !int | !float | !str}` reads JSON.
+Not yet: published names, which stamp nothing.
 `include/oylng/schema.h` documents the rest.
 
 `oylng --typed` types a stream and writes each document as JSON, each
@@ -180,8 +182,7 @@ or later.
 
 - `make test` runs the API tests, the emitter's tests, part 2's tests and
   the YAML 2.0 test suite. Part 2's run the draft's examples, read from
-  `../yaml2/spec/yaml-easy-schema.md` (`SCHEMA_SPEC=`), skipping those with
-  `!**`. The emitter's write every string of up to three characters
+  `../yaml2/spec/yaml-easy-schema.md` (`SCHEMA_SPEC=`). The emitter's write every string of up to three characters
   from the ones that matter to YAML, and random longer ones, in each place
   a scalar can go, and read them back; and each suite test that passes is
   written again four ways and must read back the same. Each suite test is
@@ -191,8 +192,8 @@ or later.
   with the suite's `bin/suite-to-data`, which needs PyYAML. Part 2's suite,
   `suite/yes` (`make test-yes`), types each test and compares its typed
   events, or its refusal and the refusal's kind; it skips tests with `keep`
-  or a store of published names, times held otherwise than the engine
-  holds them, and `!**`. Then
+  or a store of published names, and times held otherwise than the engine
+  holds them. Then
   `make test-plain` runs them all again, built without SIMD and without the
   fast paths for flow collections on one line and simple block lines, so
   the code those stand in for stays tested.
@@ -203,7 +204,7 @@ or later.
 - `make test-schema-diff` runs part 2's checker, yaml2's `schemacheck.py`
   on its `ai` branch (`SCHEMACHECK=`), on its examples and edge cases, and
   gives each stream it types to `oylng --typed`: both must refuse it, or
-  both accept it with the same values. It skips those with `!**`.
+  both accept it with the same values.
 - `make test-pattern-diff` generates patterns (`PATTERN_N=`, 20,000 by
   default), with strings that match them and strings that nearly do, and
   some patterns broken on purpose, and gives each to this parser and to

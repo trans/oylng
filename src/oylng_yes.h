@@ -96,6 +96,8 @@ enum { STD_STR, STD_INT, STD_BIGINT, STD_FLOAT, STD_DECIMAL, STD_BOOL, STD_NULL,
 #define XF_TYPES  32u    /* values are typed with it, so it has its alternatives */
 #define XF_FILLED 64u    /* X_SEQ, X_MAP: its children are compiled */
 #define XF_PAT   128u    /* X_STD: a pattern */
+#define XF_BARE  256u    /* X_MAP: the rules of a `!**` written as a type, its
+                            only rule !* (section 10) */
 
 typedef struct oylng__xt    xt;
 typedef struct oylng__entry centry;
@@ -136,7 +138,8 @@ typedef struct {
 } xalts;
 
 struct oylng__xt {
-    uint8_t  kind, std, flags;
+    uint8_t  kind, std;
+    uint16_t flags;
     uint32_t pos;         /* where it is written, in the schema's text */
     uint32_t node;        /* X_SEQ, X_MAP: its node in the table, or UINT32_MAX */
     uint32_t mark;        /* the walk last through it */
@@ -162,6 +165,7 @@ struct oylng__xt {
             xrow     *rows;   /* type keys, in the order written */
             uint32_t  nrows;
             xt       *other;  /* !* */
+            xt       *deep;   /* !**: its rules, a mapping (section 10) */
         } map;
     } u;
 };
@@ -204,6 +208,8 @@ struct oylng__sctx {
     uint32_t       nfresh, capfresh, nfresh_types, capfresh_types;
     centry       **fresh_entries;
     uint32_t       nfresh_entries, capfresh_entries;
+    xt           **fresh_deeps;   /* the rules of each `!**` it reached */
+    uint32_t       nfresh_deeps, capfresh_deeps;
     /* scratch */
     xt           **stk;
     uint32_t       nstk, capstk;

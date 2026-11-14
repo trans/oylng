@@ -18,18 +18,21 @@
   the year 0000. Patterns (sections 4.3 and 4.5) are I-Regexp (RFC 9485),
   read and counted as the draft says, with Unicode 16's categories for
   `\p{..}`, and matched without backtracking, in time linear in the text;
-  a number a pattern matched is delivered in the standard spelling. Not
-  yet: `!**`, which a schema is refused for, saying so, and published
-  names. `oylng --typed` types a stream and writes each value with its
+  a number a pattern matched is delivered in the standard spelling. `!**`
+  (section 10) types what it reaches at every level below, by its rules or
+  its `!*`, and walks the rest. An application's schema is read under the
+  size limit as a stream of its own, and its full size held to it (section
+  3, yaml2 `425db57`). Not yet: published names. `oylng --typed` types a stream and writes each value with its
   type; with `--every-entry`, a stream with a table and no document is
   checked as a schema file, every entry as a root.
-- Tested: 60 API checks and the draft's 59 examples without `!**` (`make
-  test`); part 2's suite (yaml2 `63e86ea`), 664 of its 806 tests passed and
-  none failed, the rest skipped for `!**` (69), times held otherwise (25),
-  `keep` (24), published names (23) and a limit of 0 (1) (`make test-yes`); 716 of the streams the draft's schema checker (yaml2's
-  `schemacheck.py`) types in its examples and edge cases, each refused by
-  both or accepted with the same values (`make test-schema-diff`, with
-  `--every-entry`, as the checker checks a stream with no document); 50,000
+- Tested: 75 API checks and the draft's 68 examples (`make test`); part 2's
+  suite (yaml2 `a7e2df6`), 736 of its 808 tests passed and none failed, the
+  rest skipped for times held otherwise (25), `keep` (24) and published
+  names (23) (`make test-yes`); all 798 of the streams the draft's schema
+  checker (yaml2's `schemacheck.py`) types in its examples and edge cases
+  that the engine can run, each refused by both or accepted with the same
+  values (`make test-schema-diff`, with `--every-entry`, as the checker
+  checks a stream with no document, and `--schema-limit`); 50,000
   generated patterns and 199,553 strings, read, counted and matched as the
   checker's reading run by Python's `re` does (`make test-pattern-diff`);
   GitHub's workflow format and Compose as shadow schemas, on the 490

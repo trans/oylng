@@ -128,6 +128,7 @@ void oylng__sctx_free(void *ctx) {
     free(S->fresh);
     free(S->fresh_types);
     free(S->fresh_entries);
+    free(S->fresh_deeps);
     free(S);
 }
 
@@ -511,8 +512,20 @@ const xfield *oylng__field(const sctx *S, const xt *m, const char *k, size_t n) 
     return found ? &m->u.map.f[m->u.map.ix[h] - 1] : NULL;
 }
 
+/* What a `!**` holds (section 10): a mapping of rules, or a type, which is
+ * read as rules whose only rule is !* */
+static xt *rules_of(sctx *S, uint32_t node, size_t pos) {
+    xt *v = compile_node(S, node);
+    if (v->kind == X_MAP) return v;
+    xt *r = new_xt(S, X_MAP, pos);
+    r->flags |= XF_FILLED | XF_BARE;
+    r->u.map.other = v;
+    return r;
+}
+
 /* A collection's children, compiled: a sequence's items and the type
- * `...` repeats, a mapping's fields, type keys and !* (section 7) */
+ * `...` repeats, a mapping's fields, type keys, !* (section 7) and !**
+ * (section 10) */
 static void fill(sctx *S, xt *t) {
     if (t->flags & XF_FILLED) return;
     t->flags |= XF_FILLED;
@@ -556,7 +569,10 @@ static void fill(sctx *S, xt *t) {
         size_t kl = kn.len;
         bool opt = false;
         if (kn.plain && kl && ks[0] == '!') {
-            if (kl == 3 && memcmp(ks, "!**", 3) == 0) bad(S, kn.pos, "`!**` isn't supported yet");
+            if (kl == 3 && memcmp(ks, "!**", 3) == 0) {
+                t->u.map.deep = rules_of(S, c[2 * p + 1], kn.pos);
+                continue;
+            }
             xt *v = compile_node(S, c[2 * p + 1]);
             if (kl == 2 && ks[1] == '*') { t->u.map.other = v; continue; }
             xstr kt = copy(S, ks, kl);
@@ -641,6 +657,15 @@ static void go_through(sctx *S, xt *root) {
                 make_place(S, t->u.map.rows[i].val, true);
             }
             if (t->u.map.other) make_place(S, t->u.map.other, true);
+            if (t->u.map.deep) {
+                /* the rules aren't a place, but what they hold is */
+                xt *d = t->u.map.deep;
+                fill(S, d);
+                if (d->u.map.deep) bad(S, d->pos, "a `!**` holds no `!**`");
+                GROW(S, S->fresh_deeps, S->capfresh_deeps, S->nfresh_deeps + 1);
+                S->fresh_deeps[S->nfresh_deeps++] = d;
+                if (!(d->flags & XF_SEEN)) push(S, d);
+            }
             break;
         default:
             break;
@@ -666,8 +691,13 @@ static uint64_t full_of(const xt *t) {
     }
     case X_NAME:
         return sat(1, t->u.name->full);
-    case X_MAP:
-        return 1 + (uint64_t)t->u.map.nf + t->u.map.nrows + (t->u.map.other != NULL);
+    case X_MAP: {
+        uint64_t n = 1 + (uint64_t)t->u.map.nf + t->u.map.nrows + (t->u.map.other != NULL);
+        const xt *d = t->u.map.deep;
+        /* a `!**` 1, and a mapping of rules its keys too */
+        if (d) n += 1 + ((d->flags & XF_BARE) ? 0 : (uint64_t)d->u.map.nf + d->u.map.nrows + (d->u.map.other != NULL));
+        return n;
+    }
     case X_STD:
         return (t->flags & XF_PAT) ? t->u.std.rxcount : 1;   /* a pattern its count */
     default:
@@ -758,6 +788,15 @@ static uint64_t root_full(sctx *S, xt *root) {
                 push(S, t->u.map.rows[i].val);
             }
             if (t->u.map.other) push(S, t->u.map.other);
+            if (t->u.map.deep) {   /* what the rules hold, not the rules, which t counts */
+                xt *d = t->u.map.deep;
+                for (uint32_t i = 0; i < d->u.map.nf; i++) push(S, d->u.map.f[i].type);
+                for (uint32_t i = 0; i < d->u.map.nrows; i++) {
+                    push(S, d->u.map.rows[i].key);
+                    push(S, d->u.map.rows[i].val);
+                }
+                if (d->u.map.other) push(S, d->u.map.other);
+            }
             break;
         default:
             break;
@@ -893,6 +932,21 @@ static void key_ceilings(sctx *S, xt *t) {
     }
 }
 
+/* Section 10: a `!**` walks every collection, so the type its !* gives the
+ * scalars it reaches can't hold a collection; and its type keys are tried
+ * as one union, under the ceiling */
+static void check_deep(sctx *S, const xt *d) {
+    const xt *o = d->u.map.other;
+    if (o)
+        for (uint32_t i = 0; i < o->alts->n; i++)
+            if (o->alts->p[i].t->kind == X_SEQ || o->alts->p[i].t->kind == X_MAP)
+                bad(S, o->pos, "a `!**` takes a scalar type, or a mapping of rules");
+    uint64_t k = key_count(d);
+    if (k > CEILING)
+        bad(S, d->pos, "the type keys of a `!**` have %llu positions, past the ceiling of %d", (unsigned long long)k,
+            CEILING);
+}
+
 /* ── Roots ───────────────────────────────────────────────── */
 
 static void compile_root(sctx *S, centry *e) {
@@ -904,7 +958,7 @@ static void compile_root(sctx *S, centry *e) {
         e->root->pos = (uint32_t)pos32(tn.pos);
     }
     xt *root = e->root;
-    S->nfresh = S->nfresh_types = S->nfresh_entries = 0;
+    S->nfresh = S->nfresh_types = S->nfresh_entries = S->nfresh_deeps = 0;
     if (!(root->flags & XF_TYPES)) {
         root->flags |= XF_TYPES;
         fresh_add(S, &S->fresh_types, &S->nfresh_types, &S->capfresh_types, root);
@@ -920,6 +974,7 @@ static void compile_root(sctx *S, centry *e) {
     }
     for (uint32_t i = 0; i < S->nfresh_types; i++) expand(S, S->fresh_types[i]);
     for (uint32_t i = 0; i < S->nfresh_types; i++) key_ceilings(S, S->fresh_types[i]);
+    for (uint32_t i = 0; i < S->nfresh_deeps; i++) check_deep(S, S->fresh_deeps[i]);
     e->root_ok = true;
 }
 

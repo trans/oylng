@@ -16,13 +16,13 @@ the engine holds of a date (9 fraction digits, a second of 60, the year
 (part 1, section 10), applied to held and full as the engine's tree applies
 it, which the checker's typed leaves out; and with it for part 2's counts
 alone (`--typed-limit`), typed counted as an interface that keeps
-references counts it.
+references counts it. In both, an application's schema is read under the
+limit as a stream of its own, and held to it for its full size (section 3,
+`--schema-limit`).
 
 Skipped, and counted: streams the checker types with a store of published
-schemas, which the engine doesn't look up, a limit of 0, which the tool
-takes as the default, and those the engine refuses because they use what
-it doesn't do yet (`!**`). Where both
-refuse, the data paths are compared too, and a different one is reported
+schemas, which the engine doesn't look up, and a limit of 0, which the
+tool takes as the default. Where both refuse, the data paths are compared too, and a different one is reported
 but isn't a disagreement: the checker's path is the first fault it meets.
 Exits with 1 if there are any disagreements. With --seeds, also writes each
 stream, framed, into DIR as a fuzz input (fuzz/fuzz_parser.c), its first byte
@@ -101,7 +101,7 @@ def checker_schema(ns, c):
     except ns['REFUSED'] as e:
         return 'no', str(e)
 
-def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=None):
+def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=None, schema_limit=None):
     sf = os.path.join(tmp, 'stream.yaml')
     with open(sf, 'w', encoding='utf-8', newline='') as f: f.write(framed(stream))
     cmd = [tool, '--typed', '--every-entry']   # typed() checks every entry of a stream with no document
@@ -112,6 +112,7 @@ def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=No
     if cut: cmd.append('--cut')
     if limit is not None: cmd += ['--limit', str(limit)]
     if counts is not None: cmd += ['--typed-limit', str(counts)]
+    if schema_limit is not None: cmd += ['--schema-limit', str(schema_limit)]
     r = subprocess.run(cmd + [sf], capture_output=True, timeout=120)
     err = r.stderr.decode('utf-8', 'replace').strip()
     if r.returncode == 0:
@@ -185,11 +186,10 @@ def main():
             with open(os.path.join(seeds, 'schema-' + hashlib.sha1(b).hexdigest()[:16]), 'wb') as f: f.write(b)
     tail = said.strip().splitlines()[-2:]
     print('checker:', '; '.join(tail))
-    seen, n, agree, skipped, store, differ, paths, zero = set(), 0, 0, 0, 0, [], [], 0
+    seen, n, agree, store, differ, paths, zero = set(), 0, 0, 0, [], [], 0
 
     def compare(c, want, got):
-        nonlocal agree, skipped
-        if got[0] == 'no' and 'supported yet' in got[1]: skipped += 1; return
+        nonlocal agree
         if got[0] == 'crash' or want[0] != got[0]: differ.append((c, want, got)); return
         if want[0] == 'no':
             agree += 1
@@ -211,8 +211,10 @@ def main():
                     engine(tool, tmp, framed, c['stream'], c['app'], c['limit'] if limited else None, c['cut']))
             if limited:
                 n += 1
+                # an application's schema is a stream of its own, read under the limit (section 3)
                 compare(dict(c, how="part 2's counts alone"), checker(ns, c, False),
-                        engine(tool, tmp, framed, c['stream'], c['app'], None, c['cut'], c['limit']))
+                        engine(tool, tmp, framed, c['stream'], c['app'], None, c['cut'], c['limit'],
+                               c['limit'] if c['app'] else None))
         for c in schemas:
             key = ('schema', c['text'], c['root'], c['limit'])
             if key in seen: continue
@@ -232,7 +234,7 @@ def main():
         print('  engine: ', short(got[1], 300), '(refuses)' if got[0] != 'ok' else '')
     for c, want, got in paths[:20] if verbose else []:
         print('PATH:', short(c['stream'], 120), '| checker', want[1][:80], '| engine', got[1][:80])
-    print(f'{n} cases: {agree} agree, {len(differ)} differ, {skipped} skipped (!**, not built yet), '
+    print(f'{n} cases: {agree} agree, {len(differ)} differ, '
           f'{store} with a store and {zero} with a limit of 0 not run; {len(paths)} refused at different paths')
     sys.exit(1 if differ else 0)
 
