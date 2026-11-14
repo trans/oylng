@@ -188,7 +188,11 @@ or later.
   also read as trees, which must give the same events, offsets and errors,
   and be written as the events are. The suite is
   read from `../yaml2/suite` (set `SUITE=` for another place) and converted
-  with the suite's `bin/suite-to-data`, which needs PyYAML. Then
+  with the suite's `bin/suite-to-data`, which needs PyYAML. Part 2's suite,
+  `suite/yes` (`make test-yes`), types each test and compares its typed
+  events, or its refusal and the refusal's kind; it skips tests with `keep`
+  or a store of published names, times held otherwise than the engine
+  holds them, and `!**`. Then
   `make test-plain` runs them all again, built without SIMD and without the
   fast paths for flow collections on one line and simple block lines, so
   the code those stand in for stays tested.

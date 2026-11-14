@@ -24,7 +24,9 @@
   type; with `--every-entry`, a stream with a table and no document is
   checked as a schema file, every entry as a root.
 - Tested: 60 API checks and the draft's 59 examples without `!**` (`make
-  test`); 716 of the streams the draft's schema checker (yaml2's
+  test`); part 2's suite (yaml2 `63e86ea`), 664 of its 806 tests passed and
+  none failed, the rest skipped for `!**` (69), times held otherwise (25),
+  `keep` (24), published names (23) and a limit of 0 (1) (`make test-yes`); 716 of the streams the draft's schema checker (yaml2's
   `schemacheck.py`) types in its examples and edge cases, each refused by
   both or accepted with the same values (`make test-schema-diff`, with
   `--every-entry`, as the checker checks a stream with no document); 50,000
