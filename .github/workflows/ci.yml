@@ -8,7 +8,7 @@ on:
 # The YAML 2.0 suite the tests pass against: trans/yaml2 at this commit.
 # Move it forward when the suite changes and the parser has caught up.
 env:
-  YAML2_REF: 213471d4742e0cfe30171b6d99c3792faf957b16
+  YAML2_REF: 590d0a795af196971a6c831361ddde5ce23a36c7
 
 jobs:
   test:
