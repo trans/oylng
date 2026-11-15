@@ -243,6 +243,18 @@ typedef bool (*oylng__lookup)(void *ctx, oylng_str address, oylng_str sha256, oy
 oylng__lookup oylng__parser_lookup(const oylng_parser *p, void **ctx);
 void        *oylng__parser_pubs(const oylng_parser *p);
 void         oylng__parser_set_pubs(oylng_parser *p, void *pubs, void (*free_fn)(void *));
+/* The application's bindings (part 2, section 12), as oylng_parser_bind
+ * gives them: the fn and drop of schema.h's oylng_bind_fn and
+ * oylng_drop_fn */
+struct oylng_typed;
+typedef struct {
+    char  *name;
+    size_t len;
+    const char *(*fn)(void *ctx, struct oylng_typed *t, uint32_t v, void **object);
+    void (*drop)(void *ctx, void *object);
+    void  *ctx;
+} oylng__binding;
+const oylng__binding *oylng__parser_bindings(const oylng_parser *p, uint32_t *n);
 /* After the stream's end: how many --- & tables it had, and whether a ...
  * was read */
 void         oylng__parser_shape(const oylng_parser *p, uint32_t *tables, bool *dotted);

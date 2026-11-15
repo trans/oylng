@@ -19,6 +19,11 @@
  * where the events were, or for a schema; each typed value must be what its
  * type says, each key's value found; every third document's stamp is
  * ignored, and it must not be typed by it. The flow bit also turns on the cut.
+ * Typed so, the names the stream writes as !name are bound, up to 32 of
+ * them, and a few others (section 12): the binding of a value finds
+ * the objects of the bound values just below it made, a value written at
+ * an offset of 5 mod 8 is refused, each bound value has its object, at one place only,
+ * and every object made is let go.
  * Where the stream holds a NUL, what comes before it is also a published
  * file (section 3.1), and what comes after a stream typed with a lookup
  * that gives it, once each #sha256= and the 64 hex digits after it are set
@@ -30,6 +35,7 @@
 
 #include "oylng/oylng.h"
 #include "oylng/schema.h"
+#include <ctype.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -170,6 +176,88 @@ static void check_value(const oylng_typed *t, oylng_value v, size_t *budget) {
     default:
         abort();
     }
+}
+
+/* Bindings (section 12) */
+static const char *const fixed_names[] = { "a", "b", "c", "job", "point" };
+#define NFIXED (sizeof fixed_names / sizeof *fixed_names)
+#define NBOUND 40
+static oylng_str bound_names[NBOUND];
+static size_t nbound;
+
+/* The names to bind: the fixed ones, and each !name the stream writes */
+static void find_names(const char *in, size_t size) {
+    nbound = 0;
+    for (size_t i = 0; i < NFIXED; i++) bound_names[nbound++] = (oylng_str){ fixed_names[i], strlen(fixed_names[i]) };
+    for (size_t i = 0; i + 1 < size && nbound < NBOUND; i++) {
+        if (in[i] != '!') continue;
+        size_t j = i + 1;
+        while (j < size && j - i <= 40 && (isalnum((unsigned char)in[j]) || in[j] == '_' || in[j] == '-')) j++;
+        if (j == i + 1 || j - i > 40) continue;
+        oylng_str n = { in + i + 1, j - i - 1 };
+        bool dup = false;
+        for (size_t k = 0; k < nbound && !dup; k++)
+            dup = bound_names[k].len == n.len && !memcmp(bound_names[k].data, n.data, n.len);
+        if (!dup) bound_names[nbound++] = n;
+        i = j - 1;
+    }
+}
+
+typedef struct { const oylng_typed *t; oylng_value v; } fobj;
+typedef struct { size_t made, dropped; } fbinder;
+
+static bool is_bound(oylng_str n) {
+    for (size_t i = 0; n.data && i < nbound; i++)
+        if (bound_names[i].len == n.len && !memcmp(bound_names[i].data, n.data, n.len)) return true;
+    return false;
+}
+
+static const char *fuzz_bind(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
+    fbinder *b = ctx;
+    if (!is_bound(oylng_value_name(t, v)) || oylng_value_object(t, v)) abort();
+    oylng_type ty = oylng_value_type(t, v);
+    if (ty == OYLNG_T_SEQUENCE || ty == OYLNG_T_MAPPING)
+        for (size_t i = 0; i < oylng_value_count(t, v); i++) {
+            oylng_value c = ty == OYLNG_T_SEQUENCE ? oylng_value_item(t, v, i) : oylng_value_at(t, v, i);
+            if (is_bound(oylng_value_name(t, c)) && !oylng_value_object(t, c)) abort();   /* innermost first */
+        }
+    if (oylng_node_mark(oylng_typed_tree(t), oylng_value_node(t, v)).offset % 8 == 5) return "refused by the binding";
+    fobj *o = malloc(sizeof *o);
+    if (!o) return "out of memory";
+    *o = (fobj){ t, v };
+    b->made++;
+    *obj = o;
+    return NULL;
+}
+
+static void fuzz_drop(void *ctx, void *o) {
+    ((fbinder *)ctx)->dropped++;
+    free(o);
+}
+
+/* Each bound value has its own object, and is at one place only */
+static void check_objects(const oylng_typed *t, oylng_value v, uint8_t **seen, size_t *cap, size_t *budget) {
+    if (!*budget) return;
+    --*budget;
+    if (is_bound(oylng_value_name(t, v))) {
+        const fobj *o = oylng_value_object(t, v);
+        if (!o || o->t != t || o->v != v) abort();
+        if (v >= *cap) {
+            size_t nc = *cap ? *cap : 256;
+            while (nc <= v) nc *= 2;
+            uint8_t *ns = realloc(*seen, nc);
+            if (!ns) { *budget = 0; return; }
+            memset(ns + *cap, 0, nc - *cap);
+            *seen = ns;
+            *cap = nc;
+        }
+        if ((*seen)[v]) abort();
+        (*seen)[v] = 1;
+    } else if (oylng_value_object(t, v)) abort();
+    oylng_type ty = oylng_value_type(t, v);
+    if (ty == OYLNG_T_SEQUENCE || ty == OYLNG_T_MAPPING)
+        for (size_t i = 0; i < oylng_value_count(t, v); i++)
+            check_objects(t, ty == OYLNG_T_SEQUENCE ? oylng_value_item(t, v, i) : oylng_value_at(t, v, i), seen, cap, budget);
 }
 
 /* The published file, for any hash: the parser checks it */
@@ -349,8 +437,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         app = NULL;
     }
     oylng_parser *yp = parser_for(in, size, opt);
+    fbinder fb = { 0 };
     if (yp) {
         oylng_parser_set_cut(yp, (opt & 0x40) != 0);
+        find_names(in, size);
+        for (size_t i = 0; i < nbound; i++)
+            if (oylng_parser_bind(yp, bound_names[i], fuzz_bind, fuzz_drop, &fb) != OYLNG_OK) abort();
         oylng_typed *y;
         oylng_status st;
         size_t budget = 1 << 16;
@@ -365,8 +457,13 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (how == OYLNG_TYPED_NOT && oylng_value_type(y, root) != OYLNG_T_ANY) abort();
             if (how == OYLNG_TYPED_APP && !app) abort();
             check_value(y, root, &budget);
+            uint8_t *seen = NULL;
+            size_t cap = 0, ob = 1 << 16;
+            check_objects(y, root, &seen, &cap, &ob);
+            free(seen);
             oylng_typed_free(y);
         }
+        if (fb.made != fb.dropped) abort();
         if (st == OYLNG_OK) {
             if (!clean && pst != OYLNG_ERR_MEMORY) abort();
         } else {

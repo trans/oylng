@@ -257,6 +257,10 @@ struct oylng_parser {
     void        (*pubs_free)(void *);
     bool          dotted;
 
+    /* for the typed reader: the application's bindings (section 12) */
+    oylng__binding *binds;
+    uint32_t        nbinds, capbinds;
+
     oylng_status status;
     oylng_mark   errmark;
     char         errmsg[200];
@@ -2565,6 +2569,8 @@ void oylng_parser_free(oylng_parser *P) {
     free(P->tmemo);
     if (P->sctx) P->sctx_free(P->sctx);
     if (P->pubs) P->pubs_free(P->pubs);
+    for (uint32_t i = 0; i < P->nbinds; i++) free(P->binds[i].name);
+    free(P->binds);
     oylng_arena_free(P->strings);
     oylng_arena_free(P->vals);
     free(P);
@@ -2664,6 +2670,43 @@ void oylng_parser_set_stamps(oylng_parser *P, bool on) {
 }
 
 bool oylng__parser_stamps(const oylng_parser *P) { return !P->no_stamps; }
+
+oylng_status oylng_parser_bind(oylng_parser *P, oylng_str name, oylng_bind_fn fn, oylng_drop_fn drop, void *ctx) {
+    if (!P || (!name.data && name.len)) return OYLNG_ERR_INPUT;
+    for (uint32_t i = 0; i < P->nbinds; i++) {
+        oylng__binding *b = &P->binds[i];
+        if (b->len != name.len || (name.len && memcmp(b->name, name.data, name.len) != 0)) continue;
+        if (!fn) {
+            free(b->name);
+            P->binds[i] = P->binds[--P->nbinds];
+        } else {
+            b->fn = fn;
+            b->drop = drop;
+            b->ctx = ctx;
+        }
+        return OYLNG_OK;
+    }
+    if (!fn) return OYLNG_OK;
+    if (P->nbinds == P->capbinds) {
+        if (P->capbinds > UINT32_MAX / 2) return OYLNG_ERR_MEMORY;
+        uint32_t c = P->capbinds ? 2 * P->capbinds : 8;
+        oylng__binding *nb = realloc(P->binds, (size_t)c * sizeof *nb);
+        if (!nb) return OYLNG_ERR_MEMORY;
+        P->binds = nb;
+        P->capbinds = c;
+    }
+    char *nm = malloc(name.len + 1);
+    if (!nm) return OYLNG_ERR_MEMORY;
+    if (name.len) memcpy(nm, name.data, name.len);
+    nm[name.len] = 0;
+    P->binds[P->nbinds++] = (oylng__binding){ nm, name.len, fn, drop, ctx };
+    return OYLNG_OK;
+}
+
+const oylng__binding *oylng__parser_bindings(const oylng_parser *P, uint32_t *n) {
+    *n = P->nbinds;
+    return P->binds;
+}
 
 void oylng_parser_set_lookup(oylng_parser *P, oylng__lookup fn, void *ctx) {
     if (!P) return;

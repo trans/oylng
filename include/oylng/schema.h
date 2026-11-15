@@ -18,7 +18,9 @@
  * OYLNG_T_STR; what is walked has no name (oylng_value_name). A published
  * name (section 3.1) stamps a document only if the application gives the
  * parser a lookup (oylng_parser_set_lookup); without one it stamps
- * nothing, as any other global name.
+ * nothing, as any other global name. An application's code bound to a
+ * named type (oylng_parser_bind, section 12) makes an object of each value
+ * of that type, once the document is typed.
  */
 
 #ifndef OYLNG_SCHEMA_H
@@ -148,6 +150,8 @@ typedef enum {
  *  at the stamp. */
 OYLNG_API oylng_status oylng_parse_typed(oylng_parser *p, const oylng_schema *app, oylng_typed **out);
 
+/** Lets the document go, and with it each object of a binding's that
+ *  wasn't taken (oylng_value_take), through the binding's drop. */
 OYLNG_API void oylng_typed_free(oylng_typed *t);
 
 /** The document as a tree, valid while the typed document is: its name,
@@ -197,6 +201,44 @@ OYLNG_API oylng_str   oylng_value_key(const oylng_typed *t, oylng_value map, siz
 OYLNG_API oylng_value oylng_value_at(const oylng_typed *t, oylng_value map, size_t i);
 /** The value of @p key in a mapping, or OYLNG_NO_VALUE */
 OYLNG_API oylng_value oylng_value_get(const oylng_typed *t, oylng_value map, oylng_str key);
+
+/* ── Application types (section 12) ─────────────────────── */
+
+/** An application's code for a named type: it takes value @p v of @p t
+ *  and sets *object to a value of the application's own (NULL is one too),
+ *  returning NULL; or it returns why the document is refused, which is
+ *  copied, having let go what it made or took. It may read @p t, and take
+ *  the objects of the values below @p v (oylng_value_take). */
+typedef const char *(*oylng_bind_fn)(void *ctx, oylng_typed *t, oylng_value v, void **object);
+
+/** Lets go an object that oylng_typed_free finds untaken */
+typedef void (*oylng_drop_fn)(void *ctx, void *object);
+
+/** Binds @p fn to the name @p name: each value whose name it is
+ *  (oylng_value_name) gets an object @p fn makes, from the next document
+ *  typed on, whichever schema types it: the stream's own, the
+ *  application's or a published one. A name nobody bound makes nothing, so
+ *  the bindings are all that a stream can get made (section 12). @p fn runs
+ *  once the document is typed, never while it is, so never on trial; once
+ *  for each place a value is used, so `*p` twice is two calls and two
+ *  objects; innermost first, so the code finds the objects of the values
+ *  below its own made; and in the order written. Its refusal refuses the
+ *  document, OYLNG_ERR_SCHEMA with the value's path and where it is
+ *  written, and the objects made are let go. Binding a name again
+ *  replaces its binding, and @p fn NULL unbinds it; from inside a binding,
+ *  a change takes effect with the next document. @p drop may be NULL.
+ *  OYLNG_ERR_MEMORY if memory runs out. */
+OYLNG_API oylng_status oylng_parser_bind(oylng_parser *p, oylng_str name, oylng_bind_fn fn, oylng_drop_fn drop,
+                                         void *ctx);
+
+/** The object a binding made for value v, or NULL. Where a name is bound,
+ *  each value on the way to a bound one is a value of its own at each
+ *  place it is used; elsewhere, a value reached twice may be one value. */
+OYLNG_API void *oylng_value_object(const oylng_typed *t, oylng_value v);
+
+/** The same, and the document no longer holds it: oylng_typed_free won't
+ *  let it go */
+OYLNG_API void *oylng_value_take(oylng_typed *t, oylng_value v);
 
 #ifdef __cplusplus
 }

@@ -58,6 +58,12 @@ struct oylng_typed {
     size_t         nn, capn;
     char          *pool;
     size_t         np, capp;
+    /* the objects bindings made (section 12), and each value's, in objs or
+       NONE, for the first nobjat values */
+    struct obj { void *o; void (*drop)(void *, void *); void *ctx; } *objs;
+    size_t         nobj, capobj;
+    uint32_t      *objat;
+    size_t         nobjat, capobjat;
 };
 
 /* ── Typing ──────────────────────────────────────────────── */
@@ -90,6 +96,11 @@ typedef struct {
     oylng__rxscr      rxs;        /* for matching patterns */
     char             *canon;      /* a number a pattern matched, as spelled */
     size_t            capcanon;
+    struct bnd { const char *(*fn)(void *, oylng_typed *, uint32_t, void **);
+                 void (*drop)(void *, void *); void *ctx; } *bt;   /* each name's binding */
+    size_t            capbt;
+    uint8_t          *bfl;        /* each value's B_ flags */
+    size_t            capbfl;
     jmp_buf           jb;
     oylng_status      st;
 } typer;
@@ -798,6 +809,145 @@ static bool type_tree(typer *R, const xt *root) {
     return true;
 }
 
+/* ── Application types (section 12) ──────────────────────── */
+
+/* A value: seen; with a bound value at or below it; and claimed by the
+ * place being walked, so a second place gets a copy */
+enum { B_SEEN = 1, B_HAS = 2, B_MINE = 4 };
+
+static bool bound(const typer *R, uint32_t v) {
+    uint32_t nm = R->Y->v[v].name;
+    return nm != NONE && R->bt[nm].fn;
+}
+
+static void walk_into(typer *R, uint32_t v) {
+    const oylng_typed *Y = R->Y;
+    const tval *t = &Y->v[v];
+    bool coll = t->type == OYLNG_T_SEQUENCE || t->type == OYLNG_T_MAPPING;
+    ROOM(R, R->f, R->capf, R->nf + 1);
+    R->f[R->nf++] = (frame){ .node = t->node, .val = v, .n = coll ? (uint32_t)oylng_node_count(Y->T, t->node) : 0 };
+}
+
+/* A copy of value c, for a place of its own: its children are the same */
+static uint32_t own_copy(typer *R, uint32_t c) {
+    oylng_typed *Y = R->Y;
+    if (Y->nv >= NONE - 1) refuse_as(R, OYLNG_ERR_LIMIT, Y->v[c].node, "a typed document of 4G values or more");
+    ROOM(R, Y->v, Y->capv, Y->nv + 1);
+    ROOM(R, R->bfl, R->capbfl, Y->nv + 1);
+    tval *t = &Y->v[Y->nv];
+    *t = Y->v[c];
+    if (t->type == OYLNG_T_SEQUENCE || t->type == OYLNG_T_MAPPING) {
+        size_t n = oylng_node_count(Y->T, t->node);
+        if (Y->nk + n >= NONE) refuse_as(R, OYLNG_ERR_LIMIT, t->node, "a typed document of 4G values or more");
+        ROOM(R, Y->kids, Y->capk, Y->nk + n);
+        if (n) memcpy(Y->kids + Y->nk, Y->kids + t->a, n * sizeof *Y->kids);
+        t->a = (uint32_t)Y->nk;
+        Y->nk += n;
+    }
+    R->bfl[Y->nv] = B_SEEN | B_HAS;
+    return (uint32_t)Y->nv++;
+}
+
+/* Value v's binding called, its parents on the frames: a refusal gives
+ * their path */
+static void call(typer *R, uint32_t v) {
+    oylng_typed *Y = R->Y;
+    /* room first, so that an object made is never lost */
+    ROOM(R, Y->objs, Y->capobj, Y->nobj + 1);
+    if (Y->nobjat < Y->nv) {
+        ROOM(R, Y->objat, Y->capobjat, Y->nv);
+        for (size_t i = Y->nobjat; i < Y->nv; i++) Y->objat[i] = NONE;
+        Y->nobjat = Y->nv;
+    }
+    const struct bnd *b = &R->bt[Y->v[v].name];
+    void *o = NULL;
+    const char *why = b->fn(b->ctx, Y, v, &o);
+    if (why) refuse(R, Y->v[v].node, "%s", why);
+    if (!o) return;
+    Y->objs[Y->nobj] = (struct obj){ o, b->drop, b->ctx };
+    Y->objat[v] = (uint32_t)Y->nobj++;
+}
+
+/* The bindings, once the document is typed: each value with a bound name
+ * gets its object, once for each place it is used, innermost first, in
+ * the order written. A value reached twice is one value; one with a bound
+ * value at or below it is copied for each place after the first, so each
+ * place has its own, and the rest stays shared. */
+static bool bind_doc(typer *R, const oylng__binding *bs, uint32_t nb) {
+    if (setjmp(R->jb)) return false;
+    oylng_typed *Y = R->Y;
+    bool any = false;
+    ROOM(R, R->bt, R->capbt, Y->nn);
+    for (size_t i = 0; i < Y->nn; i++) {
+        R->bt[i] = (struct bnd){ 0 };
+        const char *s = Y->pool + Y->names[i].off;
+        size_t n = Y->names[i].len;
+        for (uint32_t j = 0; j < nb; j++)
+            if (bs[j].len == n && (!n || memcmp(bs[j].name, s, n) == 0)) {
+                R->bt[i] = (struct bnd){ bs[j].fn, bs[j].drop, bs[j].ctx };
+                any = true;
+                break;
+            }
+    }
+    if (!any) return true;
+
+    /* which values have a bound value at or below them */
+    ROOM(R, R->bfl, R->capbfl, Y->nv);
+    memset(R->bfl, 0, Y->nv);
+    R->nf = 0;
+    R->bfl[Y->root] = B_SEEN;
+    walk_into(R, Y->root);
+    while (R->nf) {
+        frame *f = &R->f[R->nf - 1];
+        if (f->i == f->n) {
+            uint32_t v = f->val;
+            if (bound(R, v)) R->bfl[v] |= B_HAS;
+            if (--R->nf) {
+                frame *up = &R->f[R->nf - 1];
+                if (R->bfl[v] & B_HAS) R->bfl[up->val] |= B_HAS;
+                up->i++;
+            }
+            continue;
+        }
+        uint32_t c = Y->kids[Y->v[f->val].a + f->i];
+        if (R->bfl[c] & B_SEEN) {   /* done: the values are a graph without cycles */
+            if (R->bfl[c] & B_HAS) R->bfl[f->val] |= B_HAS;
+            f->i++;
+            continue;
+        }
+        R->bfl[c] = B_SEEN;
+        walk_into(R, c);
+    }
+    if (!(R->bfl[Y->root] & B_HAS)) return true;
+
+    /* each place, its own value, and the calls */
+    R->bfl[Y->root] |= B_MINE;
+    walk_into(R, Y->root);
+    while (R->nf) {
+        frame *f = &R->f[R->nf - 1];
+        if (f->i == f->n) {
+            uint32_t v = f->val;
+            R->nf--;
+            if (bound(R, v)) call(R, v);
+            if (R->nf) R->f[R->nf - 1].i++;
+            continue;
+        }
+        uint32_t pv = f->val, pi = f->i;
+        uint32_t c = Y->kids[Y->v[pv].a + pi];
+        if (!(R->bfl[c] & B_HAS)) {
+            f->i++;
+            continue;
+        }
+        if (R->bfl[c] & B_MINE) {
+            c = own_copy(R, c);
+            Y->kids[Y->v[pv].a + pi] = c;
+        }
+        R->bfl[c] |= B_MINE;
+        walk_into(R, c);
+    }
+    return true;
+}
+
 /* ── Reading a typed document ────────────────────────────── */
 
 struct start {
@@ -1012,8 +1162,15 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
     if (!c.root) {
         ok = !setjmp(R.jb);
         if (ok) Y->root = new_val(&R, OYLNG_T_ANY, oylng_tree_root(T), NULL);
-    } else ok = type_tree(&R, c.root);
+    } else {
+        ok = type_tree(&R, c.root);
+        uint32_t nb;
+        const oylng__binding *bs = oylng__parser_bindings(P, &nb);
+        if (ok && nb) ok = bind_doc(&R, bs, nb);
+    }
     free(R.f);
+    free(R.bt);
+    free(R.bfl);
     free(R.memo);
     free(R.nms);
     free(R.ok);
@@ -1032,6 +1189,10 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
 
 void oylng_typed_free(oylng_typed *Y) {
     if (!Y) return;
+    for (size_t i = Y->nobj; i--;)
+        if (Y->objs[i].o && Y->objs[i].drop) Y->objs[i].drop(Y->objs[i].ctx, Y->objs[i].o);
+    free(Y->objs);
+    free(Y->objat);
     oylng_tree_free(Y->T);
     free(Y->v);
     free(Y->kids);
@@ -1061,6 +1222,18 @@ oylng_str oylng_value_text(const oylng_typed *Y, oylng_value v) {
     const tval *t = val(Y, v);
     if (t && t->own) return (oylng_str){ (const char *)Y->bytes + t->a, (size_t)t->x.n };
     return t ? oylng_node_text(Y->T, t->node) : (oylng_str){ NULL, 0 };
+}
+
+void *oylng_value_object(const oylng_typed *Y, oylng_value v) {
+    if (!Y || v >= Y->nobjat || Y->objat[v] == NONE) return NULL;
+    return Y->objs[Y->objat[v]].o;
+}
+
+void *oylng_value_take(oylng_typed *Y, oylng_value v) {
+    if (!Y || v >= Y->nobjat || Y->objat[v] == NONE) return NULL;
+    void *o = Y->objs[Y->objat[v]].o;
+    Y->objs[Y->objat[v]].o = NULL;
+    return o;
 }
 
 oylng_str oylng_value_name(const oylng_typed *Y, oylng_value v) {

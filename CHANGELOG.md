@@ -35,6 +35,22 @@
   type; with `--every-entry`, a stream with a table and no document is
   checked as a schema file, every entry as a root; with `--store DIR`, a
   published name is looked up in DIR, by its hash.
+- **Application types** (part 2, section 12). `oylng_parser_bind(p, name,
+  fn, drop, ctx)` binds an application's code to a named type, whichever
+  schema types the document: the stream's own, the application's or a
+  published one. The code takes each value whose name it is
+  (`oylng_value_name`) and makes an object of the application's, or
+  refuses the document, which is then `OYLNG_ERR_SCHEMA` at the value's
+  path. It runs once the document is typed, never on trial; innermost
+  first, so a mapping's code finds the objects below it made and can take
+  them; in the order written; and once for each place a value is used, so
+  `*p` twice is two calls and two objects. A value reached twice stays one
+  value except on the way to a bound one, where each place gets its own.
+  `oylng_value_object` and `oylng_value_take`; `oylng_typed_free` lets go
+  what wasn't taken, through `drop`, and so does a refusal. 26 new API
+  checks; the fuzzer binds each name a stream writes and checks the
+  order, that each bound value has its own object at one place, a
+  binding's refusal, and that all that is made is let go.
 - **An application may ignore a file's schema, or be handed it** (part 2,
   section 3). With `oylng_parser_set_stamps(p, false)` a stamp types
   nothing, and nothing is looked up or compiled for it, so a schema in
@@ -51,7 +67,7 @@
   fuzzer checks the table after each tree, types each stream with its
   stamps ignored, which must read as its trees do, and ignores every third
   document's stamp when typing.
-- Tested: 139 API checks and the draft's 70 examples (`make test`); part 2's
+- Tested: 165 API checks and the draft's 70 examples (`make test`); part 2's
   suite (yaml2 `0b88244`), 793 of its 842 tests passed and none failed, 23
   of them with a store of published files, the rest skipped for times held
   otherwise (25) and `keep` (24) (`make test-yes`); all 859 of the streams

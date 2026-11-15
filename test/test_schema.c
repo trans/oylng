@@ -629,6 +629,235 @@ static void ignored_stamps(void) {
     oylng_schema_free(app);
 }
 
+/* Section 12: an application's code for named types. A binder counts what
+ * it makes and lets go, and notes each call's first letter in order. */
+typedef struct {
+    int  made, dropped, calls;
+    char order[64];
+} binder;
+
+typedef struct { int64_t x, y; int id; } point;
+typedef struct { point *a, *b; } line;
+
+static void note(binder *b, char c) {
+    size_t n = strlen(b->order);
+    if (n + 1 < sizeof b->order) b->order[n] = c, b->order[n + 1] = 0;
+    b->calls++;
+}
+
+static const char *bind_point(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
+    binder *b = ctx;
+    note(b, 'p');
+    point p = { 0 };
+    if (!oylng_value_int(t, oylng_value_get(t, v, S("x")), &p.x) || !oylng_value_int(t, oylng_value_get(t, v, S("y")), &p.y))
+        return "a point has two numbers";
+    if (p.x < 0) return "x is negative";
+    point *o = malloc(sizeof *o);
+    *o = p;
+    o->id = ++b->made;
+    *obj = o;
+    return NULL;
+}
+
+static const char *bind_line(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
+    binder *b = ctx;
+    note(b, 'l');
+    point *a = oylng_value_take(t, oylng_value_get(t, v, S("a"))), *c = oylng_value_take(t, oylng_value_get(t, v, S("b")));
+    if (!a || !c) {
+        b->dropped += !!a + !!c;
+        free(a);
+        free(c);
+        return "a line needs two points";
+    }
+    line *l = malloc(sizeof *l);
+    *l = (line){ a, c };
+    b->made++;
+    *obj = l;
+    return NULL;
+}
+
+static const char *bind_money(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
+    binder *b = ctx;
+    note(b, 'm');
+    oylng_str s = oylng_value_text(t, v);
+    int64_t *cents = malloc(sizeof *cents);
+    *cents = 0;
+    for (size_t i = 0; i < s.len; i++)
+        if (s.data[i] != '.') *cents = *cents * 10 + (s.data[i] - '0');
+    b->made++;
+    *obj = cents;
+    return NULL;
+}
+
+static const char *bind_nothing(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
+    (void)t, (void)v, (void)obj;
+    note(ctx, 'n');
+    return NULL;
+}
+
+static void drop_obj(void *ctx, void *o) {
+    ((binder *)ctx)->dropped++;
+    free(o);
+}
+
+static void drop_line(void *ctx, void *o) {
+    line *l = o;
+    ((binder *)ctx)->dropped += 3;
+    free(l->a);
+    free(l->b);
+    free(l);
+}
+
+/* The next document of p typed, or NULL and the error in err */
+static oylng_typed *typed_next(oylng_parser *p, const oylng_schema *app, char *err, size_t errlen) {
+    oylng_typed *y = NULL;
+    oylng_status st = oylng_parse_typed(p, app, &y);
+    snprintf(err, errlen, "%s", st == OYLNG_OK ? "" : oylng_parser_error(p));
+    return y;
+}
+
+static void bindings(void) {
+    char err[300];
+    binder b = { 0 };
+
+    /* section 12's first example: money bound, invoice not */
+    const char *s = "%YAML 2.0\n--- &\nmoney: !str(/[0-9]+[.][0-9]{2}/)\ninvoice:\n  total: !money\n"
+                    "--- !invoice\ntotal: 19.99\n";
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    CHECK(oylng_parser_bind(p, S("money"), bind_money, drop_obj, &b) == OYLNG_OK, "bound");
+    oylng_typed *y = typed_next(p, NULL, err, sizeof err);
+    oylng_value r = oylng_typed_root(y), total = oylng_value_get(y, r, S("total"));
+    int64_t *cents = oylng_value_object(y, total);
+    CHECK(y && cents && *cents == 1999 && !oylng_value_object(y, r) && b.calls == 1, "money is 1999 cents, the invoice nothing: %s", err);
+    CHECK(oylng_value_type(y, total) == OYLNG_T_STR && eq(oylng_value_text(y, total), "19.99", 5), "and still the string it was");
+    oylng_parser_free(p);
+    CHECK(b.dropped == 0, "the document outlives the parser");
+    oylng_typed_free(y);
+    CHECK(b.made == 1 && b.dropped == 1, "an object not taken is let go with the document");
+
+    /* the second: a union's alternatives bound, innermost first; *o twice
+       is two calls and two objects; a line takes its points */
+    const char *as = "%YAML 2.0\n--- &\npoint:\n  x: !int\n  y: !int\nsweep:\n  target: !int\nline: {a: !point, b: !point}\n"
+                     "shape: {!|: [!point, !sweep, !line]}\nq: {x: !int, y: !int}\n"
+                     "r: {shapes: [!shape, ...], same: [!q, ...]}\n";
+    oylng_schema *app = oylng_schema_new(as, strlen(as), S("r"), 0);
+    CHECK(oylng_schema_status(app) == OYLNG_OK, "the application's schema: %s", oylng_schema_error(app));
+    b = (binder){ 0 };
+    s = "%YAML 2.0\n--- &\no: {x: 1, y: 2}\n---\nshapes: [*o, {target: 3}, *o, {a: *o, b: {x: 5, y: 6}}]\nsame: [*o, *o]\n";
+    p = oylng_parser_new(s, strlen(s));
+    oylng_parser_bind(p, S("point"), bind_point, drop_obj, &b);
+    oylng_parser_bind(p, S("sweep"), bind_nothing, NULL, &b);
+    oylng_parser_bind(p, S("line"), bind_line, drop_line, &b);
+    y = typed_next(p, app, err, sizeof err);
+    r = oylng_typed_root(y);
+    oylng_value sh = oylng_value_get(y, r, S("shapes")), same = oylng_value_get(y, r, S("same"));
+    point *p0 = oylng_value_object(y, oylng_value_item(y, sh, 0)), *p2 = oylng_value_object(y, oylng_value_item(y, sh, 2));
+    line *l3 = oylng_value_object(y, oylng_value_item(y, sh, 3));
+    CHECK(y && !strcmp(b.order, "pnpppl") && b.made == 5, "the calls, in order: %s, %d made %s", b.order, b.made, err);
+    CHECK(p0 && p2 && p0 != p2 && p0->x == 1 && p2->y == 2 && oylng_value_item(y, sh, 0) != oylng_value_item(y, sh, 2),
+          "*o twice: two values, two objects");
+    CHECK(!oylng_value_object(y, oylng_value_item(y, sh, 1)) && l3 && l3->a->x == 1 && l3->b->y == 6 &&
+          !oylng_value_object(y, oylng_value_get(y, oylng_value_item(y, sh, 3), S("a"))), "a line, its points taken");
+    CHECK(oylng_value_item(y, same, 0) == oylng_value_item(y, same, 1) && !oylng_value_object(y, oylng_value_item(y, same, 0)),
+          "where nothing is bound, *o twice is still one value");
+    point *mine = oylng_value_take(y, oylng_value_item(y, sh, 0));
+    CHECK(mine == p0 && !oylng_value_object(y, oylng_value_item(y, sh, 0)) && !oylng_value_take(y, oylng_value_item(y, sh, 0)),
+          "taken, once");
+    oylng_typed_free(y);
+    CHECK(b.dropped == 4, "the rest let go: %d", b.dropped);
+    free(mine);
+
+    /* refused by a binding: the document, at the value; what was made let
+       go; a refusal of the schema's comes first, and calls nothing */
+    b = (binder){ 0 };
+    CHECK(!typed_next(p, app, err, sizeof err) && !*err, "the end");
+    oylng_parser_free(p);
+    s = "%YAML 2.0\n---\nshapes: [{x: 1, y: 1}, {target: 2}, {x: -1, y: 0}]\nsame: []\n";
+    p = oylng_parser_new(s, strlen(s));
+    oylng_parser_bind(p, S("point"), bind_point, drop_obj, &b);
+    CHECK(!typed_next(p, app, err, sizeof err) && !strcmp(err, "/shapes/2: x is negative") &&
+          oylng_parser_error_mark(p).line == 3 && oylng_parser_error_mark(p).col == 37,
+          "refused: %s at %zu:%zu", err, oylng_parser_error_mark(p).line, oylng_parser_error_mark(p).col);
+    CHECK(b.calls == 2 && b.made == 1 && b.dropped == 1, "what was made, let go: %d %d %d", b.calls, b.made, b.dropped);
+    oylng_parser_free(p);
+    b = (binder){ 0 };
+    s = "%YAML 2.0\n---\nshapes: [{x: 1, y: 1}, {x: a, y: 0}]\nsame: []\n";
+    p = oylng_parser_new(s, strlen(s));
+    oylng_parser_bind(p, S("point"), bind_point, drop_obj, &b);
+    CHECK(!typed_next(p, app, err, sizeof err) && strstr(err, "/shapes/1/x") && b.calls == 0, "the schema first: %s", err);
+    oylng_parser_free(p);
+    b = (binder){ 0 };
+    s = "%YAML 2.0\n---\nshapes: [{a: {x: 1, y: 1}, b: {x: 2, y: 2}}]\nsame: []\n";
+    p = oylng_parser_new(s, strlen(s));
+    oylng_parser_bind(p, S("line"), bind_line, drop_line, &b);
+    CHECK(!typed_next(p, app, err, sizeof err) && !strcmp(err, "/shapes/0: a line needs two points") && b.calls == 1,
+          "a line with its points unbound: %s", err);
+    oylng_parser_free(p);
+
+    /* a root bound, by the stream's own table; bound again, and unbound */
+    binder b2 = { 0 };
+    b = (binder){ 0 };
+    s = "%YAML 2.0\n--- &\npoint: {x: !int, y: !int}\n--- !point\nx: 7\ny: 8\n--- !point\nx: 9\ny: 9\n--- !point\nx: 1\ny: 1\n";
+    p = oylng_parser_new(s, strlen(s));
+    oylng_parser_bind(p, S("point"), bind_point, drop_obj, &b);
+    y = typed_next(p, NULL, err, sizeof err);
+    point *root = oylng_value_take(y, oylng_typed_root(y));
+    CHECK(root && root->x == 7 && root->y == 8, "the root's object, by the stamp: %s", err);
+    free(root);
+    oylng_typed_free(y);
+    oylng_parser_bind(p, S("point"), bind_point, drop_obj, &b2);
+    y = typed_next(p, NULL, err, sizeof err);
+    CHECK(b.calls == 1 && b2.calls == 1 && oylng_value_object(y, oylng_typed_root(y)), "bound again, replaced");
+    oylng_typed_free(y);
+    CHECK(oylng_parser_bind(p, S("point"), NULL, NULL, NULL) == OYLNG_OK && oylng_parser_bind(p, S("nope"), NULL, NULL, NULL) == OYLNG_OK,
+          "unbound");
+    y = typed_next(p, NULL, err, sizeof err);
+    CHECK(y && b2.calls == 1 && !oylng_value_object(y, oylng_typed_root(y)), "and nothing called");
+    oylng_typed_free(y);
+    CHECK(b.dropped == b.made - 1 && b2.dropped == b2.made, "all let go: %d/%d %d/%d", b.dropped, b.made, b2.dropped, b2.made);
+    oylng_parser_free(p);
+
+    /* a chain of references: 1024 places, 1024 calls, 1024 objects */
+    b = (binder){ 0 };
+    char big[2048];
+    size_t o = (size_t)snprintf(big, sizeof big, "%%YAML 2.0\n--- &\np: {x: 1, y: 1}\nl0: [*p, *p]\nn0: !point\n"
+                                "point: {x: !int, y: !int}\n");
+    for (int i = 1; i < 10; i++)
+        o += (size_t)snprintf(big + o, sizeof big - o, "l%d: [*l%d, *l%d]\nn%d: [!n%d, ...]\n", i, i - 1, i - 1, i, i - 1);
+    snprintf(big + o, sizeof big - o, "n10: [!n9, ...]\n--- !n10\n*l9\n");
+    p = oylng_parser_new(big, strlen(big));
+    oylng_parser_bind(p, S("point"), bind_point, drop_obj, &b);
+    y = typed_next(p, NULL, err, sizeof err);
+    oylng_value first = oylng_typed_root(y), last = first;
+    for (int i = 0; i < 10; i++) {
+        first = oylng_value_item(y, first, 0);
+        last = oylng_value_item(y, last, 1);
+    }
+    point *pf = oylng_value_object(y, first), *pl = oylng_value_object(y, last);
+    CHECK(y && b.calls == 1024 && b.made == 1024 && pf && pl && pf->id == 1 && pl->id == 1024, "1024 points: %d calls %s",
+          b.calls, err);
+    oylng_typed_free(y);
+    CHECK(b.dropped == 1024, "and let go: %d", b.dropped);
+    oylng_parser_free(p);
+
+    /* the one bound value below the second [*o] was seen below the first */
+    b = (binder){ 0 };
+    s = "%YAML 2.0\n--- &\no: {x: 1, y: 2}\npoint: {x: !int, y: !int}\nr: [[!point, ...], ...]\n--- !r\n- [*o]\n- [*o]\n";
+    p = oylng_parser_new(s, strlen(s));
+    oylng_parser_bind(p, S("point"), bind_point, drop_obj, &b);
+    y = typed_next(p, NULL, err, sizeof err);
+    r = oylng_typed_root(y);
+    pf = oylng_value_object(y, oylng_value_item(y, oylng_value_item(y, r, 0), 0));
+    pl = oylng_value_object(y, oylng_value_item(y, oylng_value_item(y, r, 1), 0));
+    CHECK(y && b.calls == 2 && pf && pl && pf != pl, "found through a value seen before: %d calls %s", b.calls, err);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+
+    CHECK(oylng_parser_bind(NULL, S("x"), bind_point, NULL, NULL) == OYLNG_ERR_INPUT &&
+          !oylng_value_object(NULL, 0) && !oylng_value_take(NULL, 0), "NULLs");
+    oylng_schema_free(app);
+}
+
 static void api(void) {
     oylng_parser *p;
     const char *err;
@@ -963,6 +1192,7 @@ static void api(void) {
 
     published_names();
     ignored_stamps();
+    bindings();
 }
 
 int main(int argc, char **argv) {

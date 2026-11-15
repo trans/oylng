@@ -155,6 +155,31 @@ tree: YAML like any other, which it can look at, keep or write out. A
 tree of the table shares its nodes as a document's tree does, so it is as
 large as the table is written.
 
+An application binds its own code to a named type (section 12), and that
+code turns each value of the type into one of the application's objects,
+or refuses the document. Only a bound name makes anything, so a file can
+never choose what code runs. The code runs once the document is typed, so
+never on trial, innermost first, and once for each place a value is used:
+`*p` named twice makes two objects. The document holds the objects until
+the application takes them, and lets go the rest when it is freed.
+
+```c
+static const char *make_point(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
+    struct point *pt = malloc(sizeof *pt);
+    if (!pt || !oylng_value_int(t, oylng_value_get(t, v, (oylng_str){ "x", 1 }), &pt->x) ||
+        !oylng_value_int(t, oylng_value_get(t, v, (oylng_str){ "y", 1 }), &pt->y)) {
+        free(pt);
+        return "a point needs x and y";   /* refuses the document, at the value */
+    }
+    *obj = pt;
+    return NULL;
+}
+static void drop(void *ctx, void *obj) { free(obj); }
+
+oylng_parser_bind(p, (oylng_str){ "point", 5 }, make_point, drop, ctx);
+/* then for each !point value: oylng_value_object(t, v), or oylng_value_take(t, v) */
+```
+
 `oylng --typed` types a stream and writes each document as JSON, each
 value with its type:
 
