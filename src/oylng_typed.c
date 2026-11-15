@@ -937,6 +937,10 @@ static oylng_status at_start(void *ctx, oylng_str name) {
     oylng_parser *P = c->P;
     void *lctx;
     oylng_str addr, hex, root;
+    /* stamps ignored (section 3): a stamp types nothing, as one naming
+       nothing doesn't, and nothing is looked up or compiled for it, so
+       the application's schema types the document, if there is one */
+    if (!oylng__parser_stamps(P)) name.data = NULL;
     if (name.data && oylng__parser_lookup(P, &lctx) && published_name(name, &addr, &hex, &root)) {
         const oylng_schema *sc = published(P, name, addr, hex, root);
         if (!sc) return oylng__parser_fail(P, OYLNG_ERR_SCHEMA, "");   /* failed already: this gives its status */

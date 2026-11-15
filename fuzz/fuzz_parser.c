@@ -10,11 +10,15 @@
  * without error is written again by the emitter, which must accept it, and
  * what it writes must read back as the same events. Read as trees, the
  * stream must give the same events, or the same error, each key's value
- * must be found, and the trees must be written as the events were. Typed
+ * must be found, and the trees must be written as the events were. After
+ * each tree, the table's tree must find each entry's value by its key, and
+ * after an error, give the error. Typed with stamps ignored and no
+ * application's schema, the stream must read as the trees did. Typed
  * (part 2), by its stamps, and by the stream's own table as an application's
  * schema rooted at `a` when it compiles as one, the stream must be refused
  * where the events were, or for a schema; each typed value must be what its
- * type says, each key's value found. The flow bit also turns on the cut.
+ * type says, each key's value found; every third document's stamp is
+ * ignored, and it must not be typed by it. The flow bit also turns on the cut.
  * Where the stream holds a NUL, what comes before it is also a published
  * file (section 3.1), and what comes after a stream typed with a lookup
  * that gives it, once each #sha256= and the 64 hex digits after it are set
@@ -72,6 +76,25 @@ static uint64_t tree_hash(uint64_t h, const oylng_tree *t, oylng_node n) {
     }
     if (oylng_node_item(t, n, c) != OYLNG_NO_NODE || oylng_node_key(t, n, c) != OYLNG_NO_NODE) abort();
     return tv_hash(h, map ? OYLNG_EVT_MAP_END : OYLNG_EVT_SEQ_END, none);
+}
+
+/* The table's tree: each entry's value found by its key; after an error,
+ * the error */
+static void check_table(oylng_parser *p, oylng_status st) {
+    oylng_tree *t = (oylng_tree *)1;
+    oylng_status ts = oylng_parser_table(p, &t);
+    if (ts == OYLNG_ERR_MEMORY) return;
+    if (st != OYLNG_OK) {
+        if (ts != st || t) abort();
+        return;
+    }
+    if (ts != OYLNG_OK) abort();
+    if (!t) return;
+    oylng_node r = oylng_tree_root(t);
+    if (oylng_node_kind(t, r) != OYLNG_NODE_MAPPING || !oylng_node_count(t, r)) abort();
+    for (size_t i = 0; i < oylng_node_count(t, r); i++)
+        if (oylng_node_get(t, r, oylng_node_text(t, oylng_node_key(t, r, i))) != oylng_node_value(t, r, i)) abort();
+    oylng_tree_free(t);
 }
 
 /* Each typed value is what its type says. A typed document shares a value
@@ -267,7 +290,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             oylng_status est = oylng_emit_tree(te, t);
             if (est != OYLNG_OK && est != OYLNG_ERR_MEMORY) abort();
             oylng_tree_free(t);
+            check_table(tp, OYLNG_OK);
         }
+        check_table(tp, st);
         if (st == OYLNG_ERR_MEMORY || pst == OYLNG_ERR_MEMORY) {
             /* one of them ran out where the other didn't */
         } else if (clean) {
@@ -287,6 +312,34 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     oylng_emitter_free(te);
     oylng_parser_free(tp);
 
+    /* typed with stamps ignored and no schema of the application's: as the
+       trees, or the same error */
+    oylng_parser *np = parser_for(in, size, opt);
+    if (np) {
+        oylng_parser_set_stamps(np, false);
+        uint64_t h5 = 0xCBF29CE484222325u;
+        oylng_typed *y;
+        oylng_status st;
+        while ((st = oylng_parse_typed(np, NULL, &y)) == OYLNG_OK && y) {
+            if (oylng_typed_how(y) != OYLNG_TYPED_NOT) abort();
+            const oylng_tree *t = oylng_typed_tree(y);
+            h5 = tv_hash(h5, OYLNG_EVT_DOC_START, oylng_tree_name(t));
+            h5 = tree_hash(h5, t, oylng_tree_root(t));
+            h5 = tv_hash(h5, OYLNG_EVT_DOC_END, (oylng_str){ NULL, 0 });
+            oylng_typed_free(y);
+        }
+        if (st == OYLNG_ERR_MEMORY || pst == OYLNG_ERR_MEMORY) {
+        } else if (clean) {
+            if (st != OYLNG_OK || h5 != h3) abort();
+        } else {
+            const char *x = oylng_parser_error(p), *z = oylng_parser_error(np);
+            if (st == OYLNG_OK || !x || !z || strcmp(x, z) != 0 ||
+                oylng_parser_error_mark(p).offset != oylng_parser_error_mark(np).offset)
+                abort();
+        }
+        oylng_parser_free(np);
+    }
+
     /* typed: refused where the events were, or for a schema */
     static const uint64_t limits[8] = { 0, 4, 16, 64, 256, 4096, 1 << 16, 0 };
     oylng_schema *app = oylng_schema_new(in, size, (oylng_str){ "a", 1 }, limits[opt & 7]);
@@ -301,10 +354,14 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         oylng_typed *y;
         oylng_status st;
         size_t budget = 1 << 16;
-        while ((st = oylng_parse_typed(yp, app, &y)) == OYLNG_OK && y) {
+        unsigned ndoc = 0;
+        bool off = false;
+        while ((oylng_parser_set_stamps(yp, !(off = ndoc++ % 3 == 2)),
+                st = oylng_parse_typed(yp, app, &y)) == OYLNG_OK && y) {
             oylng_typed_by how = oylng_typed_how(y);
             oylng_value root = oylng_typed_root(y);
             if (root == OYLNG_NO_VALUE) abort();
+            if (off && (how == OYLNG_TYPED_STAMP || how == OYLNG_TYPED_PUBLISHED)) abort();
             if (how == OYLNG_TYPED_NOT && oylng_value_type(y, root) != OYLNG_T_ANY) abort();
             if (how == OYLNG_TYPED_APP && !app) abort();
             check_value(y, root, &budget);

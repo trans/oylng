@@ -339,6 +339,49 @@ oylng_status oylng__tree_read(oylng_parser *P, oylng_tree **out,
     return OYLNG_OK;
 }
 
+oylng_status oylng_parser_table(oylng_parser *P, oylng_tree **out) {
+    if (!out) return OYLNG_ERR_INPUT;
+    *out = NULL;
+    if (!P) return OYLNG_ERR_INPUT;
+    oylng_status st = oylng__parser_status(P);
+    if (st != OYLNG_OK) return st;
+    uint32_t n = oylng__table_count(P);
+    if (!n) return OYLNG_OK;
+    const char *in;
+    size_t len;
+    oylng__parser_input(P, &in, &len);
+    if (len >= UINT32_MAX) return OYLNG_ERR_LIMIT;
+    builder B = { .P = P, .st = OYLNG_OK };
+    B.T = calloc(1, sizeof *B.T);
+    if (!B.T) return OYLNG_ERR_MEMORY;
+    B.T->in = in;
+    B.T->inlen = len;
+    /* a mapping of the entries, where the first one's key is */
+    uint32_t k, v;
+    oylng__tnode kn;
+    oylng__table_entry_nodes(P, 0, &k, &v);
+    oylng__table_node(P, k, &kn);
+    oylng_node root = new_node(&B, OYLNG_NODE_MAPPING, kn.pos);
+    B.T->root = root;
+    for (uint32_t e = 0; e < n && B.st == OYLNG_OK; e++) {
+        oylng__table_entry_nodes(P, e, &k, &v);
+        oylng_node kid = from_table(&B, k);
+        if (kid != OYLNG_NO_NODE) push_child(&B, kid);
+        oylng_node vid = B.st == OYLNG_OK ? from_table(&B, v) : OYLNG_NO_NODE;
+        if (vid != OYLNG_NO_NODE) push_child(&B, vid);
+    }
+    if (B.st == OYLNG_OK) close_coll(&B, root, 0);
+    free(B.stk);
+    free(B.open);
+    free(B.todo);
+    if (B.st != OYLNG_OK) {
+        oylng_tree_free(B.T);
+        return B.st;   /* the parser's own state is untouched */
+    }
+    *out = B.T;
+    return OYLNG_OK;
+}
+
 oylng_node oylng_tree_root(const oylng_tree *T) { return T ? T->root : OYLNG_NO_NODE; }
 
 oylng_str oylng_tree_name(const oylng_tree *T) {

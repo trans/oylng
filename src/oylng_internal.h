@@ -219,6 +219,12 @@ void         oylng__entry_reach(oylng_parser *p, uint32_t e);
  * entry e's name */
 uint32_t     oylng__table_count(const oylng_parser *p);
 void         oylng__table_entry_at(const oylng_parser *p, uint32_t e, const char **k, size_t *kl);
+/* Entry e's key node, and its value's, references followed */
+void         oylng__table_entry_nodes(const oylng_parser *p, uint32_t e, uint32_t *key, uint32_t *val);
+/* OYLNG_OK, or the error the parser has stopped with */
+oylng_status oylng__parser_status(const oylng_parser *p);
+/* Whether a stamp types its document: oylng_parser_set_stamps */
+bool         oylng__parser_stamps(const oylng_parser *p);
 uint64_t     oylng__parser_limit(const oylng_parser *p);
 /* The limit for part 2's counts, a schema's full size and typed: the
  * parser's limit, unless a test sets one for them alone (0 to unset) */

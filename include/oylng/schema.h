@@ -59,6 +59,17 @@ OYLNG_API void oylng_schema_free(oylng_schema *s);
  *  unless set. */
 OYLNG_API void oylng_parser_set_cut(oylng_parser *p, bool cut);
 
+/** Whether a stamp types its document; on unless set off (section 3: an
+ *  application may ignore a file's schema). Off, a stamp types nothing, as
+ *  one naming nothing doesn't: nothing is looked up or compiled for it, so
+ *  a schema in error refuses nothing, and the document is typed as one
+ *  with no stamp, by the application's schema, or with none, not at all,
+ *  read as it is. So an application checking files it didn't write can
+ *  hold each to its own schema, whatever the file says. It can be changed
+ *  between documents. For a stamp in the stream's table, oylng_parser_table
+ *  gives the schema ignored. */
+OYLNG_API void oylng_parser_set_stamps(oylng_parser *p, bool on);
+
 /** An application's lookup of published names (section 3.1). Given a
  *  name's address, the name before its #, to which https:// leads, and its
  *  SHA-256 in 64 lowercase hex digits: true, with *file set to the bytes

@@ -254,6 +254,20 @@ typedef enum {
  *  what was wrong. An input of 4 GiB or more is OYLNG_ERR_LIMIT. */
 OYLNG_API oylng_status oylng_parse_tree(oylng_parser *p, oylng_tree **tree);
 
+/** The stream's table as a tree, which the events and the trees of
+ *  documents never deliver: its node a mapping of the entries, in the order
+ *  they were first defined, each with its latest value, references and
+ *  merges applied, and a node named twice shared, as in a document's tree.
+ *  It is the table of the document being read or last read, since a table
+ *  is read with the document after it; after the stream's end, the last
+ *  one. With a document's name, it is the document's schema (part 2,
+ *  section 3), which is YAML too. On OYLNG_OK, *tree is the table, to be
+ *  freed with oylng_tree_free, or NULL if it has no entries. It can be
+ *  called at any time, and changes nothing in the parser: an error stopping
+ *  the parser is given back, and running out of memory is OYLNG_ERR_MEMORY,
+ *  with the parser as it was. */
+OYLNG_API oylng_status oylng_parser_table(oylng_parser *p, oylng_tree **tree);
+
 OYLNG_API void oylng_tree_free(oylng_tree *t);
 
 /** The document's node. */

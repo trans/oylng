@@ -35,7 +35,23 @@
   type; with `--every-entry`, a stream with a table and no document is
   checked as a schema file, every entry as a root; with `--store DIR`, a
   published name is looked up in DIR, by its hash.
-- Tested: 122 API checks and the draft's 70 examples (`make test`); part 2's
+- **An application may ignore a file's schema, or be handed it** (part 2,
+  section 3). With `oylng_parser_set_stamps(p, false)` a stamp types
+  nothing, and nothing is looked up or compiled for it, so a schema in
+  error refuses nothing: a document is typed as one with no stamp, by the
+  application's schema, or without one, read as it is. So an application
+  checking files it didn't write holds each to its own schema, as section
+  15's open point on ways past a stamp asks. It can change between
+  documents. `oylng_parser_table`
+  gives the stream's table as a tree, a mapping of the entries in the order
+  first defined, each with its latest value and its nodes shared, so a
+  stamp's schema can be looked at or kept; it can be called at any time
+  and changes nothing in the parser. `oylng --typed --no-stamps`. 21 new
+  API checks of the table (144 in all) and 17 of stamps ignored; the
+  fuzzer checks the table after each tree, types each stream with its
+  stamps ignored, which must read as its trees do, and ignores every third
+  document's stamp when typing.
+- Tested: 139 API checks and the draft's 70 examples (`make test`); part 2's
   suite (yaml2 `0b88244`), 793 of its 842 tests passed and none failed, 23
   of them with a store of published files, the rest skipped for times held
   otherwise (25) and `keep` (24) (`make test-yes`); all 859 of the streams

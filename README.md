@@ -144,6 +144,17 @@ static bool lookup(void *ctx, oylng_str address, oylng_str sha256, oylng_str *fi
 oylng_parser_set_lookup(p, lookup, ctx);
 ```
 
+An application may also ignore a file's schema (section 3). With
+`oylng_parser_set_stamps(p, false)`, a stamp types nothing, and nothing is
+looked up or compiled for it: each document is typed as one with no stamp
+is, by the application's schema, or without one, read as it is. So an
+application checking files it didn't write can hold every file to its own
+schema, whatever schema the file gives itself. And `oylng_parser_table`
+hands the application the stream's table, the schema a stamp names, as a
+tree: YAML like any other, which it can look at, keep or write out. A
+tree of the table shares its nodes as a document's tree does, so it is as
+large as the table is written.
+
 `oylng --typed` types a stream and writes each document as JSON, each
 value with its type:
 
@@ -151,6 +162,7 @@ value with its type:
 build/oylng --typed file.yaml                      # by its stamps
 build/oylng --typed --schema app.yaml svc file.yaml
 build/oylng --typed --store schemas/ file.yaml     # published names: schemas/SHA256
+build/oylng --typed --no-stamps --schema app.yaml svc file.yaml   # app.yaml's svc, whatever the stamps
 build/oylng --typed --every-entry app.yaml         # a schema file: every entry checked
 ```
 

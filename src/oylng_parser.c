@@ -240,10 +240,12 @@ struct oylng_parser {
     uint32_t  captmemo, tgen;
 
     /* for the typed reader (oylng_typed.c): the table's schemas, let go
-       when the table is, and whether a time may be cut */
+       when the table is, whether a time may be cut, and whether stamps
+       are ignored (part 2, section 3) */
     void     *sctx;
     void    (*sctx_free)(void *);
     bool      cut;
+    bool      no_stamps;
 
     /* for the typed reader: the application's lookup of published names
        (part 2, section 3.1), and the files it gave, compiled, which last
@@ -2638,6 +2640,13 @@ void oylng__table_entry_at(const oylng_parser *P, uint32_t e, const char **k, si
     *kl = kn->len;
 }
 
+void oylng__table_entry_nodes(const oylng_parser *P, uint32_t e, uint32_t *key, uint32_t *val) {
+    *key = P->entries[e].key;
+    *val = deref(P, P->entries[e].val);
+}
+
+oylng_status oylng__parser_status(const oylng_parser *P) { return P->state == ST_ERROR ? P->status : OYLNG_OK; }
+
 uint64_t oylng__parser_limit(const oylng_parser *P) { return P->limit; }
 
 uint64_t oylng__parser_counts_limit(const oylng_parser *P) { return P->counts_limit ? P->counts_limit : P->limit; }
@@ -2649,6 +2658,12 @@ bool oylng__parser_cut(const oylng_parser *P) { return P->cut; }
 void oylng_parser_set_cut(oylng_parser *P, bool cut) {
     if (P) P->cut = cut;
 }
+
+void oylng_parser_set_stamps(oylng_parser *P, bool on) {
+    if (P) P->no_stamps = !on;
+}
+
+bool oylng__parser_stamps(const oylng_parser *P) { return !P->no_stamps; }
 
 void oylng_parser_set_lookup(oylng_parser *P, oylng__lookup fn, void *ctx) {
     if (!P) return;

@@ -543,6 +543,128 @@ static void test_tree(void) {
     oylng_tree_free(NULL);
 }
 
+/* The table of the stream at its point p has reached, as a tree: NULL and
+ * a note if it isn't OYLNG_OK */
+static oylng_tree *table_of(oylng_parser *p) {
+    oylng_tree *t = (oylng_tree *)1;
+    oylng_status st = oylng_parser_table(p, &t);
+    if (st != OYLNG_OK) printf("  (table: %d, %s)\n", (int)st, oylng_parser_error(p));
+    return st == OYLNG_OK ? t : NULL;
+}
+
+/* Whether table t's entries are the keys keys, in order, separated by spaces */
+static bool keys_are(const oylng_tree *t, const char *keys) {
+    char b[200] = "";
+    size_t o = 0;
+    oylng_node r = oylng_tree_root(t);
+    for (size_t i = 0; i < oylng_node_count(t, r); i++)
+        o += (size_t)snprintf(b + o, sizeof b - o, "%s%s", i ? " " : "", txt(t, oylng_node_key(t, r, i)));
+    if (strcmp(b, keys)) printf("  (keys: %s)\n", b);
+    return t && oylng_node_kind(t, r) == OYLNG_NODE_MAPPING && !strcmp(b, keys);
+}
+
+static void test_table(void) {
+    /* the table, its entries in order, a node named twice shared; read
+     * with the document after it, and the same once that has ended */
+    const char *s = "%YAML 2.0\n--- &\na: [x, yy]\nm: {k: v}\nb: *a\nbase: {p: 1}\nmm: {<<: *base, q: 2}\n"
+                    "---\nd: *m\n";
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    oylng_tree *t = table_of(p);
+    CHECK(!t, "no table before the stream is read");
+    const oylng_event *e;
+    CHECK(oylng_parse_next(p, &e) == OYLNG_OK && e->type == OYLNG_EVT_STREAM_START && !table_of(p),
+          "nor at its start: a table is read with the document after it");
+    CHECK(oylng_parse_next(p, &e) == OYLNG_OK && e->type == OYLNG_EVT_DOC_START, "the document");
+    t = table_of(p);
+    CHECK(keys_are(t, "a m b base mm"), "inside it, its table");
+    oylng_node r = oylng_tree_root(t), a = at(t, r, "a"), mm = at(t, r, "mm");
+    CHECK(oylng_node_count(t, a) == 2 && !strcmp(txt(t, oylng_node_item(t, a, 1)), "yy") && at(t, r, "b") == a,
+          "a, and b the same node");
+    CHECK(oylng_node_count(t, mm) == 2 && at(t, mm, "p") == at(t, at(t, r, "base"), "p") &&
+          !strcmp(txt(t, at(t, mm, "q")), "2"), "a merge applied, its value shared");
+    CHECK(oylng_tree_nodes(t) == 18, "18 nodes, as written: %zu", oylng_tree_nodes(t));
+    oylng_mark mk = oylng_node_mark(t, r);
+    CHECK(mk.line == 3 && mk.col == 1 && !oylng_tree_name(t).data, "where the first entry is, and no name: %zu:%zu",
+          mk.line, mk.col);
+    oylng_tree_free(t);
+    while (oylng_parse_next(p, &e) == OYLNG_OK && e->type != OYLNG_EVT_DOC_END) {}
+    t = table_of(p);
+    CHECK(keys_are(t, "a m b base mm"), "after the document's end");
+    oylng_tree_free(t);
+    CHECK(oylng_parse_next(p, &e) == OYLNG_OK && e->type == OYLNG_EVT_STREAM_END, "the stream's end");
+    t = table_of(p);
+    CHECK(keys_are(t, "a m b base mm"), "and after it");
+    oylng_tree_free(t);
+    oylng_parser_free(p);
+
+    /* a second --- & adds entries and replaces them, each in its place;
+     * ... takes the table away; a stream of tables alone has one too */
+    s = "%YAML 2.0\n--- &\na: 1\nb: 2\n---\nx\n--- &\na: 3\nc: 4\n---\ny\n...\n---\nz\n...\n--- &\nq: '!str'\nr: !str\n";
+    p = oylng_parser_new(s, strlen(s));
+    const char *want[] = { "a b", "a b c", "" };
+    int good = 0, docs = 0;
+    while (oylng_parse_tree(p, &t) == OYLNG_OK && t) {
+        oylng_tree_free(t);
+        t = table_of(p);
+        good += docs < 3 && (*want[docs] ? keys_are(t, want[docs]) : !t);
+        if (docs == 1) good += !strcmp(txt(t, at(t, oylng_tree_root(t), "a")), "3");
+        oylng_tree_free(t);
+        docs++;
+    }
+    CHECK(docs == 3 && good == 4 && !oylng_parser_error(p), "tables in turn: %d of 4", good);
+    t = table_of(p);
+    r = oylng_tree_root(t);
+    CHECK(keys_are(t, "q r") && !oylng_node_plain(t, at(t, r, "q")) && oylng_node_plain(t, at(t, r, "r")) &&
+          !strcmp(txt(t, at(t, r, "q")), "!str"), "the last table, and how its scalars were written");
+    oylng_tree_free(t);
+    oylng_parser_free(p);
+
+    /* many entries, found by the index; texts that outlive the parser;
+     * a chain of references as large as written */
+    char big[4096];
+    size_t o = (size_t)snprintf(big, sizeof big, "%%YAML 2.0\n--- &\n");
+    for (int i = 0; i < 20; i++) o += (size_t)snprintf(big + o, sizeof big - o, "e%d: \"\\u00e9%d\"\n", i, i);
+    o += (size_t)snprintf(big + o, sizeof big - o, "l0: [x, x, x, x, x, x, x, x, x, x]\n");
+    for (int i = 1; i < 7; i++)
+        o += (size_t)snprintf(big + o, sizeof big - o, "l%d: [*l%d, *l%d, *l%d, *l%d, *l%d, *l%d, *l%d, *l%d, *l%d, *l%d]\n",
+                              i, i - 1, i - 1, i - 1, i - 1, i - 1, i - 1, i - 1, i - 1, i - 1, i - 1);
+    snprintf(big + o, sizeof big - o, "---\n*l6\n");
+    p = oylng_parser_new(big, strlen(big));
+    oylng_parser_set_limit(p, UINT64_MAX);
+    CHECK(oylng_parse_tree(p, &t) == OYLNG_OK && t, "the document");
+    oylng_tree_free(t);
+    t = table_of(p);
+    oylng_parser_free(p);
+    r = oylng_tree_root(t);
+    CHECK(t && oylng_node_count(t, r) == 27 && !strcmp(txt(t, at(t, r, "e17")), "\xc3\xa9" "17") &&
+          at(t, r, "e20") == OYLNG_NO_NODE, "20 strings found by the index, the parser gone");
+    CHECK(oylng_tree_nodes(t) == 1 + 27 + 20 + 11 + 6, "the table as written: %zu nodes", oylng_tree_nodes(t));
+    oylng_tree_free(t);
+
+    /* an error is given back; nothing else changes the parser */
+    s = "%YAML 2.0\n--- &\na: 1\na: 2\n---\nx\n";
+    p = oylng_parser_new(s, strlen(s));
+    CHECK(oylng_parse_tree(p, &t) == OYLNG_ERR_PARSE && !t, "a key twice in the table");
+    t = (oylng_tree *)1;
+    CHECK(oylng_parser_table(p, &t) == OYLNG_ERR_PARSE && !t, "the parser's error, and no table");
+    oylng_parser_free(p);
+    s = "%YAML 2.0\n--- &\na: 1\n---\n*a\n---\n[*a]\n";
+    p = oylng_parser_new(s, strlen(s));
+    CHECK(oylng_parse_next(p, &e) == OYLNG_OK && oylng_parse_next(p, &e) == OYLNG_OK && oylng_parse_next(p, &e) == OYLNG_OK &&
+          e->type == OYLNG_EVT_SCALAR, "into the first document");
+    t = table_of(p);
+    oylng_tree_free(t);
+    t = table_of(p);
+    oylng_tree_free(t);
+    int n = 0;
+    while (oylng_parse_next(p, &e) == OYLNG_OK && e->type != OYLNG_EVT_STREAM_END) n++;
+    CHECK(n == 6 && !oylng_parser_error(p), "the rest of the stream, as it would be: %d events", n);
+    oylng_parser_free(p);
+    CHECK(oylng_parser_table(NULL, &t) == OYLNG_ERR_INPUT && !t && oylng_parser_table(p = oylng_parser_new("", 0), NULL) == OYLNG_ERR_INPUT,
+          "NULLs");
+    oylng_parser_free(p);
+}
+
 int main(void) {
     test_error_marks();
     test_stop();
@@ -553,6 +675,7 @@ int main(void) {
     test_stream();
     test_fast();
     test_tree();
+    test_table();
     printf("api: %d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }

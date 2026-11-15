@@ -518,6 +518,117 @@ static void published_names(void) {
     free(sh.copy);
 }
 
+/* Each document of stream s typed with stamps as stamp gives, one letter a
+ * document ('0' off, else on, the last letter for the rest), and with
+ * lookup sh: how each was typed, a letter each (N, S, A, P), and its root's
+ * type, a letter each (a any, m mapping, s string, i int), in hows, then
+ * the error, if any */
+static oylng_status stamps_run(const char *s, const char *stamp, shelf *sh, const oylng_schema *app,
+                               char *hows, char *err, size_t errlen) {
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    if (sh) oylng_parser_set_lookup(p, shelf_lookup, sh);
+    size_t o = 0, d = 0, last = strlen(stamp) - 1;
+    oylng_status st;
+    for (;; d++) {
+        oylng_parser_set_stamps(p, stamp[d < last ? d : last] != '0');
+        oylng_typed *y;
+        st = oylng_parse_typed(p, app, &y);
+        if (st != OYLNG_OK || !y) break;
+        oylng_typed_by how = oylng_typed_how(y);
+        oylng_type ty = oylng_value_type(y, oylng_typed_root(y));
+        hows[o++] = "NSAP"[how];
+        hows[o++] = ty == OYLNG_T_ANY ? 'a' : ty == OYLNG_T_MAPPING ? 'm' : ty == OYLNG_T_STR ? 's' : ty == OYLNG_T_INT ? 'i' : '?';
+        oylng_typed_free(y);
+    }
+    hows[o] = 0;
+    snprintf(err, errlen, "%s", st == OYLNG_OK ? "" : oylng_parser_error(p));
+    oylng_parser_free(p);
+    return st;
+}
+
+/* Section 3: an application may ignore a file's schema, and so hold a file
+ * it didn't write to its own */
+static void ignored_stamps(void) {
+    char hows[64], err[300];
+    const char *as = "%YAML 2.0\n--- &\nr: {n?: !str, s?: !str}\n";
+    oylng_schema *app = oylng_schema_new(as, strlen(as), S("r"), 0);
+    CHECK(oylng_schema_status(app) == OYLNG_OK, "the application's schema");
+
+    /* ignored: a stamp in the table, one that doesn't fit it, one whose
+       schema is in error, and one naming nothing; each document is typed
+       as one with no stamp is, by the application's schema, or with none,
+       not at all */
+    const char *s = "%YAML 2.0\n--- &\njob: {n: !int}\nbad: !stirng\n"
+                    "--- !job\nn: 3\n--- !job\nn: x\n--- !bad\nn: y\n---\ns: 4\n--- !nope\ns: 5\n";
+    oylng_status st = stamps_run(s, "0", NULL, app, hows, err, sizeof err);
+    CHECK(st == OYLNG_OK && !strcmp(hows, "AmAmAmAmAm"), "off: %s %s", hows, err);
+    st = stamps_run(s, "0", NULL, NULL, hows, err, sizeof err);
+    CHECK(st == OYLNG_OK && !strcmp(hows, "NaNaNaNaNa"), "off, no schema of the application's: %s %s", hows, err);
+    st = stamps_run(s, "1", NULL, app, hows, err, sizeof err);
+    CHECK(st == OYLNG_ERR_SCHEMA && !strcmp(hows, "Sm") && strstr(err, "/n"), "on: %s %s", hows, err);
+    st = stamps_run("%YAML 2.0\n--- &\nbad: !stirng\n--- !bad\nx\n", "1", NULL, NULL, hows, err, sizeof err);
+    CHECK(st == OYLNG_ERR_SCHEMA && !*hows, "a schema in error, on: %s", err);
+
+    /* a file's own loose schema doesn't get it past the application's */
+    const char *loose = "%YAML 2.0\n--- &\nloose: !any\n--- !loose\nextra: 2\n";
+    st = stamps_run(loose, "1", NULL, app, hows, err, sizeof err);
+    CHECK(st == OYLNG_OK && !strcmp(hows, "Sa"), "on, the file's: %s %s", hows, err);
+    st = stamps_run(loose, "0", NULL, app, hows, err, sizeof err);
+    CHECK(st == OYLNG_ERR_SCHEMA && !*hows && strstr(err, "extra"), "off, the application's: %s", err);
+
+    /* typed by the application's schema, not the stamp's; and the
+       stamp's schema, handed over */
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    oylng_parser_set_stamps(p, false);
+    oylng_typed *y;
+    CHECK(oylng_parse_typed(p, app, &y) == OYLNG_OK && y, "the first document");
+    const oylng_tree *t = oylng_typed_tree(y);
+    oylng_value n = oylng_value_get(y, oylng_typed_root(y), S("n"));
+    CHECK(eq(oylng_tree_name(t), "job", 3) && oylng_value_type(y, n) == OYLNG_T_STR &&
+          eq(oylng_value_text(y, n), "3", 1) && oylng_typed_how(y) == OYLNG_TYPED_APP,
+          "n is the application's !str, and the name is still there");
+    oylng_tree *tb = (oylng_tree *)1;
+    CHECK(oylng_parser_table(p, &tb) == OYLNG_OK && tb, "the table");
+    oylng_node job = oylng_node_get(tb, oylng_tree_root(tb), oylng_tree_name(t));
+    oylng_node ty = oylng_node_get(tb, job, S("n"));
+    CHECK(oylng_node_kind(tb, job) == OYLNG_NODE_MAPPING && eq(oylng_node_text(tb, ty), "!int", 4) && oylng_node_plain(tb, ty),
+          "the schema the stamp names: {n: !int}");
+    oylng_tree_free(tb);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+
+    /* changed between documents: off, on, off */
+    s = "%YAML 2.0\n--- &\njob: {n: !int}\n--- !job\nn: 3\n--- !job\nn: 4\n--- !job\nn: 5\n";
+    st = stamps_run(s, "010", NULL, app, hows, err, sizeof err);
+    CHECK(st == OYLNG_OK && !strcmp(hows, "AmSmAm"), "off, on, off: %s %s", hows, err);
+
+    /* an entry a stamp named can be replaced, if the stamp was ignored */
+    s = "%YAML 2.0\n--- &\njob: {n: !int}\n--- !job\nn: 3\n--- &\njob: {n: !str}\n---\nx\n";
+    st = stamps_run(s, "1", NULL, NULL, hows, err, sizeof err);
+    CHECK(st == OYLNG_ERR_SCHEMA && strstr(err, "replaced after a type reached it"), "on: %s", err);
+    st = stamps_run(s, "0", NULL, NULL, hows, err, sizeof err);
+    CHECK(st == OYLNG_OK && !strcmp(hows, "NaNa"), "off: %s %s", hows, err);
+
+    /* a published name: off, nothing is looked up */
+    const char *ab = "%YAML 2.0\n--- &\na: !int\n";
+    char hab[65], ps[200];
+    hex_of(ab, strlen(ab), hab);
+    shelf sh = { .files = { ab } };
+    oylng_schema *app2 = oylng_schema_new("%YAML 2.0\n--- &\nr: !str\n", 24, S("r"), 0);
+    snprintf(ps, sizeof ps, "%%YAML 2.0\n--- !x.org/a.yes#sha256=%s\n1\n", hab);
+    st = stamps_run(ps, "0", &sh, app2, hows, err, sizeof err);
+    CHECK(st == OYLNG_OK && !strcmp(hows, "As") && sh.calls == 0, "off: %s %d calls %s", hows, sh.calls, err);
+    st = stamps_run(ps, "0", &sh, NULL, hows, err, sizeof err);
+    CHECK(st == OYLNG_OK && !strcmp(hows, "Na") && sh.calls == 0, "off, no schema of the application's: %s %d calls %s",
+          hows, sh.calls, err);
+    st = stamps_run(ps, "1", &sh, app2, hows, err, sizeof err);
+    CHECK(st == OYLNG_OK && !strcmp(hows, "Pi") && sh.calls == 1, "on: %s %d calls %s", hows, sh.calls, err);
+    free(sh.copy);
+    oylng_parser_set_stamps(NULL, false);
+    oylng_schema_free(app2);
+    oylng_schema_free(app);
+}
+
 static void api(void) {
     oylng_parser *p;
     const char *err;
@@ -851,6 +962,7 @@ static void api(void) {
     oylng_parser_free(p);
 
     published_names();
+    ignored_stamps();
 }
 
 int main(int argc, char **argv) {

@@ -2,7 +2,7 @@
  * oylng — read a YAML 2.0 stream and show what it delivers
  *
  *     oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]
- *     oylng --typed [--schema SCHEMA ROOT] [--store DIR] [--cut] [--every-entry] [--limit N] [FILE]
+ *     oylng --typed [--schema SCHEMA ROOT] [--store DIR] [--cut] [--no-stamps] [--every-entry] [--limit N] [FILE]
  *
  * --events (the default) writes the events in the suite's notation;
  * --json writes one line of JSON per document; --emit writes the stream
@@ -16,6 +16,8 @@
  * published name (section 3.1) is looked up in DIR, the file named by its
  * SHA-256 in lowercase hex; without it, no name is looked up.
  * --cut cuts a time's fraction to the digits the engine holds;
+ * --no-stamps ignores every stamp (section 3): each document is typed by
+ * SCHEMA, as one with no stamp is, or without SCHEMA, read as it is;
  * --typed-limit N, for tests, sets the size limit for part 2's counts
  * alone (a schema's full size, and typed), as yaml2's checker has them,
  * where --limit sets it for the stream too; --schema-limit N sets it for
@@ -252,7 +254,7 @@ static int run_typed(oylng_parser *p, const char *in, size_t len, const char *pa
 }
 
 int main(int argc, char **argv) {
-    int json = 0, emit = 0, flow = 0, typed = 0, cut = 0, every = 0;
+    int json = 0, emit = 0, flow = 0, typed = 0, cut = 0, every = 0, no_stamps = 0;
     const char *schema_path = NULL, *schema_root = NULL, *store_dir = NULL;
     unsigned indent = 2;
     unsigned long long limit = 0, counts_limit = 0, schema_limit = 0;
@@ -266,6 +268,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--schema") && i + 2 < argc) schema_path = argv[++i], schema_root = argv[++i];
         else if (!strcmp(argv[i], "--store") && i + 1 < argc) store_dir = argv[++i];
         else if (!strcmp(argv[i], "--cut")) cut = 1;
+        else if (!strcmp(argv[i], "--no-stamps")) no_stamps = 1;
         else if (!strcmp(argv[i], "--every-entry")) every = 1;
         else if (!strcmp(argv[i], "--typed-limit") && i + 1 < argc) counts_limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--schema-limit") && i + 1 < argc) schema_limit = strtoull(argv[++i], NULL, 10);
@@ -273,7 +276,8 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--limit") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             puts("usage: oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]\n"
-                 "       oylng --typed [--schema SCHEMA ROOT] [--store DIR] [--cut] [--every-entry] [--limit N] [FILE]");
+                 "       oylng --typed [--schema SCHEMA ROOT] [--store DIR] [--cut] [--no-stamps] [--every-entry]\n"
+                 "                     [--limit N] [FILE]");
             return 0;
         } else if (!path) path = argv[i];
         else { fprintf(stderr, "oylng: one file at a time\n"); return 2; }
@@ -314,6 +318,7 @@ int main(int argc, char **argv) {
             }
         }
         oylng_parser_set_cut(p, cut);
+        oylng_parser_set_stamps(p, !no_stamps);
         oylng__parser_set_counts_limit(p, counts_limit);
         store st = { store_dir, NULL };
         if (store_dir) oylng_parser_set_lookup(p, store_lookup, &st);
