@@ -125,8 +125,24 @@ text, with Unicode 16's categories for `\p{..}`. `!**` types what a
 mapping holds at every level below it, by its rules or by its `!*`, and
 walks the rest. A union reads any JSON value:
 `json: {!|: [!null, !bool, !int, !float, !str, {!*: !json}, [!json, ...]]}`.
-Not yet: published names, which stamp nothing.
 `include/oylng/schema.h` documents the rest.
+
+A published name (section 3.1), such as
+`--- !tabcomputing.com/address/v1/address.yes#sha256=8789cc…`, ends in the
+SHA-256 of a schema file anyone can use. The parser looks one up only
+through a lookup the application gives it, which gets the file's bytes
+from wherever the application keeps them, by the address or by the hash.
+The parser checks that the file hashes to the name, and that it is one
+table with an entry named like the file. It reads the file under the
+stream's size limit and compiles it once per stream. Without a lookup, a
+published name stamps nothing, as any other global name.
+
+```c
+static bool lookup(void *ctx, oylng_str address, oylng_str sha256, oylng_str *file) {
+    /* from a folder, a cache or https:// and the address: false if it can't be had */
+}
+oylng_parser_set_lookup(p, lookup, ctx);
+```
 
 `oylng --typed` types a stream and writes each document as JSON, each
 value with its type:
@@ -134,6 +150,7 @@ value with its type:
 ```sh
 build/oylng --typed file.yaml                      # by its stamps
 build/oylng --typed --schema app.yaml svc file.yaml
+build/oylng --typed --store schemas/ file.yaml     # published names: schemas/SHA256
 build/oylng --typed --every-entry app.yaml         # a schema file: every entry checked
 ```
 
@@ -193,9 +210,9 @@ or later.
   read from `../yaml2/suite` (set `SUITE=` for another place) and converted
   with the suite's `bin/suite-to-data`, which needs PyYAML. Part 2's suite,
   `suite/yes` (`make test-yes`), types each test and compares its typed
-  events, or its refusal and the refusal's kind; it skips tests with `keep`
-  or a store of published names, and times held otherwise than the engine
-  holds them. Then
+  events, or its refusal and the refusal's kind, with a lookup of the
+  test's store of published files where it has one; it skips tests with
+  `keep`, and times held otherwise than the engine holds them. Then
   `make test-plain` runs them all again, built without SIMD and without the
   fast paths for flow collections on one line and simple block lines, so
   the code those stand in for stays tested.

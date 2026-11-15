@@ -8,7 +8,8 @@
  * error with refused and at; and limit, cut, schema.yaml and root, holds,
  * leap-second, year-zero, keep and store where a test has them. Each test
  * is typed (oylng_parse_typed), by an application's schema where it has
- * one, and must give typed.event, a !float compared by its bits; or be
+ * one, and with a store, by the published files in it, which a lookup
+ * gets by their hash (section 3.1); it must give typed.event, a !float compared by its bits; or be
  * refused, as refused says: the schema, or a document, whose path is
  * compared with at (a different one is counted, not failed: the suite's is
  * the first fault its checker meets). The limit applies to the stream, and
@@ -16,7 +17,7 @@
  * held to it for its full size (section 3).
  *
  * Skipped, and counted: keep and together, interfaces this parser doesn't
- * offer; store, since it looks up no published name; holds other than its
+ * offer; holds other than its
  * own (9 fraction digits, a second 60, the year 0000), and a test without
  * holds that it refuses for a time it can't hold; a limit of 0, which
  * the library takes as the default. Exits with 1 if any test fails.
@@ -33,7 +34,7 @@
 #include <sys/stat.h>
 
 static int passed, failed, verbose, paths;
-static int skip_keep, skip_store, skip_holds, skip_zero;
+static int skip_keep, skip_holds, skip_zero, published;
 
 static char *slurp(const char *dir, const char *name, size_t *len) {
     char path[4096];
@@ -55,6 +56,26 @@ static int has(const char *dir, const char *name) {
     struct stat st;
     snprintf(path, sizeof path, "%s/%s", dir, name);
     return stat(path, &st) == 0;
+}
+
+/* A test's store: the file named by the hash, as an application's folder
+ * of published schemas. The library reads it before the next lookup. */
+typedef struct {
+    char  dir[4096];
+    char *last;
+} store;
+
+static bool store_lookup(void *ctx, oylng_str address, oylng_str sha256, oylng_str *file) {
+    (void)address;
+    store *st = ctx;
+    free(st->last);
+    char name[80];
+    snprintf(name, sizeof name, "%.*s", (int)sha256.len, sha256.data);
+    size_t n;
+    st->last = slurp(st->dir, name, &n);
+    if (!st->last) return false;
+    *file = (oylng_str){ st->last, n };
+    return true;
 }
 
 /* A one-line file's line, without its break; NULL if there's none */
@@ -183,7 +204,6 @@ static bool same_events(const char *got, const char *want) {
 
 static void run(const char *dir) {
     if (has(dir, "keep") || has(dir, "together")) { skip_keep++; return; }
-    if (has(dir, "store")) { skip_store++; return; }
     char *holds = line(dir, "holds");
     bool ours = !holds || (!strcmp(holds, "9") && has(dir, "leap-second") && has(dir, "year-zero"));
     if (!ours) { skip_holds++; free(holds); return; }
@@ -207,6 +227,8 @@ static void run(const char *dir) {
     strbuf got = { 0 };
     oylng_parser *p = NULL;
     oylng_schema *app = NULL;
+    store st = { .last = NULL };
+    snprintf(st.dir, sizeof st.dir, "%s/store", dir);
     if (limit && !lim) { skip_zero++; goto done; }   /* the library's 0 is the default */
     if (schema) {
         app = oylng_schema_new(schema, slen, root ? (oylng_str){ root, strlen(root) } : (oylng_str){ NULL, 0 }, lim);
@@ -220,6 +242,10 @@ static void run(const char *dir) {
         p = oylng_parser_new(in, len);
         if (lim) oylng_parser_set_limit(p, lim);
         oylng_parser_set_cut(p, cut);
+        if (has(dir, "store")) {
+            oylng_parser_set_lookup(p, store_lookup, &st);
+            published++;
+        }
         sb_str(&got, "+STR\n");
         for (;;) {
             oylng_typed *y;
@@ -271,6 +297,7 @@ static void run(const char *dir) {
 done:
     oylng_parser_free(p);
     oylng_schema_free(app);
+    free(st.last);
     free(got.data);
     free(in);
     free(name);
@@ -321,8 +348,8 @@ int main(int argc, char **argv) {
     }
     if (!data) { fprintf(stderr, "usage: test_yes DATA [-v]\n"); return 2; }
     walk(data);
-    printf("yes: %d passed, %d failed; skipped %d with keep, %d with a store, %d holding more,"
+    printf("yes: %d passed, %d failed (%d run with a store); skipped %d with keep, %d holding more,"
            " %d with a limit of 0; %d refused at another path\n",
-           passed, failed, skip_keep, skip_store, skip_holds, skip_zero, paths);
+           passed, failed, published, skip_keep, skip_holds, skip_zero, paths);
     return failed ? 1 : 0;
 }

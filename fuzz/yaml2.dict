@@ -91,3 +91,6 @@
 "!int(/[-+][0-9]+/)"
 "!decimal(5:2 0.. /"
 "!null(/~/)"
+"#sha256="
+".yes#sha256="
+"x.org/a.yes#sha256="

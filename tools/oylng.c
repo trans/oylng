@@ -2,7 +2,7 @@
  * oylng — read a YAML 2.0 stream and show what it delivers
  *
  *     oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]
- *     oylng --typed [--schema SCHEMA ROOT] [--cut] [--every-entry] [--limit N] [FILE]
+ *     oylng --typed [--schema SCHEMA ROOT] [--store DIR] [--cut] [--every-entry] [--limit N] [FILE]
  *
  * --events (the default) writes the events in the suite's notation;
  * --json writes one line of JSON per document; --emit writes the stream
@@ -12,7 +12,9 @@
  * and writes one line of JSON per document, each value [type, value]. As
  * section 2 has it, only what a document reaches is checked, so a stream
  * with a table and no documents loads, empty; with --every-entry, it is
- * checked as a schema file is, every entry as a root.
+ * checked as a schema file is, every entry as a root. With --store, a
+ * published name (section 3.1) is looked up in DIR, the file named by its
+ * SHA-256 in lowercase hex; without it, no name is looked up.
  * --cut cuts a time's fraction to the digits the engine holds;
  * --typed-limit N, for tests, sets the size limit for part 2's counts
  * alone (a schema's full size, and typed), as yaml2's checker has them,
@@ -185,6 +187,30 @@ static void typed_json(strbuf *b, const oylng_typed *t, oylng_value v) {
     sb_str(b, "]");
 }
 
+/* --store: a published name's file, DIR/SHA256. The library reads it
+ * before the next lookup, so each one lets the one before go. */
+typedef struct {
+    const char *dir;
+    char       *last;
+} store;
+
+static bool store_lookup(void *ctx, oylng_str address, oylng_str sha256, oylng_str *file) {
+    (void)address;
+    store *st = ctx;
+    free(st->last);
+    st->last = NULL;
+    char path[4096];
+    snprintf(path, sizeof path, "%s/%.*s", st->dir, (int)sha256.len, sha256.data);
+    FILE *f = fopen(path, "rb");
+    if (!f) return false;
+    size_t n = 0;
+    st->last = read_all(f, &n);
+    fclose(f);
+    if (!st->last) return false;
+    *file = (oylng_str){ st->last, n };
+    return true;
+}
+
 /* --typed */
 static int run_typed(oylng_parser *p, const char *in, size_t len, const char *path,
                      const oylng_schema *app, uint64_t limit, uint64_t counts_limit, int every) {
@@ -227,7 +253,7 @@ static int run_typed(oylng_parser *p, const char *in, size_t len, const char *pa
 
 int main(int argc, char **argv) {
     int json = 0, emit = 0, flow = 0, typed = 0, cut = 0, every = 0;
-    const char *schema_path = NULL, *schema_root = NULL;
+    const char *schema_path = NULL, *schema_root = NULL, *store_dir = NULL;
     unsigned indent = 2;
     unsigned long long limit = 0, counts_limit = 0, schema_limit = 0;
     const char *path = NULL;
@@ -238,6 +264,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--flow")) flow = 1;
         else if (!strcmp(argv[i], "--typed")) typed = 1, json = 0, emit = 0;
         else if (!strcmp(argv[i], "--schema") && i + 2 < argc) schema_path = argv[++i], schema_root = argv[++i];
+        else if (!strcmp(argv[i], "--store") && i + 1 < argc) store_dir = argv[++i];
         else if (!strcmp(argv[i], "--cut")) cut = 1;
         else if (!strcmp(argv[i], "--every-entry")) every = 1;
         else if (!strcmp(argv[i], "--typed-limit") && i + 1 < argc) counts_limit = strtoull(argv[++i], NULL, 10);
@@ -246,7 +273,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--limit") && i + 1 < argc) limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             puts("usage: oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]\n"
-                 "       oylng --typed [--schema SCHEMA ROOT] [--cut] [--every-entry] [--limit N] [FILE]");
+                 "       oylng --typed [--schema SCHEMA ROOT] [--store DIR] [--cut] [--every-entry] [--limit N] [FILE]");
             return 0;
         } else if (!path) path = argv[i];
         else { fprintf(stderr, "oylng: one file at a time\n"); return 2; }
@@ -288,7 +315,10 @@ int main(int argc, char **argv) {
         }
         oylng_parser_set_cut(p, cut);
         oylng__parser_set_counts_limit(p, counts_limit);
+        store st = { store_dir, NULL };
+        if (store_dir) oylng_parser_set_lookup(p, store_lookup, &st);
         int rc = run_typed(p, in, len, path, app, limit, counts_limit, every);
+        free(st.last);
         oylng_schema_free(app);
         oylng_parser_free(p);
         free(in);

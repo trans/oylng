@@ -808,11 +808,143 @@ struct start {
     oylng_typed_by      how;
 };
 
+/* ── Published names (section 3.1) ───────────────────────── */
+
+/* A global name that ends in a file name, X.yes, then #sha256= and 64
+ * lowercase hex digits: its address, the part before the #, its hash, and
+ * its root, X. False for any other name, which stamps nothing. */
+static bool published_name(oylng_str n, oylng_str *addr, oylng_str *hex, oylng_str *root) {
+    const char *hash = memchr(n.data, '#', n.len);
+    if (!hash) return false;
+    size_t a = (size_t)(hash - n.data);
+    if (n.len - a - 1 != 7 + 64 || memcmp(hash + 1, "sha256=", 7) != 0) return false;
+    for (size_t i = 0; i < 64; i++) {
+        char d = hash[8 + i];
+        if (!((d >= '0' && d <= '9') || (d >= 'a' && d <= 'f'))) return false;
+    }
+    /* two parts or more, none of them empty */
+    size_t parts = 0, from = 0, last = 0;
+    for (size_t i = 0; i <= a; i++) {
+        if (i < a && n.data[i] != '/') continue;
+        if (i == from) return false;
+        parts++;
+        last = from;
+        from = i + 1;
+    }
+    if (parts < 2 || a - last <= 4 || memcmp(n.data + a - 4, ".yes", 4) != 0) return false;
+    *addr = (oylng_str){ n.data, a };
+    *hex = (oylng_str){ hash + 8, 64 };
+    *root = (oylng_str){ n.data + last, a - last - 4 };
+    return true;
+}
+
+/* The files the lookup gave, compiled, by hash and root: the same bytes
+ * can be named for any entry they have */
+typedef struct {
+    const char   *hex;    /* in the stream, which lasts as the parser does */
+    oylng_str     root;
+    oylng_schema *sc;
+} pub;
+
+typedef struct {
+    pub     *e;
+    uint32_t n, cap;
+} pubs;
+
+static void pubs_free(void *p) {
+    pubs *L = p;
+    for (uint32_t i = 0; i < L->n; i++) oylng_schema_free(L->e[i].sc);
+    free(L->e);
+    free(L);
+}
+
+#define ADDR(a) (int)((a).len > 80 ? 80 : (a).len), (a).data, (a).len > 80 ? "..." : ""
+
+/* The schema a published name stamps, looked up once a stream; NULL, the
+ * parser failed, if it can't be had or isn't good */
+static const oylng_schema *published(oylng_parser *P, oylng_str name, oylng_str addr, oylng_str hex,
+                                     oylng_str root) {
+    const char *in;
+    size_t inlen;
+    oylng__parser_input(P, &in, &inlen);
+    size_t at = (size_t)(name.data - in);
+    pubs *L = oylng__parser_pubs(P);
+    for (uint32_t i = 0; L && i < L->n; i++)
+        if (!memcmp(L->e[i].hex, hex.data, 64) && L->e[i].root.len == root.len &&
+            !memcmp(L->e[i].root.data, root.data, root.len))
+            return L->e[i].sc;
+
+    void *lctx;
+    oylng__lookup look = oylng__parser_lookup(P, &lctx);
+    oylng_str file = { NULL, 0 };
+    char msg[240];
+    if (!look(lctx, addr, hex, &file) || (!file.data && file.len)) {
+        /* the document can't be read as it is meant to be: strings would
+           be different data */
+        snprintf(msg, sizeof msg, "/: the application can't get %.*s%s", ADDR(addr));
+        oylng__parser_fail_at(P, OYLNG_ERR_SCHEMA, at, msg);
+        return NULL;
+    }
+    unsigned char h[32];
+    oylng__sha256(file.data ? file.data : "", file.len, h);
+    static const char digits[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++)
+        if (hex.data[2 * i] != digits[h[i] >> 4] || hex.data[2 * i + 1] != digits[h[i] & 15]) {
+            snprintf(msg, sizeof msg, "/: %.*s%s doesn't hash to its name", ADDR(addr));
+            oylng__parser_fail_at(P, OYLNG_ERR_SCHEMA, at, msg);
+            return NULL;
+        }
+    /* a stream of its own, under the parser's limit (section 3) */
+    oylng_schema *sc = oylng__published_new(file.data, file.len, root, oylng__parser_counts_limit(P));
+    if (!sc || sc->st == OYLNG_ERR_MEMORY) {
+        oylng_schema_free(sc);
+        oylng__parser_fail(P, OYLNG_ERR_MEMORY, "out of memory");
+        return NULL;
+    }
+    if (sc->st != OYLNG_OK) {
+        if (sc->mark.line)
+            snprintf(msg, sizeof msg, "%.*s%s:%zu:%zu: %s", ADDR(addr), sc->mark.line, sc->mark.col, sc->msg);
+        else
+            snprintf(msg, sizeof msg, "%.*s%s: %s", ADDR(addr), sc->msg);
+        oylng_schema_free(sc);
+        oylng__parser_fail_at(P, OYLNG_ERR_SCHEMA, at, msg);
+        return NULL;
+    }
+    if (!L) {
+        L = calloc(1, sizeof *L);
+        if (!L) goto memory;
+        oylng__parser_set_pubs(P, L, pubs_free);
+    }
+    if (L->n == L->cap) {
+        uint32_t cap = L->cap ? 2 * L->cap : 4;
+        pub *e = realloc(L->e, cap * sizeof *e);
+        if (!e) goto memory;
+        L->e = e;
+        L->cap = cap;
+    }
+    L->e[L->n++] = (pub){ hex.data, root, sc };
+    return sc;
+memory:
+    oylng_schema_free(sc);
+    oylng__parser_fail(P, OYLNG_ERR_MEMORY, "out of memory");
+    return NULL;
+}
+
 /* At a document's start: the schema its stamp names, compiled and checked
  * before its data is read (section 2), or the application's */
 static oylng_status at_start(void *ctx, oylng_str name) {
     struct start *c = ctx;
     oylng_parser *P = c->P;
+    void *lctx;
+    oylng_str addr, hex, root;
+    if (name.data && oylng__parser_lookup(P, &lctx) && published_name(name, &addr, &hex, &root)) {
+        const oylng_schema *sc = published(P, name, addr, hex, root);
+        if (!sc) return oylng__parser_fail(P, OYLNG_ERR_SCHEMA, "");   /* failed already: this gives its status */
+        c->S = sc->ctx;
+        c->root = sc->root;
+        c->how = OYLNG_TYPED_PUBLISHED;
+        return OYLNG_OK;
+    }
     if (name.data && !memchr(name.data, '/', name.len)) {
         sctx *S = oylng__parser_ctx(P);
         uint32_t count = oylng__table_count(P);

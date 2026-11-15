@@ -29,6 +29,7 @@
  */
 
 #include "oylng_internal.h"
+#include "oylng/schema.h"   /* part 2's settings, defined here: so that they are exported */
 #include "oylng_simd.h"
 #include <setjmp.h>
 #include <stdarg.h>
@@ -243,6 +244,16 @@ struct oylng_parser {
     void     *sctx;
     void    (*sctx_free)(void *);
     bool      cut;
+
+    /* for the typed reader: the application's lookup of published names
+       (part 2, section 3.1), and the files it gave, compiled, which last
+       the stream; and whether a ... was read, which a published file
+       hasn't */
+    oylng__lookup lookup;
+    void         *lookup_ctx;
+    void         *pubs;
+    void        (*pubs_free)(void *);
+    bool          dotted;
 
     oylng_status status;
     oylng_mark   errmark;
@@ -2300,6 +2311,7 @@ static bool next_document(parser *P) {
         if (eof(P)) return false;
         bool ended = dots(P);
         if (ended) {
+            P->dotted = true;
             P->p += 3;
             eol(P);
             const char *after = P->p;
@@ -2550,6 +2562,7 @@ void oylng_parser_free(oylng_parser *P) {
     free(P->g);
     free(P->tmemo);
     if (P->sctx) P->sctx_free(P->sctx);
+    if (P->pubs) P->pubs_free(P->pubs);
     oylng_arena_free(P->strings);
     oylng_arena_free(P->vals);
     free(P);
@@ -2635,6 +2648,29 @@ bool oylng__parser_cut(const oylng_parser *P) { return P->cut; }
 
 void oylng_parser_set_cut(oylng_parser *P, bool cut) {
     if (P) P->cut = cut;
+}
+
+void oylng_parser_set_lookup(oylng_parser *P, oylng__lookup fn, void *ctx) {
+    if (!P) return;
+    P->lookup = fn;
+    P->lookup_ctx = ctx;
+}
+
+oylng__lookup oylng__parser_lookup(const oylng_parser *P, void **ctx) {
+    *ctx = P->lookup_ctx;
+    return P->lookup;
+}
+
+void *oylng__parser_pubs(const oylng_parser *P) { return P->pubs; }
+
+void oylng__parser_set_pubs(oylng_parser *P, void *pubs, void (*free_fn)(void *)) {
+    P->pubs = pubs;
+    P->pubs_free = free_fn;
+}
+
+void oylng__parser_shape(const oylng_parser *P, uint32_t *tables, bool *dotted) {
+    *tables = P->tdoc;
+    *dotted = P->dotted;
 }
 
 void *oylng__parser_ctx(const oylng_parser *P) { return P->sctx; }

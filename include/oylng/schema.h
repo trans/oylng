@@ -15,9 +15,10 @@
  * Below a `!**` (section 10), what no rule picks out is walked: a mapping
  * or a sequence is typed OYLNG_T_MAPPING or OYLNG_T_SEQUENCE, its children
  * looked up in turn, and a scalar takes the rules' `!*`, or is
- * OYLNG_T_STR; what is walked has no name (oylng_value_name). Not yet: a
- * published name is never looked up, as section 3.1 has it unless the
- * application asks, so it stamps nothing.
+ * OYLNG_T_STR; what is walked has no name (oylng_value_name). A published
+ * name (section 3.1) stamps a document only if the application gives the
+ * parser a lookup (oylng_parser_set_lookup); without one it stamps
+ * nothing, as any other global name.
  */
 
 #ifndef OYLNG_SCHEMA_H
@@ -57,6 +58,23 @@ OYLNG_API void oylng_schema_free(oylng_schema *s);
  *  rounding up, rather than refuse a time with more (section 4.8). Off
  *  unless set. */
 OYLNG_API void oylng_parser_set_cut(oylng_parser *p, bool cut);
+
+/** An application's lookup of published names (section 3.1). Given a
+ *  name's address, the name before its #, to which https:// leads, and its
+ *  SHA-256 in 64 lowercase hex digits: true, with *file set to the bytes
+ *  of the file, or false if it can't get the file, which refuses the
+ *  document. A copy from anywhere will do, a mirror or a folder of the
+ *  schemas the application accepts, as the parser refuses a file that
+ *  doesn't hash to the name. It reads the bytes before it returns to the
+ *  application, and keeps none of them. */
+typedef bool (*oylng_lookup_fn)(void *ctx, oylng_str address, oylng_str sha256, oylng_str *file);
+
+/** Look published names up with @p fn, which is given @p ctx; NULL, the
+ *  default, to look nothing up. A name is looked up once a stream: the
+ *  file is compiled, as a stream of its own under the parser's size
+ *  limit, and kept for the stream's other documents with that name. Set it
+ *  before the first document. */
+OYLNG_API void oylng_parser_set_lookup(oylng_parser *p, oylng_lookup_fn fn, void *ctx);
 
 /* ── Typed documents ─────────────────────────────────────── */
 
@@ -104,13 +122,19 @@ typedef enum {
     OYLNG_TYPED_NOT = 0,   /**< not at all: its root is OYLNG_T_ANY */
     OYLNG_TYPED_STAMP,     /**< by its stamp and the stream's own table */
     OYLNG_TYPED_APP,       /**< by the application's schema */
+    OYLNG_TYPED_PUBLISHED, /**< by its stamp, a published name the
+                                application's lookup found */
 } oylng_typed_by;
 
 /** The next document, typed: by its stamp, else by @p app (which may be
  *  NULL), else not at all. Called where oylng_parse_tree can be, and like
- *  it gives *out NULL at the end of the stream. A schema the stream holds
- *  is checked before the document's data is read. Errors are final, as the
- *  parser's are; OYLNG_ERR_INPUT for an app schema in error. */
+ *  it gives *out NULL at the end of the stream. A schema the stream holds,
+ *  or a published one, is checked before the document's data is read.
+ *  Errors are final, as the parser's are; OYLNG_ERR_INPUT for an app
+ *  schema in error. A published file that can't be had, or doesn't hash to
+ *  its name, refuses the document, its path /; one that is bad refuses the
+ *  schema, the error naming the file's address. Both are OYLNG_ERR_SCHEMA,
+ *  at the stamp. */
 OYLNG_API oylng_status oylng_parse_typed(oylng_parser *p, const oylng_schema *app, oylng_typed **out);
 
 OYLNG_API void oylng_typed_free(oylng_typed *t);

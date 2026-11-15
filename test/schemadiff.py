@@ -20,13 +20,15 @@ references counts it. In both, an application's schema is read under the
 limit as a stream of its own, and held to it for its full size (section 3,
 `--schema-limit`).
 
-Skipped, and counted: streams the checker types with a store of published
-schemas, which the engine doesn't look up, and a limit of 0, which the
-tool takes as the default. Where both refuse, the data paths are compared too, and a different one is reported
+A stream the checker types with a store of published schemas (section
+3.1) is given to the engine with the store as a folder, each file named by
+the hash it is kept under (`--store`). Skipped, and counted: a limit of 0,
+which the tool takes as the default. Where both refuse, the data paths are compared too, and a different one is reported
 but isn't a disagreement: the checker's path is the first fault it meets.
 Exits with 1 if there are any disagreements. With --seeds, also writes each
 stream, framed, into DIR as a fuzz input (fuzz/fuzz_parser.c), its first byte
-0 for the default options.
+0 for the default options; a stream with a store has its first file before
+it, and a NUL.
 """
 import base64, contextlib, io, json, math, os, subprocess, sys, tempfile, textwrap
 from decimal import Decimal
@@ -88,7 +90,7 @@ def checker(ns, c, whole):
             read = ns['g']['read']
             read(c['stream'], c['limit'])
             if c['app']: read(c['app'][0], c['limit'])
-        return 'ok', ns['typed'](c['stream'], c['app'], None, c['limit'], c['cut'], not whole)
+        return 'ok', ns['typed'](c['stream'], c['app'], c['store'], c['limit'], c['cut'], not whole)
     except ns['REFUSED'] + (RecursionError,) as e:
         return 'no', str(e)
     finally:
@@ -101,7 +103,7 @@ def checker_schema(ns, c):
     except ns['REFUSED'] as e:
         return 'no', str(e)
 
-def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=None, schema_limit=None):
+def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=None, schema_limit=None, store=None):
     sf = os.path.join(tmp, 'stream.yaml')
     with open(sf, 'w', encoding='utf-8', newline='') as f: f.write(framed(stream))
     cmd = [tool, '--typed', '--every-entry']   # typed() checks every entry of a stream with no document
@@ -109,6 +111,14 @@ def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=No
         af = os.path.join(tmp, 'app.yaml')
         with open(af, 'w', encoding='utf-8', newline='') as f: f.write(framed(app[0]))
         cmd += ['--schema', af, app[1]]
+    if store is not None:
+        d = os.path.join(tmp, 'store')
+        if os.path.isdir(d):
+            for f in os.listdir(d): os.unlink(os.path.join(d, f))
+        else: os.mkdir(d)
+        for h, b in store.items():
+            with open(os.path.join(d, h), 'wb') as f: f.write(b if isinstance(b, bytes) else b.encode('utf-8'))
+        cmd += ['--store', d]
     if cut: cmd.append('--cut')
     if limit is not None: cmd += ['--limit', str(limit)]
     if counts is not None: cmd += ['--typed-limit', str(counts)]
@@ -182,11 +192,14 @@ def main():
         os.makedirs(seeds, exist_ok=True)
         for c in streams:
             b = b'\0' + framed(c['stream']).encode('utf-8', 'surrogatepass')
+            if c['store']:   # a published file, NUL, then the stream
+                f = next(iter(c['store'].values()))
+                b = b'\0' + (f if isinstance(f, bytes) else f.encode('utf-8')) + b'\0' + b[1:]
             if len(b) > 4096: continue
             with open(os.path.join(seeds, 'schema-' + hashlib.sha1(b).hexdigest()[:16]), 'wb') as f: f.write(b)
     tail = said.strip().splitlines()[-2:]
     print('checker:', '; '.join(tail))
-    seen, n, agree, store, differ, paths, zero = set(), 0, 0, 0, [], [], 0
+    seen, n, agree, stored, differ, paths, zero = set(), 0, 0, 0, [], [], 0
 
     def compare(c, want, got):
         nonlocal agree
@@ -201,20 +214,22 @@ def main():
 
     with tempfile.TemporaryDirectory(dir=os.environ.get('TMPDIR')) as tmp:
         for c in streams:
-            key = (c['stream'], c['app'], c['limit'], c['cut'], c['store'] is not None)
+            st = c['store']
+            key = (c['stream'], c['app'], c['limit'], c['cut'], None if st is None else tuple(sorted(st.items())))
             if key in seen: continue
             seen.add(key)
-            if c['store'] is not None: store += 1; continue
+            if st is not None: stored += 1
             limited = c['limit'] != ns['LIMIT']
             n += 1
             compare(dict(c, how='the whole limit'), checker(ns, c, True),
-                    engine(tool, tmp, framed, c['stream'], c['app'], c['limit'] if limited else None, c['cut']))
+                    engine(tool, tmp, framed, c['stream'], c['app'], c['limit'] if limited else None, c['cut'],
+                           store=st))
             if limited:
                 n += 1
                 # an application's schema is a stream of its own, read under the limit (section 3)
                 compare(dict(c, how="part 2's counts alone"), checker(ns, c, False),
                         engine(tool, tmp, framed, c['stream'], c['app'], None, c['cut'], c['limit'],
-                               c['limit'] if c['app'] else None))
+                               c['limit'] if c['app'] else None, st))
         for c in schemas:
             key = ('schema', c['text'], c['root'], c['limit'])
             if key in seen: continue
@@ -223,19 +238,20 @@ def main():
             n += 1
             limited = c['limit'] != ns['LIMIT']
             compare(dict(stream='(a schema alone)', app=(c['text'], c['root']), limit=c['limit'], cut=False,
-                         how="part 2's counts alone"),
+                         how="part 2's counts alone", store=None),
                     checker_schema(ns, c), engine(tool, tmp, framed, '', (c['text'], c['root']), None, False,
                                                   c['limit'] if limited else None))
     for c, want, got in differ:
         print('DIFFER:', short(c['stream']))
         if c['app']: print('  app schema', short(c['app'][0]), 'root', c['app'][1])
+        if c.get('store') is not None: print('  store', short(c['store'], 300))
         if c['limit'] != ns['LIMIT'] or c['cut']: print('  limit', c['limit'], 'cut', c['cut'], 'as', c['how'])
         print('  checker:', short(want[1] if want[0] == 'no' else want[1], 300), '(refuses)' if want[0] == 'no' else '')
         print('  engine: ', short(got[1], 300), '(refuses)' if got[0] != 'ok' else '')
     for c, want, got in paths[:20] if verbose else []:
         print('PATH:', short(c['stream'], 120), '| checker', want[1][:80], '| engine', got[1][:80])
-    print(f'{n} cases: {agree} agree, {len(differ)} differ, '
-          f'{store} with a store and {zero} with a limit of 0 not run; {len(paths)} refused at different paths')
+    print(f'{n} cases: {agree} agree, {len(differ)} differ, {stored} streams with a store among them; '
+          f'{zero} with a limit of 0 not run; {len(paths)} refused at different paths')
     sys.exit(1 if differ else 0)
 
 if __name__ == '__main__':

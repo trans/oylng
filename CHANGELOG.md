@@ -25,23 +25,32 @@
   rules or its `!*`, and walks the rest; a type with `!**` takes a mapping
   only (yaml2 `e75a203`). An application's schema is read under the
   size limit as a stream of its own, and its full size held to it (section
-  3, yaml2 `425db57`). Not yet: published names. `oylng --typed` types a stream and writes each value with its
+  3, yaml2 `425db57`). A published name (section 3.1) stamps a document
+  through a lookup the application gives (`oylng_parser_set_lookup`), which
+  gets the file by its address or its hash; the parser checks that the
+  file hashes to the name (SHA-256, its own), that it is one table and
+  nothing else, and that it has an entry named like the file, reads it
+  under the stream's limit, and compiles it once a stream. Without a
+  lookup, a published name stamps nothing. `oylng --typed` types a stream and writes each value with its
   type; with `--every-entry`, a stream with a table and no document is
-  checked as a schema file, every entry as a root.
-- Tested: 89 API checks and the draft's 70 examples (`make test`); part 2's
-  suite (yaml2 `0b88244`), 770 of its 842 tests passed and none failed, the
-  rest skipped for times held otherwise (25), `keep` (24) and published
-  names (23) (`make test-yes`); all 832 of the streams the draft's schema
-  checker (yaml2's `schemacheck.py`) types in its examples and edge cases
-  that the engine can run, each refused by both or accepted with the same
-  values (`make test-schema-diff`, with `--every-entry`, as the checker
-  checks a stream with no document, and `--schema-limit`); 50,000
+  checked as a schema file, every entry as a root; with `--store DIR`, a
+  published name is looked up in DIR, by its hash.
+- Tested: 122 API checks and the draft's 70 examples (`make test`); part 2's
+  suite (yaml2 `0b88244`), 793 of its 842 tests passed and none failed, 23
+  of them with a store of published files, the rest skipped for times held
+  otherwise (25) and `keep` (24) (`make test-yes`); all 859 of the streams
+  the draft's schema checker (yaml2's `schemacheck.py`) types in its
+  examples and edge cases that the engine can run, 23 with a store, each
+  refused by both or accepted with the same values (`make
+  test-schema-diff`, with `--every-entry`, as the checker checks a stream
+  with no document, `--schema-limit` and `--store`); 50,000
   generated patterns and 199,553 strings, read, counted and matched as the
   checker's reading run by Python's `re` does (`make test-pattern-diff`);
   GitHub's workflow format and Compose as shadow schemas, on the 490
   workflow and 311 Compose files of yaml2's public sample, with the
   checker's verdict and refusal path on every file. The fuzzer types each
-  stream too.
+  stream too, and a stream after a NUL with what comes before it as a
+  published file.
 - `oylng_event` gains `plain`, at its end, and the tree
   `oylng_node_plain`: whether a scalar was written plain, as part 2 needs,
   since a quoted `"3"` is never an `!int`.

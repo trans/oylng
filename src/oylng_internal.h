@@ -230,6 +230,21 @@ struct oylng_schema *oylng__schema_new(const char *yaml, size_t len, oylng_str r
 bool         oylng__parser_cut(const oylng_parser *p);
 void        *oylng__parser_ctx(const oylng_parser *p);
 void         oylng__parser_set_ctx(oylng_parser *p, void *ctx, void (*free_fn)(void *));
+/* The application's lookup of published names (oylng_lookup_fn, part 2,
+ * section 3.1), or NULL; and the files it gave, compiled, which the parser
+ * lets go at its end */
+typedef bool (*oylng__lookup)(void *ctx, oylng_str address, oylng_str sha256, oylng_str *file);
+oylng__lookup oylng__parser_lookup(const oylng_parser *p, void **ctx);
+void        *oylng__parser_pubs(const oylng_parser *p);
+void         oylng__parser_set_pubs(oylng_parser *p, void *pubs, void (*free_fn)(void *));
+/* After the stream's end: how many --- & tables it had, and whether a ...
+ * was read */
+void         oylng__parser_shape(const oylng_parser *p, uint32_t *tables, bool *dotted);
+/* oylng_schema_new, for a published file: also refused unless it is one
+ * table and nothing else */
+struct oylng_schema *oylng__published_new(const char *yaml, size_t len, oylng_str root, uint64_t limit);
+/* SHA-256 (oylng_sha256.c) */
+void         oylng__sha256(const void *data, size_t len, unsigned char out[32]);
 /* As oylng__parser_fail, at an offset in the input */
 oylng_status oylng__parser_fail_at(oylng_parser *p, oylng_status st, size_t offset, const char *msg);
 

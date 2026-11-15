@@ -15,6 +15,11 @@
  * schema rooted at `a` when it compiles as one, the stream must be refused
  * where the events were, or for a schema; each typed value must be what its
  * type says, each key's value found. The flow bit also turns on the cut.
+ * Where the stream holds a NUL, what comes before it is also a published
+ * file (section 3.1), and what comes after a stream typed with a lookup
+ * that gives it, once each #sha256= and the 64 hex digits after it are set
+ * to the file's hash: a published document must be typed as its type says,
+ * and a refusal must say why.
  *
  *     clang -fsanitize=fuzzer,address,undefined -Iinclude src/oylng_*.c fuzz/fuzz_parser.c
  */
@@ -143,6 +148,19 @@ static void check_value(const oylng_typed *t, oylng_value v, size_t *budget) {
         abort();
     }
 }
+
+/* The published file, for any hash: the parser checks it */
+static bool lookup(void *ctx, oylng_str address, oylng_str sha256, oylng_str *file) {
+    (void)address;
+    (void)sha256;
+    *file = *(const oylng_str *)ctx;
+    return true;
+}
+
+void oylng__sha256(const void *data, size_t len, unsigned char out[32]);
+
+/* FILE NUL STREAM: STREAM typed, its published names looked up in FILE */
+static void published(const char *in, size_t size, unsigned opt);
 
 static oylng_parser *parser_for(const char *in, size_t size, unsigned opt) {
     oylng_parser *p = oylng_parser_new(in, size);
@@ -306,6 +324,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     oylng_schema_free(app);
     oylng_parser_free(p);
+    published(in, size, opt);
 
     /* written again, it reads back the same */
     oylng_str out = oylng_emitter_output(em);
@@ -329,4 +348,41 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     oylng_emitter_free(em);
     free(in);
     return 0;
+}
+
+static void published(const char *in, size_t size, unsigned opt) {
+    const char *nul = memchr(in, '\0', size);
+    if (!nul) return;
+    oylng_str file = { in, (size_t)(nul - in) };
+    size_t n = size - file.len - 1;
+    char *s = malloc(n ? n : 1);
+    if (!s) return;
+    memcpy(s, nul + 1, n);
+    unsigned char h[32];
+    oylng__sha256(file.data, file.len, h);
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i + 8 + 64 <= n; i++)
+        if (!memcmp(s + i, "#sha256=", 8))
+            for (int j = 0; j < 32; j++) {
+                s[i + 8 + 2 * j] = digits[h[j] >> 4];
+                s[i + 9 + 2 * j] = digits[h[j] & 15];
+            }
+    oylng_parser *yp = parser_for(s, n, opt);
+    if (yp) {
+        oylng_parser_set_lookup(yp, lookup, &file);
+        oylng_typed *y;
+        oylng_status st;
+        size_t budget = 1 << 16;
+        while ((st = oylng_parse_typed(yp, NULL, &y)) == OYLNG_OK && y) {
+            oylng_typed_by how = oylng_typed_how(y);
+            oylng_value root = oylng_typed_root(y);
+            if (root == OYLNG_NO_VALUE || how == OYLNG_TYPED_APP) abort();
+            if (how == OYLNG_TYPED_NOT && oylng_value_type(y, root) != OYLNG_T_ANY) abort();
+            check_value(y, root, &budget);
+            oylng_typed_free(y);
+        }
+        if (st != OYLNG_OK && !oylng_parser_error(yp)) abort();
+        oylng_parser_free(yp);
+    }
+    free(s);
 }

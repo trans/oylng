@@ -1045,12 +1045,13 @@ static void schema_fail(oylng_schema *sc, oylng_status st, const char *msg, oyln
 
 /* Compiles root, or every entry as a root if root.data is NULL: false if
  * that failed, and S says why; missing says if there is no root */
-static bool compile_app(sctx *S, oylng_parser *P, oylng_str root, xt **out, char *missing, size_t mn) {
+static bool compile_app(sctx *S, oylng_parser *P, oylng_str root, xt **out, char *missing, size_t mn,
+                        const char *what) {
     missing[0] = '\0';
     if (setjmp(S->jb)) return false;
     if (root.data) {
         centry *en = entry_of(S, root.data, root.len);
-        if (!en) snprintf(missing, mn, "the schema has no entry %.*s", (int)(root.len > 60 ? 60 : root.len), root.data);
+        if (!en) snprintf(missing, mn, "%s has no entry %.*s", what, (int)(root.len > 60 ? 60 : root.len), root.data);
         else {
             compile_root(S, en);
             *out = en->root;
@@ -1068,12 +1069,26 @@ static bool compile_app(sctx *S, oylng_parser *P, oylng_str root, xt **out, char
     return true;
 }
 
+static oylng_schema *schema_make(const char *yaml, size_t len, oylng_str root, uint64_t limit,
+                                 uint64_t counts_limit, bool published);
+
 oylng_schema *oylng_schema_new(const char *yaml, size_t len, oylng_str root, uint64_t limit) {
-    return oylng__schema_new(yaml, len, root, limit, 0);
+    return schema_make(yaml, len, root, limit, 0, false);
 }
 
 oylng_schema *oylng__schema_new(const char *yaml, size_t len, oylng_str root, uint64_t limit,
                                 uint64_t counts_limit) {
+    return schema_make(yaml, len, root, limit, counts_limit, false);
+}
+
+/* Section 3.1: a published file is %YAML 2.0 and one --- &, with nothing
+ * after it, not even ... */
+oylng_schema *oylng__published_new(const char *yaml, size_t len, oylng_str root, uint64_t limit) {
+    return schema_make(yaml, len, root, limit, 0, true);
+}
+
+static oylng_schema *schema_make(const char *yaml, size_t len, oylng_str root, uint64_t limit,
+                                 uint64_t counts_limit, bool published) {
     oylng_schema *sc = calloc(1, sizeof *sc);
     if (!sc) return NULL;
     if ((!yaml && len) || (root.len && !root.data)) {
@@ -1086,9 +1101,18 @@ oylng_schema *oylng__schema_new(const char *yaml, size_t len, oylng_str root, ui
     oylng__parser_set_counts_limit(P, counts_limit);
     const oylng_event *e;
     oylng_status st;
-    while ((st = oylng_parse_next(P, &e)) == OYLNG_OK && e->type != OYLNG_EVT_STREAM_END) {}
+    uint32_t docs = 0, tables;
+    bool dotted;
+    while ((st = oylng_parse_next(P, &e)) == OYLNG_OK && e->type != OYLNG_EVT_STREAM_END)
+        if (e->type == OYLNG_EVT_DOC_START) docs++;
     if (st != OYLNG_OK) {
         schema_fail(sc, st, oylng_parser_error(P), oylng_parser_error_mark(P));
+        oylng_parser_free(P);
+        return sc;
+    }
+    oylng__parser_shape(P, &tables, &dotted);
+    if (published && (docs || tables != 1 || dotted)) {
+        schema_fail(sc, OYLNG_ERR_SCHEMA, "a published schema is one table and nothing else", (oylng_mark){ 0, 0, 0 });
         oylng_parser_free(P);
         return sc;
     }
@@ -1100,10 +1124,10 @@ oylng_schema *oylng__schema_new(const char *yaml, size_t len, oylng_str root, ui
     }
     sc->ctx = S;
     char missing[120];
-    if (!compile_app(S, P, root, &sc->root, missing, sizeof missing))
+    if (!compile_app(S, P, root, &sc->root, missing, sizeof missing, published ? "the file" : "the schema"))
         schema_fail(sc, S->st, S->msg, mark_in(yaml, len, S->errpos));
     else if (missing[0])
-        schema_fail(sc, OYLNG_ERR_SCHEMA, missing, (oylng_mark){ 0, 1, 1 });
+        schema_fail(sc, OYLNG_ERR_SCHEMA, missing, published ? (oylng_mark){ 0, 0, 0 } : (oylng_mark){ 0, 1, 1 });
     S->P = NULL;
     S->in = NULL;
     oylng_parser_free(P);

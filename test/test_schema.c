@@ -34,6 +34,15 @@ static int checks, failed;
 
 static oylng_str S(const char *s) { return (oylng_str){ s, strlen(s) }; }
 
+/* The library's own SHA-256, for published names' hashes */
+void oylng__sha256(const void *data, size_t len, unsigned char out[32]);
+
+static void hex_of(const void *s, size_t n, char out[65]) {
+    unsigned char h[32];
+    oylng__sha256(s, n, h);
+    for (int i = 0; i < 32; i++) snprintf(out + 2 * i, 3, "%02x", h[i]);
+}
+
 static bool eq(oylng_str a, const char *b, size_t bl) { return a.len == bl && (!bl || memcmp(a.data, b, bl) == 0); }
 
 /* ── Comparing with JSON ─────────────────────────────────── */
@@ -308,6 +317,205 @@ static oylng_typed *typed(oylng_parser **pp, const char *s, const oylng_schema *
     *err = NULL;
     if (oylng_parse_typed(*pp, app, &y) != OYLNG_OK) *err = oylng_parser_error(*pp);
     return y;
+}
+
+/* ── Published names (section 3.1) ───────────────────────── */
+
+/* An application's folder of published files, found by their hash. Each
+ * one it gives is a copy, let go once the parser has returned, so that a
+ * parser keeping any of it is caught (under the sanitizers). */
+typedef struct {
+    const char *files[4];
+    bool        any;   /* gives files[0], whatever the hash: a lookup that lies */
+    int         calls;
+    char       *copy;
+    char        addr[200];
+} shelf;
+
+static bool shelf_lookup(void *ctx, oylng_str addr, oylng_str sha256, oylng_str *file) {
+    shelf *sh = ctx;
+    sh->calls++;
+    snprintf(sh->addr, sizeof sh->addr, "%.*s", (int)addr.len, addr.data);
+    for (int i = 0; i < 4 && sh->files[i]; i++) {
+        char h[65];
+        size_t n = strlen(sh->files[i]);
+        hex_of(sh->files[i], n, h);
+        if (!sh->any && (sha256.len != 64 || memcmp(h, sha256.data, 64))) continue;
+        free(sh->copy);
+        sh->copy = malloc(n + 1);
+        memcpy(sh->copy, sh->files[i], n + 1);
+        *file = (oylng_str){ sh->copy, n };
+        return true;
+    }
+    return false;
+}
+
+/* The documents of stream s, typed with sh as the lookup: how many, the
+ * last one's root's type and how it was typed, or 0 and the error */
+typedef struct {
+    int            docs;
+    oylng_type     type;
+    oylng_typed_by how;
+    oylng_status   st;
+    char           err[300];
+    oylng_mark     mark;
+    char           name[40];
+} pubrun;
+
+static pubrun pub_run(const char *s, shelf *sh, const oylng_schema *app, uint64_t limit) {
+    pubrun r = { 0 };
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    if (limit) oylng_parser_set_limit(p, limit);
+    if (sh) oylng_parser_set_lookup(p, shelf_lookup, sh);
+    for (;;) {
+        oylng_typed *y;
+        r.st = oylng_parse_typed(p, app, &y);
+        if (sh) {
+            free(sh->copy);   /* the parser has its own of all it needs */
+            sh->copy = NULL;
+        }
+        if (r.st != OYLNG_OK) {
+            snprintf(r.err, sizeof r.err, "%s", oylng_parser_error(p));
+            r.mark = oylng_parser_error_mark(p);
+            break;
+        }
+        if (!y) break;
+        r.docs++;
+        oylng_value v = oylng_typed_root(y);
+        r.type = oylng_value_type(y, v);
+        r.how = oylng_typed_how(y);
+        oylng_str nm = oylng_value_name(y, v);
+        snprintf(r.name, sizeof r.name, "%.*s", nm.data ? (int)nm.len : 0, nm.data ? nm.data : "");
+        oylng_typed_free(y);
+    }
+    oylng_parser_free(p);
+    return r;
+}
+
+static void published_names(void) {
+    /* SHA-256: FIPS 180-2's examples, a million a's, and the digests of
+       every run of a's to 299, which crosses each way a block can end */
+    char h[65];
+    hex_of("", 0, h);
+    CHECK(!strcmp(h, "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"), "sha256 of nothing: %s", h);
+    hex_of("abc", 3, h);
+    CHECK(!strcmp(h, "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"), "sha256 of abc: %s", h);
+    const char *two = "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq";
+    hex_of(two, strlen(two), h);
+    CHECK(!strcmp(h, "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"), "sha256 of 448 bits: %s", h);
+    char *as = malloc(1000000);
+    memset(as, 'a', 1000000);
+    hex_of(as, 1000000, h);
+    CHECK(!strcmp(h, "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"), "sha256 of 10^6 a's: %s", h);
+    unsigned char *all = malloc(300 * 32);
+    for (int n = 0; n < 300; n++) oylng__sha256(as, (size_t)n, all + 32 * n);
+    hex_of(all, 300 * 32, h);
+    CHECK(!strcmp(h, "80e953e3b006c4bab43fd5d792f8bd29c122f6cf1497318365fe66bf2d61398d"), "sha256 of 0 to 299 a's: %s", h);
+    free(all);
+    free(as);
+
+    const char *ab = "%YAML 2.0\n--- &\na: !int\nb: [!bool, ...]\n";
+    char hab[65], s[1200], t[600];
+    hex_of(ab, strlen(ab), hab);
+    shelf sh = { .files = { ab } };
+    pubrun r;
+
+    /* looked up once a stream, for each root: the same bytes give a and b */
+    snprintf(s, sizeof s, "%%YAML 2.0\n--- !x.org/a.yes#sha256=%s\n1\n--- !mirror.example/a.yes#sha256=%s\n2\n"
+             "--- !x.org/v2/b.yes#sha256=%s\n[true]\n", hab, hab, hab);
+    r = pub_run(s, &sh, NULL, 0);
+    CHECK(r.st == OYLNG_OK && r.docs == 3 && r.type == OYLNG_T_SEQUENCE && r.how == OYLNG_TYPED_PUBLISHED &&
+          !strcmp(r.name, "b"), "published, three documents: %s", r.err);
+    CHECK(sh.calls == 2, "a name looked up once a stream: %d lookups", sh.calls);
+    CHECK(!strcmp(sh.addr, "x.org/v2/b.yes"), "the address, the name before #: %s", sh.addr);
+
+    /* without a lookup, it stamps nothing, and the application's schema
+       types it */
+    oylng_schema *app = oylng_schema_new("%YAML 2.0\n--- &\nr: !str\n", 24, S("r"), 0);
+    snprintf(s, sizeof s, "%%YAML 2.0\n--- !x.org/a.yes#sha256=%s\n1\n", hab);
+    r = pub_run(s, NULL, app, 0);
+    CHECK(r.st == OYLNG_OK && r.type == OYLNG_T_STR && r.how == OYLNG_TYPED_APP, "no lookup: %s", r.err);
+    /* with one, it stamps, and the application's schema doesn't replace it */
+    sh.calls = 0;
+    r = pub_run(s, &sh, app, 0);
+    CHECK(r.st == OYLNG_OK && r.type == OYLNG_T_INT && r.how == OYLNG_TYPED_PUBLISHED, "over the app's: %s", r.err);
+    oylng_schema_free(app);
+
+    /* names that aren't published: the lookup isn't asked */
+    char up[65];
+    for (int i = 0; i < 65; i++) up[i] = (char)(hab[i] >= 'a' && hab[i] <= 'f' ? hab[i] - 32 : hab[i]);
+    const char *nots[] = { "a.yes#sha256=%s", "x.org/a.yes#sha512=%s", "x.org/a#sha256=%s", "x.org/.yes#sha256=%s",
+                           "x.org//a.yes#sha256=%s", "/a.yes#sha256=%s", "x.org/a.yes#sha256=%s0",
+                           "x.org/a.yes#sha256=%.63s", "x.org/a.yes#sha256=" };
+    for (size_t i = 0; i < sizeof nots / sizeof *nots; i++) {
+        int k = snprintf(s, sizeof s, "%%YAML 2.0\n--- !");
+        k += snprintf(s + k, sizeof s - k, nots[i], hab);
+        snprintf(s + k, sizeof s - k, "\n1\n");
+        sh.calls = 0;
+        r = pub_run(s, &sh, NULL, 0);
+        CHECK(r.st == OYLNG_OK && r.how == OYLNG_TYPED_NOT && sh.calls == 0, "not published, %s: %s", nots[i], r.err);
+    }
+    snprintf(s, sizeof s, "%%YAML 2.0\n--- !x.org/a.yes#sha256=%s\n1\n", up);
+    sh.calls = 0;
+    r = pub_run(s, &sh, NULL, 0);
+    CHECK(r.st == OYLNG_OK && r.how == OYLNG_TYPED_NOT && sh.calls == 0, "upper case hex: %s", r.err);
+
+    /* a file that can't be had, or doesn't hash to the name, refuses the
+       document, at the stamp */
+    char zero[65];
+    memset(zero, '0', 64);
+    zero[64] = '\0';
+    snprintf(s, sizeof s, "%%YAML 2.0\n--- !x.org/a.yes#sha256=%s\n1\n", zero);
+    r = pub_run(s, &sh, NULL, 0);
+    CHECK(r.st == OYLNG_ERR_SCHEMA && !strncmp(r.err, "/: the application can't get x.org/a.yes", 40) &&
+          r.mark.line == 2 && r.mark.col == 6, "can't get it: %zu:%zu: %s", r.mark.line, r.mark.col, r.err);
+    /* a lookup that gives other bytes than it was asked for: a space more */
+    snprintf(s, sizeof s, "%%YAML 2.0\n---\n0\n--- !x.org/a.yes#sha256=%s\n1\n", hab);
+    shelf liar = { .files = { "%YAML 2.0\n--- &\na: !int\nb: [!bool, ...]\n " }, .any = true };
+    r = pub_run(s, &liar, NULL, 0);
+    CHECK(r.st == OYLNG_ERR_SCHEMA && r.docs == 1 && !strcmp(r.err, "/: x.org/a.yes doesn't hash to its name") &&
+          r.mark.line == 4 && r.mark.col == 6, "a lookup that lies: %zu:%zu: %s", r.mark.line, r.mark.col, r.err);
+
+    /* a file that isn't good refuses the schema, naming its address */
+    const char *bad[] = {
+        "%YAML 2.0\n--- &\na: !int\n...\n",
+        "%YAML 2.0\n--- &\na: !int\n...\nafter\n",
+        "%YAML 2.0\n--- &\na: !int\n---\n1\n",
+        "%YAML 2.0\n--- &\na: !int\n--- &\nb: !int\n",
+        "--- &\na: !int\n",
+        "%YAML 2.0\n--- &\na: !nothing\n",
+        "%YAML 2.0\n--- &\nb: !int\n",
+        "",
+    };
+    const char *why[] = { "one table and nothing else", "one table and nothing else", "one table and nothing else",
+                          "one table and nothing else", "starts with the line %YAML 2.0", "nothing", "has no entry a",
+                          "starts with the line %YAML 2.0" };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        shelf one = { .files = { bad[i] } };
+        hex_of(bad[i], strlen(bad[i]), h);
+        snprintf(s, sizeof s, "%%YAML 2.0\n--- !x.org/a.yes#sha256=%s\n1\n", h);
+        r = pub_run(s, &one, NULL, 0);
+        CHECK(r.st == OYLNG_ERR_SCHEMA && !strncmp(r.err, "x.org/a.yes", 11) && strstr(r.err, why[i]) &&
+              r.mark.line == 2, "bad file %zu: %zu:%zu: %s", i, r.mark.line, r.mark.col, r.err);
+    }
+
+    /* the file is a stream of its own, under the parser's limit: a stream
+       of 200 holds the stamp, not a file of 300 */
+    int k = snprintf(t, sizeof t, "%%YAML 2.0\n--- &\na: !int\n");
+    while (k < 300) k += snprintf(t + k, sizeof t - k, "x%d: !str\n", k);
+    shelf big = { .files = { t } };
+    hex_of(t, strlen(t), h);
+    snprintf(s, sizeof s, "%%YAML 2.0\n--- !x.org/a.yes#sha256=%s\n1\n", h);
+    r = pub_run(s, &big, NULL, 200);
+    CHECK(r.st == OYLNG_ERR_SCHEMA && !strncmp(r.err, "x.org/a.yes:", 12), "past the limit: %s", r.err);
+    r = pub_run(s, &big, NULL, 400);
+    CHECK(r.st == OYLNG_OK && r.type == OYLNG_T_INT, "under the limit: %s", r.err);
+
+    /* the stream's own table is not the file's */
+    snprintf(s, sizeof s, "%%YAML 2.0\n--- &\na: !str\nb: !str\n--- !x.org/a.yes#sha256=%s\n1\n--- !a\n1\n", hab);
+    r = pub_run(s, &sh, NULL, 0);
+    CHECK(r.st == OYLNG_OK && r.docs == 2 && r.type == OYLNG_T_STR && r.how == OYLNG_TYPED_STAMP, "two tables: %s", r.err);
+    free(sh.copy);
 }
 
 static void api(void) {
@@ -641,6 +849,8 @@ static void api(void) {
           "a global name stamps nothing");
     oylng_typed_free(y);
     oylng_parser_free(p);
+
+    published_names();
 }
 
 int main(int argc, char **argv) {
