@@ -276,7 +276,43 @@ bool         oylng__node_shared(const oylng_tree *t, oylng_node n);
 /* The number of the pair whose key is key in mapping map, or UINT32_MAX */
 uint32_t     oylng__node_find(const oylng_tree *t, oylng_node map, oylng_str key);
 
+/* A node of a tree the emitter builds, in document order: a string's text,
+ * at off in the text given, and whether it is plain; a collection's
+ * children, a mapping's keys and values both counted */
+typedef struct {
+    uint8_t  kind;    /* oylng_kind */
+    bool     plain;
+    uint32_t n;
+    size_t   off, len;
+} oylng__tnew;
+/* The tree of the n nodes at nd: OYLNG_ERR_MEMORY or OYLNG_ERR_LIMIT if it
+ * can't be made. Its marks are all 0. */
+oylng_status oylng__tree_make(const oylng__tnew *nd, size_t n, const char *text, oylng_tree **out);
+/* String node n written as s, plain or not: false if memory runs out */
+bool         oylng__tree_set_str(oylng_tree *t, oylng_node n, const char *s, size_t len, bool plain);
+
 /* Fails the emitter, as its own errors do (oylng_emitter.c) */
 oylng_status oylng__emitter_fail(oylng_emitter *e, oylng_status st, const char *msg);
+
+/* What the emitter gives the typer, to choose how each string a schema
+ * types is written (part 2, section 13): its spelling k, from 0 on, false
+ * when there is none left; NULL if value v of t, node read with that
+ * spelling, or a collection as typed, is what was given, else why not;
+ * and what was given, for a message */
+typedef struct {
+    void *ctx;
+    bool (*next)(void *ctx, uint32_t node, unsigned k, oylng_str *text, bool *plain);
+    const char *(*fits)(void *ctx, uint32_t node, const struct oylng_typed *t, uint32_t v);
+    void (*desc)(void *ctx, uint32_t node, char *buf, size_t n);
+} oylng__speller;
+/* Types tree t, which it takes, with schema s, as a parser would type it
+ * with s for its application's schema, each string given the first of its
+ * spellings that reads back as given (oylng_typed.c). On OYLNG_OK, *out
+ * holds it, the tree with its strings spelled so; else msg says why. */
+struct oylng_schema;
+oylng_status oylng__type_emit(const struct oylng_schema *s, oylng_tree *t, const oylng__speller *sp,
+                              struct oylng_typed **out, char *msg, size_t msglen);
+/* How many values a typed document has */
+size_t       oylng__typed_count(const struct oylng_typed *t);
 
 #endif /* OYLNG_INTERNAL_H */

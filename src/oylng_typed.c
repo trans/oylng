@@ -16,6 +16,12 @@
  * Below a `!**` (section 10), its rules are the scope: a key the mapping
  * type at its place doesn't take is looked up in them, and a value no rule
  * picks out is walked, its scalars typed with the rules' !*, or strings.
+ *
+ * For the emitter (section 13), a tree it built is typed with no parser,
+ * and each string is typed once for each of its spellings, in turn, until
+ * one reads as what the emitter was given; a refusal on trial is caught.
+ * A string decides nothing above it but by its text (a union of mappings
+ * chooses by keys and literals), so it can be spelled where it is typed.
  */
 
 #include "oylng_yes.h"
@@ -103,10 +109,23 @@ typedef struct {
     size_t            capbfl;
     jmp_buf           jb;
     oylng_status      st;
+    /* emitting (section 13): each string's spellings, tried in turn, a
+       refusal on trial going to tjb; and with no parser, the error */
+    const oylng__speller *E;
+    bool              trial;
+    unsigned          trial_k;
+    jmp_buf           tjb;
+    char              why0[160];
+    char             *msg;
+    size_t            msglen;
 } typer;
 
 static _Noreturn void nomem(typer *R) {
-    R->st = oylng__parser_fail(R->P, OYLNG_ERR_MEMORY, "out of memory");
+    if (R->P) R->st = oylng__parser_fail(R->P, OYLNG_ERR_MEMORY, "out of memory");
+    else {
+        R->st = OYLNG_ERR_MEMORY;
+        snprintf(R->msg, R->msglen, "out of memory");
+    }
     longjmp(R->jb, 1);
 }
 
@@ -130,11 +149,22 @@ static void *room(typer *R, void *p, size_t *cap, size_t need, size_t elem) {
  * mapping's, as the checker gives it. */
 static _Noreturn void refuse_as(typer *R, oylng_status st, uint32_t node, const char *fmt, ...) {
     char path[160] = "", what[200];
+    if (R->trial && st == OYLNG_ERR_SCHEMA) {   /* a spelling tried: the first's why is kept */
+        if (!R->trial_k) {
+            va_list ap;
+            va_start(ap, fmt);
+            vsnprintf(R->why0, sizeof R->why0, fmt, ap);
+            va_end(ap);
+        }
+        R->trial = false;
+        longjmp(R->tjb, 1);
+    }
     size_t pl = 0, nf = R->nf;
     if (nf) {
         const frame *f = &R->f[nf - 1];
-        if (oylng_node_kind(R->T, f->node) == OYLNG_NODE_MAPPING && f->i < oylng_node_count(R->T, f->node) &&
-            oylng_node_key(R->T, f->node, f->i) == node)
+        if (f->node == node ||   /* a collection just opened, at fault itself */
+            (oylng_node_kind(R->T, f->node) == OYLNG_NODE_MAPPING && f->i < oylng_node_count(R->T, f->node) &&
+             oylng_node_key(R->T, f->node, f->i) == node))
             nf--;
     }
     for (size_t i = 0; i < nf && pl < sizeof path - 8; i++) {
@@ -153,7 +183,11 @@ static _Noreturn void refuse_as(typer *R, oylng_status st, uint32_t node, const 
     va_end(ap);
     char msg[400];
     snprintf(msg, sizeof msg, "%s: %s", pl ? path : "/", what);
-    R->st = oylng__parser_fail_at(R->P, st, oylng_node_mark(R->T, node).offset, msg);
+    if (R->P) R->st = oylng__parser_fail_at(R->P, st, oylng_node_mark(R->T, node).offset, msg);
+    else {
+        R->st = st;
+        snprintf(R->msg, R->msglen, "%s", msg);
+    }
     longjmp(R->jb, 1);
 }
 
@@ -223,7 +257,7 @@ typedef struct {
     char       why[120];
 } scalar;
 
-static bool int_spelling(const char *s, size_t n) {
+bool oylng__int_spelling(const char *s, size_t n) {
     size_t i = n && s[0] == '-';
     if (i >= n) return false;
     if (s[i] == '0') return i + 1 == n;
@@ -232,7 +266,7 @@ static bool int_spelling(const char *s, size_t n) {
     return true;
 }
 
-static bool float_spelling(const char *s, size_t n) {
+bool oylng__float_spelling(const char *s, size_t n) {
     size_t i = n && s[0] == '-';
     if (i >= n || s[i] < '0' || s[i] > '9') return false;
     if (s[i] == '0') i++;
@@ -397,7 +431,7 @@ static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain,
     switch (x->std) {
     case STD_INT:
     case STD_BIGINT:
-        if (!int_spelling(s, n)) break;
+        if (!oylng__int_spelling(s, n)) break;
         /* a limit first, on the number as written (section 4.4) */
         oylng__num_read(s, n, &num);
         if (outside(x, &num)) {
@@ -415,7 +449,7 @@ static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain,
         out->type = OYLNG_T_INT;
         return MATCH;
     case STD_FLOAT:
-        if (!float_spelling(s, n)) break;
+        if (!oylng__float_spelling(s, n)) break;
         oylng__num_read(s, n, &num);
         if (outside(x, &num)) {
             snprintf(out->why, sizeof out->why, "'%.*s' is out of range", SHOW(n), s);
@@ -428,7 +462,7 @@ static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain,
         out->type = OYLNG_T_FLOAT;
         return MATCH;
     case STD_DECIMAL:
-        if (!float_spelling(s, n)) break;
+        if (!oylng__float_spelling(s, n)) break;
         oylng__num_read(s, n, &num);
         if ((x->flags & XF_PREC) && !oylng__num_fits(&num, x->u.std.prec, x->u.std.scale)) {
             snprintf(out->why, sizeof out->why, "'%.*s' has too many digits for %llu:%llu", SHOW(n), s,
@@ -702,7 +736,10 @@ static uint32_t walk(typer *R, uint32_t node, const xt *scope) {
 
 /* The value at node typed with t, or walked if t is NULL: once for each
  * type and nearest `!**`, if node is shared */
+static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope, bool opt);
+
 static uint32_t conv(typer *R, const xt *t, uint32_t node, const xt *scope) {
+    if (R->E && oylng_node_kind(R->T, node) == OYLNG_NODE_STRING) return spell(R, t, node, scope, false);
     const xt *k = t ? t->kind_of : &WALK;
     bool shared = oylng__node_shared(R->T, node);
     if (shared && R->capmemo) {
@@ -715,6 +752,10 @@ static uint32_t conv(typer *R, const xt *t, uint32_t node, const xt *scope) {
     if (R->typed > R->limit)
         refuse_as(R, OYLNG_ERR_LIMIT, node, "typed passes the size limit of %llu", (unsigned long long)R->limit);
     uint32_t v = t ? convert(R, t, node, scope) : walk(R, node, scope);
+    if (R->E) {   /* a collection the emitter was given: its name, if it was an object's */
+        const char *why = R->E->fits(R->E->ctx, node, R->Y, v);
+        if (why) refuse_as(R, OYLNG_ERR_EMIT, node, "%s", why);
+    }
     if (shared) {
         if (2 * (R->nmemo + 1) > R->capmemo) {
             size_t nc = R->capmemo ? R->capmemo * 2 : 256;
@@ -753,14 +794,70 @@ static bool no_value(const typer *R, uint32_t vn) {
            !oylng_node_text(R->T, vn).len;
 }
 
+/* The value of a key the type names, at vn */
+static uint32_t field(typer *R, const xfield *fd, uint32_t vn, const xt *scope) {
+    if (R->E && oylng_node_kind(R->T, vn) == OYLNG_NODE_STRING) return spell(R, fd->type, vn, scope, fd->opt);
+    if (fd->opt && no_value(R, vn)) return new_val(R, OYLNG_T_NULL, vn, NULL);
+    return conv(R, fd->type, vn, scope);
+}
+
+/* ── Spelling, for the emitter (section 13) ──────────────── */
+
+/* String node read as written now, as a parser reads it: its value, or
+ * NONE if that refuses the document */
+static uint32_t attempt(typer *R, const xt *t, uint32_t node, const xt *scope, bool opt) {
+    if (setjmp(R->tjb)) return NONE;
+    R->trial = true;
+    uint32_t v = opt && no_value(R, node) ? new_val(R, OYLNG_T_NULL, node, NULL)
+               : t                        ? convert(R, t, node, scope)
+                                          : walk(R, node, scope);
+    R->trial = false;
+    return v;
+}
+
+/* String node typed with t (walked if NULL), written in the first of its
+ * spellings that reads back as what the emitter was given. A string
+ * decides nothing above it but by its text, so it is spelled where it is
+ * typed. */
+static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope, bool opt) {
+    oylng_typed *Y = R->Y;
+    const oylng__speller *E = R->E;
+    char first[48] = "";
+    R->why0[0] = 0;
+    for (unsigned k = 0;; k++) {
+        oylng_str s;
+        bool plain;
+        if (!E->next(E->ctx, node, k, &s, &plain)) {
+            char what[96];
+            E->desc(E->ctx, node, what, sizeof what);
+            refuse_as(R, OYLNG_ERR_EMIT, node, "no spelling of %s reads back: written %s, %s", what, first,
+                      R->why0);
+        }
+        if (!k) {
+            size_t n = s.len > 40 ? 40 : s.len;
+            if (!s.len) snprintf(first, sizeof first, "empty");
+            else snprintf(first, sizeof first, "%s%.*s%s%s", plain ? "" : "\"", (int)n, s.data,
+                          n < s.len ? "..." : "", plain ? "" : "\"");
+        }
+        if (!oylng__tree_set_str((oylng_tree *)R->T, node, s.data, s.len, plain)) nomem(R);
+        size_t nv = Y->nv, nb = Y->nb;
+        R->trial_k = k;
+        uint32_t v = attempt(R, t, node, scope, opt);
+        if (v != NONE) {
+            const char *why = E->fits(E->ctx, node, Y, v);
+            if (!why) return v;
+            if (!k) snprintf(R->why0, sizeof R->why0, "%s", why);
+        }
+        Y->nv = nv;
+        Y->nb = nb;
+    }
+}
+
 /* A key the mapping type at its place doesn't take, below a `!**`: looked
  * up in its rules, the closest, and nowhere else (section 10) */
 static uint32_t under(typer *R, uint32_t kn, oylng_str k, uint32_t vn, const xt *scope) {
     const xfield *fd = oylng__field(R->S, scope, k.data, k.len);
-    if (fd) {
-        if (fd->opt && no_value(R, vn)) return new_val(R, OYLNG_T_NULL, vn, NULL);
-        return conv(R, fd->type, vn, scope);
-    }
+    if (fd) return field(R, fd, vn, scope);
     for (uint32_t r = 0; r < scope->u.map.nrows; r++)
         if (key_fits(R, scope->u.map.rows[r].key, kn, k)) return conv(R, scope->u.map.rows[r].val, vn, scope);
     return anywhere(R, vn, scope);
@@ -778,10 +875,7 @@ static uint32_t child(typer *R, frame *f) {
     oylng_str k = oylng_node_text(R->T, kn);
     if (x) {
         const xfield *fd = oylng__field(R->S, x, k.data, k.len);
-        if (fd) {
-            if (fd->opt && no_value(R, vn)) return new_val(R, OYLNG_T_NULL, vn, NULL);
-            return conv(R, fd->type, vn, scope);
-        }
+        if (fd) return field(R, fd, vn, scope);
         for (uint32_t r = 0; r < x->u.map.nrows; r++)
             if (key_fits(R, x->u.map.rows[r].key, kn, k)) return conv(R, x->u.map.rows[r].val, vn, scope);
         if (x->u.map.other) return conv(R, x->u.map.other, vn, scope);
@@ -1184,6 +1278,38 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
     *out = Y;
     return OYLNG_OK;
 }
+
+/* ── Typing for the emitter (section 13) ─────────────────── */
+
+oylng_status oylng__type_emit(const oylng_schema *sc, oylng_tree *T, const oylng__speller *sp, oylng_typed **out,
+                              char *msg, size_t msglen) {
+    *out = NULL;
+    oylng_typed *Y = calloc(1, sizeof *Y);
+    if (!Y) {
+        oylng_tree_free(T);
+        snprintf(msg, msglen, "out of memory");
+        return OYLNG_ERR_MEMORY;
+    }
+    Y->T = T;
+    Y->how = OYLNG_TYPED_APP;
+    typer R = { .Y = Y, .S = sc->ctx, .T = T, .limit = UINT64_MAX, .E = sp, .msg = msg, .msglen = msglen };
+    bool ok = type_tree(&R, sc->root);
+    free(R.f);
+    free(R.memo);
+    free(R.nms);
+    free(R.ok);
+    free(R.req);
+    free(R.canon);
+    oylng__rxscr_free(&R.rxs);
+    if (!ok) {
+        oylng_typed_free(Y);
+        return R.st;
+    }
+    *out = Y;
+    return OYLNG_OK;
+}
+
+size_t oylng__typed_count(const oylng_typed *Y) { return Y ? Y->nv : 0; }
 
 /* ── Public API ──────────────────────────────────────────── */
 

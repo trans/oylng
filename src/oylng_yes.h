@@ -42,6 +42,10 @@ bool oylng__num_fits(const oylng__num *a, uint64_t prec, uint64_t scale);
 void oylng__num_of_count(uint64_t n, char *buf, oylng__num *out);
 /* !int's spelling as -2^63 to 2^64-1: false if outside */
 bool oylng__int(const char *s, size_t n, bool *neg, uint64_t *mag);
+/* !int's standard spelling, -?(0|[1-9][0-9]*), and !float's, which adds
+ * a fraction and an exponent (oylng_typed.c) */
+bool oylng__int_spelling(const char *s, size_t n);
+bool oylng__float_spelling(const char *s, size_t n);
 /* JSON's number spelling as the nearest binary64: false if too large */
 bool oylng__float(const char *s, size_t n, double *f);
 /* An RFC 3339 full-date, or date-time if full: 1, 0 if it isn't one, -1

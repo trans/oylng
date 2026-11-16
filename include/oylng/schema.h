@@ -20,7 +20,9 @@
  * parser a lookup (oylng_parser_set_lookup); without one it stamps
  * nothing, as any other global name. An application's code bound to a
  * named type (oylng_parser_bind, section 12) makes an object of each value
- * of that type, once the document is typed.
+ * of that type, once the document is typed. An emitter given a schema
+ * (oylng_emitter_set_schema, section 13) writes typed data so that the
+ * schema reads it back as it was given, or refuses the document.
  */
 
 #ifndef OYLNG_SCHEMA_H
@@ -239,6 +241,68 @@ OYLNG_API void *oylng_value_object(const oylng_typed *t, oylng_value v);
 /** The same, and the document no longer holds it: oylng_typed_free won't
  *  let it go */
 OYLNG_API void *oylng_value_take(oylng_typed *t, oylng_value v);
+
+/* ── Emitting typed data (section 13) ───────────────────── */
+
+/** Writes each document from the next on so that a parser given @p s as
+ *  its application's schema reads back what the emitter was given: a
+ *  string for oylng_emit_scalar, a value of a type for the calls below. A
+ *  document is held until it ends, and the output stops short of it till
+ *  then. It is typed with s, as the parser would type it, and each scalar
+ *  is written in the first of its spellings that reads back as given. A
+ *  string is plain, else quoted. A number is in its standard spelling,
+ *  then with a +, then with zeros before its digits, and for a float after
+ *  its point too, as a pattern may ask (section 4.5), so 5 under `!signed`
+ *  is +5. Null is null, ~, or empty. What reads back is a value of the
+ *  type given, the same value, and for an object, of its named type; an
+ *  integer may read as OYLNG_T_INT or OYLNG_T_BIGINT. Where s doesn't type
+ *  a value (OYLNG_T_ANY), any value reads back. If one doesn't, or the
+ *  document doesn't fit s, the document is refused, OYLNG_ERR_EMIT with
+ *  the path to the value, and none of it is written. @p s must have a
+ *  root, else OYLNG_ERR_INPUT, and outlive its use; NULL, the default, for
+ *  none, when a value is written in its standard spelling and nothing is
+ *  held. Set it between documents. */
+OYLNG_API oylng_status oylng_emitter_set_schema(oylng_emitter *e, const oylng_schema *s);
+
+/** Values of the standard types, where a node goes: a key is a string,
+ *  so in a key's place they are OYLNG_ERR_EMIT. A float must be finite,
+ *  as YAML 2.0 writes no other. */
+OYLNG_API oylng_status oylng_emit_int(oylng_emitter *e, int64_t v);
+OYLNG_API oylng_status oylng_emit_uint(oylng_emitter *e, uint64_t v);
+OYLNG_API oylng_status oylng_emit_float(oylng_emitter *e, double v);
+OYLNG_API oylng_status oylng_emit_bool(oylng_emitter *e, bool v);
+OYLNG_API oylng_status oylng_emit_null(oylng_emitter *e);
+/** OYLNG_T_BIGINT or OYLNG_T_DECIMAL, its text in the standard spelling,
+ *  as oylng_value_text gives it: digits with no + and no leading zeros,
+ *  and for a decimal, a fraction and an exponent if it has them. */
+OYLNG_API oylng_status oylng_emit_number(oylng_emitter *e, oylng_type type, oylng_str text);
+/** OYLNG_T_DATE, of which the date is written, or OYLNG_T_DATETIME, which
+ *  must be one RFC 3339 writes: one this library reads back the same */
+OYLNG_API oylng_status oylng_emit_datetime(oylng_emitter *e, oylng_type type, const oylng_datetime *dt);
+/** OYLNG_T_BINARY, written in base64 */
+OYLNG_API oylng_status oylng_emit_bytes(oylng_emitter *e, oylng_str bytes);
+/** Value @p v of @p t, as typed, and everything in it: a typed document
+ *  written again. Its scalars untyped (OYLNG_T_ANY) are strings. */
+OYLNG_API oylng_status oylng_emit_value(oylng_emitter *e, const oylng_typed *t, oylng_value v);
+
+/** An application's way back for a named type (section 13): it writes
+ *  @p object with @p e, as the one value of the type it is, a mapping,
+ *  say, and returns NULL; or it returns why it can't, which is copied,
+ *  and fails the emitter. */
+typedef const char *(*oylng_unbind_fn)(void *ctx, oylng_emitter *e, const void *object);
+
+/** Binds @p fn to the name @p name, for oylng_emit_object, which gives it
+ *  @p ctx. Binding a name again replaces its binding, and @p fn NULL
+ *  unbinds it. OYLNG_ERR_MEMORY if memory runs out, and the emitter is as
+ *  it was. */
+OYLNG_API oylng_status oylng_emitter_bind(oylng_emitter *e, oylng_str name, oylng_unbind_fn fn, void *ctx);
+
+/** Writes @p object with the code bound to @p name, which must write one
+ *  value, where a node goes. With a schema, it must read back as of that
+ *  name (oylng_value_name), so that a parser's binding of the name gets
+ *  it, or the document is refused. OYLNG_ERR_INPUT if nothing is bound to
+ *  the name, and the emitter is as it was. */
+OYLNG_API oylng_status oylng_emit_object(oylng_emitter *e, oylng_str name, const void *object);
 
 #ifdef __cplusplus
 }

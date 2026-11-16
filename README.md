@@ -219,6 +219,34 @@ hold: a key given twice in a mapping, a collection as a key, invalid
 UTF-8, a bad name, or events out of order. `oylng_emitter_take` hands over
 the output so far, so a large stream needn't be held whole.
 
+With a schema (part 2, section 13), the emitter writes typed data so that
+the same schema reads it back unchanged. `oylng_emitter_set_schema` holds
+each document until it ends, types it as a parser would, and writes each
+scalar in the first spelling that reads back as what it was given: a
+string quoted where its type would read it plain as something else, a
+number as its type reads it. A document with a value it can't write so is
+refused, with the path to the value, and none of it is written.
+
+```c
+const char *app = "%YAML 2.0\n--- &\nsigned: !int(/[-+][0-9]+/)\nrow:\n  id: {!|: [!int, !str]}\n  at: !signed\n";
+oylng_schema *sc = oylng_schema_new(app, strlen(app), (oylng_str){ "row", 3 }, 0);
+oylng_emitter_set_schema(em, sc);
+oylng_emit_doc_start(em, (oylng_str){ NULL, 0 });
+oylng_emit_map_start(em, false);
+oylng_emit_scalar(em, (oylng_str){ "id", 2 });
+oylng_emit_scalar(em, (oylng_str){ "3", 1 });       /* a string: id: '3' */
+oylng_emit_scalar(em, (oylng_str){ "at", 2 });
+oylng_emit_int(em, 5);                              /* at: +5 */
+oylng_emit_map_end(em);
+oylng_emit_doc_end(em);                             /* written now, or refused */
+```
+
+`oylng_emit_value` writes a typed document again. `oylng_emitter_bind`
+and `oylng_emit_object` give a bound type its way back: the application's
+code writes its object as the value its entry takes, and the emitter
+checks that it reads back as of that name, so that a parser's binding of
+the name gets it.
+
 The `oylng` tool prints a stream's events, the stream as JSON, or the
 stream written again, with its references and merges resolved:
 

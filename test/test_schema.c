@@ -133,6 +133,145 @@ static bool same(const oylng_typed *y, oylng_value v, const oylng_tree *j, oylng
     }
 }
 
+/* ── Typed values compared, for emitting (section 13) ────── */
+
+static bool same_nodes(const oylng_tree *a, oylng_node n, const oylng_tree *b, oylng_node m) {
+    oylng_kind k = oylng_node_kind(a, n);
+    if (k != oylng_node_kind(b, m)) return false;
+    if (k == OYLNG_NODE_STRING) {
+        oylng_str x = oylng_node_text(a, n), y = oylng_node_text(b, m);
+        return eq(x, y.data, y.len);
+    }
+    size_t c = oylng_node_count(a, n);
+    if (c != oylng_node_count(b, m)) return false;
+    for (size_t i = 0; i < c; i++) {
+        if (k == OYLNG_NODE_SEQUENCE) {
+            if (!same_nodes(a, oylng_node_item(a, n, i), b, oylng_node_item(b, m, i))) return false;
+            continue;
+        }
+        oylng_str x = oylng_node_text(a, oylng_node_key(a, n, i)), y = oylng_node_text(b, oylng_node_key(b, m, i));
+        if (!eq(x, y.data, y.len) || !same_nodes(a, oylng_node_value(a, n, i), b, oylng_node_value(b, m, i)))
+            return false;
+    }
+    return true;
+}
+
+/* Whether two typed values are the same: type, value and name */
+static bool same_typed(const oylng_typed *a, oylng_value v, const oylng_typed *b, oylng_value w) {
+    oylng_type t = oylng_value_type(a, v);
+    if (t != oylng_value_type(b, w)) return false;
+    oylng_str na = oylng_value_name(a, v), nb = oylng_value_name(b, w);
+    if (!na.data != !nb.data || (na.data && !eq(na, nb.data, nb.len))) return false;
+    oylng_str x = oylng_value_text(a, v), y = oylng_value_text(b, w);
+    switch (t) {
+    case OYLNG_T_ANY:
+        return same_nodes(oylng_typed_tree(a), oylng_value_node(a, v), oylng_typed_tree(b), oylng_value_node(b, w));
+    case OYLNG_T_SEQUENCE:
+    case OYLNG_T_MAPPING: {
+        size_t c = oylng_value_count(a, v);
+        if (c != oylng_value_count(b, w)) return false;
+        for (size_t i = 0; i < c; i++) {
+            if (t == OYLNG_T_SEQUENCE) {
+                if (!same_typed(a, oylng_value_item(a, v, i), b, oylng_value_item(b, w, i))) return false;
+                continue;
+            }
+            oylng_str ka = oylng_value_key(a, v, i), kb = oylng_value_key(b, w, i);
+            if (!eq(ka, kb.data, kb.len) || !same_typed(a, oylng_value_at(a, v, i), b, oylng_value_at(b, w, i)))
+                return false;
+        }
+        return true;
+    }
+    case OYLNG_T_STR:
+    case OYLNG_T_BIGINT:
+    case OYLNG_T_DECIMAL:
+        return eq(x, y.data, y.len);
+    case OYLNG_T_INT: {
+        int64_t i, j;
+        uint64_t u, k;
+        bool si = oylng_value_int(a, v, &i), sj = oylng_value_int(b, w, &j);
+        if (si || sj) return si && sj && i == j;
+        return oylng_value_uint(a, v, &u) && oylng_value_uint(b, w, &k) && u == k;
+    }
+    case OYLNG_T_FLOAT: {
+        double f = oylng_value_float(a, v), g = oylng_value_float(b, w);
+        return memcmp(&f, &g, sizeof f) == 0;
+    }
+    case OYLNG_T_BOOL:
+        return oylng_value_bool(a, v) == oylng_value_bool(b, w);
+    case OYLNG_T_NULL:
+        return true;
+    case OYLNG_T_DATE:
+    case OYLNG_T_DATETIME: {
+        oylng_datetime d, e;
+        oylng_value_datetime(a, v, &d);
+        oylng_value_datetime(b, w, &e);
+        return d.year == e.year && d.month == e.month && d.day == e.day && d.hour == e.hour &&
+               d.minute == e.minute && d.second == e.second && d.nanosecond == e.nanosecond &&
+               d.offset == e.offset && d.zulu == e.zulu && d.unknown_offset == e.unknown_offset;
+    }
+    case OYLNG_T_BINARY: {
+        oylng_str p = oylng_value_bytes(a, v), q = oylng_value_bytes(b, w);
+        return eq(p, q.data, q.len);
+    }
+    default:
+        return false;
+    }
+}
+
+/* Typed document y of stream s written again, under the schema that typed
+ * it, block and then flow, and read back with it: NULL if it reads back
+ * the same, else why not */
+static const char *round_trip(const char *s, size_t n, const oylng_typed *y, char *why, size_t whyn) {
+    oylng_str name = oylng_tree_name(oylng_typed_tree(y));
+    oylng_schema *sc = NULL;
+    if (oylng_typed_how(y) == OYLNG_TYPED_STAMP) {
+        sc = oylng_schema_new(s, n, name, 0);
+        if (oylng_schema_status(sc) != OYLNG_OK) {
+            snprintf(why, whyn, "its schema: %s", oylng_schema_error(sc));
+            oylng_schema_free(sc);
+            return why;
+        }
+    } else if (oylng_typed_how(y) != OYLNG_TYPED_NOT) {
+        return NULL;   /* a published name, which isn't looked up here */
+    }
+    const char *res = NULL;
+    for (int flow = 0; flow < 2 && !res; flow++) {
+        oylng_emitter *e = oylng_emitter_new();
+        oylng_emitter_set_flow(e, flow);
+        oylng_emitter_set_schema(e, sc);
+        oylng_status st = oylng_emit_stream_start(e);
+        if (st == OYLNG_OK) st = oylng_emit_doc_start(e, name);
+        if (st == OYLNG_OK) st = oylng_emit_value(e, y, oylng_typed_root(y));
+        if (st == OYLNG_OK) st = oylng_emit_doc_end(e);
+        if (st == OYLNG_OK) st = oylng_emit_stream_end(e);
+        oylng_str out = oylng_emitter_output(e);
+        if (st != OYLNG_OK) {
+            snprintf(why, whyn, "written %s: %s", flow ? "in flow" : "in block", oylng_emitter_error(e));
+            res = why;
+        } else {
+            oylng_parser *p = oylng_parser_new(out.data, out.len);
+            oylng_typed *back;
+            st = oylng_parse_typed(p, sc, &back);
+            if (st != OYLNG_OK || !back) {
+                snprintf(why, whyn, "written %s, it doesn't read: %s\n%.*s", flow ? "in flow" : "in block",
+                         st ? oylng_parser_error(p) : "no document", (int)(out.len > 300 ? 300 : out.len), out.data);
+                res = why;
+            } else if (!same_typed(y, oylng_typed_root(y), back, oylng_typed_root(back))) {
+                snprintf(why, whyn, "written %s, it reads back otherwise:\n%.*s", flow ? "in flow" : "in block",
+                         (int)(out.len > 300 ? 300 : out.len), out.data);
+                res = why;
+            }
+            oylng_typed_free(back);
+            oylng_parser_free(p);
+        }
+        oylng_emitter_free(e);
+    }
+    oylng_schema_free(sc);
+    return res;
+}
+
+static int trips;   /* documents written again and read back */
+
 /* ── The draft's examples ────────────────────────────────── */
 
 static char *slurp(const char *path, size_t *len) {
@@ -236,6 +375,14 @@ static const char *run_example(const char *s, size_t n, const char *want, size_t
                 free(jt);
             }
         }
+        if (!res && !refused) {
+            char tw[600];
+            const char *r = round_trip(s, n, y, tw, sizeof tw);
+            if (r) {
+                snprintf(why, whyn, "%s", r);
+                res = why;
+            } else trips++;
+        }
         oylng_typed_free(y);
     }
     if (st != OYLNG_OK) {
@@ -301,7 +448,8 @@ static void examples(const char *path) {
             fprintf(stderr, "FAIL the draft's example at line %zu: %s\n", b[i].line, r);
         } else pass++;
     }
-    printf("draft: %d examples pass, %d fail\n", pass, fail);
+    printf("draft: %d examples pass, %d fail; %d documents written again read back the same\n", pass, fail,
+           trips);
     failed += fail;
     checks += pass + fail;
     free(b);
@@ -858,6 +1006,450 @@ static void bindings(void) {
     oylng_schema_free(app);
 }
 
+/* ── Emitting typed data (section 13) ───────────────────── */
+
+typedef struct { int x, y; const char *fail; int extra; } pt;
+
+static const char *unbind_point(void *ctx, oylng_emitter *e, const void *o) {
+    const pt *p = o;
+    (void)ctx;
+    if (p->fail) return p->fail;
+    for (int i = 0; i <= p->extra; i++) {
+        oylng_emit_map_start(e, false);
+        oylng_emit_scalar(e, S("x"));
+        oylng_emit_int(e, p->x);
+        oylng_emit_scalar(e, S("y"));
+        oylng_emit_int(e, p->y);
+        oylng_emit_map_end(e);
+    }
+    return NULL;
+}
+
+/* A typed value in short: s3 i5 I5 f0.5 d19.99 btrue n D2001-02-03
+ * T(as written) x(hex) A(untyped, as written) {k:v,...} [v,...], an entry's
+ * name after an @ */
+static void brief(char *o, size_t cap, const oylng_typed *y, oylng_value v) {
+    size_t k = strlen(o);
+    if (k + 64 >= cap) return;
+    oylng_str t = oylng_value_text(y, v);
+    int64_t i;
+    uint64_t u;
+    switch (oylng_value_type(y, v)) {
+    case OYLNG_T_ANY: {
+        oylng_node n = oylng_value_node(y, v);
+        const oylng_tree *tr = oylng_typed_tree(y);
+        if (oylng_node_kind(tr, n) == OYLNG_NODE_STRING) {
+            oylng_str s = oylng_node_text(tr, n);
+            snprintf(o + k, cap - k, "A%.*s", (int)s.len, s.data);
+        } else snprintf(o + k, cap - k, "A%s", oylng_node_kind(tr, n) == OYLNG_NODE_MAPPING ? "{}" : "[]");
+        break;
+    }
+    case OYLNG_T_STR: snprintf(o + k, cap - k, "s%.*s", (int)t.len, t.data); break;
+    case OYLNG_T_INT:
+        if (oylng_value_int(y, v, &i)) snprintf(o + k, cap - k, "i%lld", (long long)i);
+        else if (oylng_value_uint(y, v, &u)) snprintf(o + k, cap - k, "i%llu", (unsigned long long)u);
+        break;
+    case OYLNG_T_BIGINT: snprintf(o + k, cap - k, "I%.*s", (int)t.len, t.data); break;
+    case OYLNG_T_FLOAT: snprintf(o + k, cap - k, "f%.17g", oylng_value_float(y, v)); break;
+    case OYLNG_T_DECIMAL: snprintf(o + k, cap - k, "d%.*s", (int)t.len, t.data); break;
+    case OYLNG_T_BOOL: snprintf(o + k, cap - k, "b%s", oylng_value_bool(y, v) ? "true" : "false"); break;
+    case OYLNG_T_NULL: snprintf(o + k, cap - k, "n"); break;
+    case OYLNG_T_DATE: snprintf(o + k, cap - k, "D%.*s", (int)t.len, t.data); break;
+    case OYLNG_T_DATETIME: snprintf(o + k, cap - k, "T%.*s", (int)t.len, t.data); break;
+    case OYLNG_T_BINARY: {
+        oylng_str b = oylng_value_bytes(y, v);
+        o[k++] = 'x';
+        for (size_t j = 0; j < b.len && k + 3 < cap; j++, k += 2) snprintf(o + k, cap - k, "%02x", (unsigned char)b.data[j]);
+        o[k] = 0;
+        break;
+    }
+    case OYLNG_T_SEQUENCE:
+    case OYLNG_T_MAPPING: {
+        bool map = oylng_value_type(y, v) == OYLNG_T_MAPPING;
+        snprintf(o + k, cap - k, "%s", map ? "{" : "[");
+        for (size_t j = 0; j < oylng_value_count(y, v); j++) {
+            k = strlen(o);
+            if (j && k + 2 < cap) snprintf(o + k, cap - k, ",");
+            if (map) {
+                oylng_str key = oylng_value_key(y, v, j);
+                k = strlen(o);
+                snprintf(o + k, cap - k, "%.*s:", (int)key.len, key.data);
+            }
+            brief(o, cap, y, map ? oylng_value_at(y, v, j) : oylng_value_item(y, v, j));
+        }
+        k = strlen(o);
+        snprintf(o + k, cap - k, "%s", map ? "}" : "]");
+        break;
+    }
+    default: break;
+    }
+    oylng_str nm = oylng_value_name(y, v);
+    k = strlen(o);
+    if (nm.data && k + nm.len + 2 < cap) snprintf(o + k, cap - k, "@%.*s", (int)nm.len, nm.data);
+}
+
+/* One document written by a script, under the schema of the table yaml
+ * (none if NULL) with root, then read back with it. The script's words: {
+ * } [ ] a block collection, {{ [[ a flow one; s:text a string, _ for a
+ * space; i: u: f: B: D: (bigint, decimal) a number; b:1 b:0; n null; x:hex
+ * bytes; o:name a point object, o!name one that refuses, o2name one that
+ * writes two. The output and the error in out and err, what it reads
+ * back as in back. */
+typedef struct { oylng_status st; char out[600], err[400], back[400]; } emitted;
+
+static emitted emit_doc(const char *yaml, const char *root, const char *script, bool flow) {
+    emitted r = { 0 };
+    oylng_schema *sc = NULL;
+    char tx[600];
+    if (yaml) {
+        snprintf(tx, sizeof tx, "%%YAML 2.0\n--- &\n%s", yaml);
+        sc = oylng_schema_new(tx, strlen(tx), S(root), 0);
+        if (oylng_schema_status(sc) != OYLNG_OK) {
+            snprintf(r.err, sizeof r.err, "schema: %s", oylng_schema_error(sc));
+            r.st = OYLNG_ERR_INPUT;
+            oylng_schema_free(sc);
+            return r;
+        }
+    }
+    oylng_emitter *e = oylng_emitter_new();
+    oylng_emitter_set_flow(e, flow);
+    if (sc) oylng_emitter_set_schema(e, sc);
+    oylng_emitter_bind(e, S("point"), unbind_point, NULL);
+    oylng_emitter_bind(e, S("sweep"), unbind_point, NULL);   /* written as a point */
+    oylng_status st = oylng_emit_stream_start(e);
+    if (st == OYLNG_OK) st = oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+    char w[200];
+    for (const char *q = script; st == OYLNG_OK && *q;) {
+        while (*q == ' ') q++;
+        size_t n = strcspn(q, " ");
+        if (!n) break;
+        snprintf(w, sizeof w, "%.*s", (int)n, q);
+        q += n;
+        for (char *c = w; *c; c++)
+            if (*c == '_') *c = ' ';
+        const char *a = w + 2;
+        pt p = { 1, 2, NULL, 0 };
+        if (!strcmp(w, "{")) st = oylng_emit_map_start(e, false);
+        else if (!strcmp(w, "{{")) st = oylng_emit_map_start(e, true);
+        else if (!strcmp(w, "[")) st = oylng_emit_seq_start(e, false);
+        else if (!strcmp(w, "[[")) st = oylng_emit_seq_start(e, true);
+        else if (!strcmp(w, "}")) st = oylng_emit_map_end(e);
+        else if (!strcmp(w, "]")) st = oylng_emit_seq_end(e);
+        else if (!strcmp(w, "n")) st = oylng_emit_null(e);
+        else if (w[0] == 's') st = oylng_emit_scalar(e, S(a));
+        else if (w[0] == 'i') st = oylng_emit_int(e, strtoll(a, NULL, 10));
+        else if (w[0] == 'u') st = oylng_emit_uint(e, strtoull(a, NULL, 10));
+        else if (w[0] == 'f') st = oylng_emit_float(e, strtod(a, NULL));
+        else if (w[0] == 'B') st = oylng_emit_number(e, OYLNG_T_BIGINT, S(a));
+        else if (w[0] == 'D') st = oylng_emit_number(e, OYLNG_T_DECIMAL, S(a));
+        else if (w[0] == 'b') st = oylng_emit_bool(e, *a == '1');
+        else if (w[0] == 'x') {
+            char by[64];
+            size_t m = 0;
+            for (; a[0] && a[1] && m < sizeof by; a += 2) {
+                unsigned h;
+                sscanf(a, "%2x", &h);
+                by[m++] = (char)h;
+            }
+            st = oylng_emit_bytes(e, (oylng_str){ by, m });
+        } else if (w[0] == 'o') {
+            if (w[1] == '!') p.fail = "it has no x";
+            if (w[1] == '2') p.extra = 1;
+            st = oylng_emit_object(e, S(w[1] == ':' ? a : w + 2), &p);
+        } else st = OYLNG_ERR_INPUT;
+    }
+    if (st == OYLNG_OK) st = oylng_emit_doc_end(e);
+    if (st == OYLNG_OK) st = oylng_emit_stream_end(e);
+    r.st = st;
+    oylng_str o = oylng_emitter_output(e);
+    snprintf(r.out, sizeof r.out, "%.*s", (int)o.len, o.data);
+    if (st != OYLNG_OK) snprintf(r.err, sizeof r.err, "%s", oylng_emitter_error(e) ? oylng_emitter_error(e) : "?");
+    else {
+        oylng_parser *rp = oylng_parser_new(o.data, o.len);
+        oylng_typed *y;
+        if (oylng_parse_typed(rp, sc, &y) == OYLNG_OK && y) {
+            brief(r.back, sizeof r.back, y, oylng_typed_root(y));
+            oylng_typed_free(y);
+        } else snprintf(r.back, sizeof r.back, "unread: %s", oylng_parser_error(rp));
+        oylng_parser_free(rp);
+    }
+    oylng_emitter_free(e);
+    oylng_schema_free(sc);
+    return r;
+}
+
+/* What a document is written as, and reads back as, or its refusal */
+#define WRITES(yaml, root, script, flow, text, back_)                                                        \
+    do {                                                                                                     \
+        emitted r_ = emit_doc(yaml, root, script, flow);                                                     \
+        CHECK(r_.st == OYLNG_OK && strstr(r_.out, text) && !strcmp(r_.back, back_),                          \
+              "%s: [%d] %s\n%s\nreads back %s", script, r_.st, r_.err, r_.out, r_.back);                      \
+    } while (0)
+#define REFUSES(yaml, root, script, flow, msg)                                                               \
+    do {                                                                                                     \
+        emitted r_ = emit_doc(yaml, root, script, flow);                                                     \
+        CHECK(r_.st == OYLNG_ERR_EMIT && strstr(r_.err, msg) && (!(yaml) || !strcmp(r_.out, "%YAML 2.0\n")), \
+              "%s: [%d] %s\n%s", script, r_.st, r_.err, r_.out);                                             \
+    } while (0)
+
+static void emitting(void) {
+    /* section 13: a string the type would read as something else is quoted */
+    const char *u = "n: {!|: [!int, !str]}\n";
+    WRITES(u, "n", "s:3", false, "--- '3'\n", "s3@n");
+    WRITES(u, "n", "i:3", false, "--- 3\n", "i3@n");
+    WRITES(u, "n", "s:abc", false, "--- abc\n", "sabc@n");
+    REFUSES(u, "n", "f:1.5", false, "/: no spelling of the float 1.5 reads back: written 1.5, it reads as !str");
+
+    /* and an integer is written as the type reads it, or refused */
+    const char *sg = "signed: !int(/[-+][0-9]+/)\noffsets: [!signed, ...]\n";
+    WRITES(sg, "offsets", "[ i:5 i:-3 i:0 ]", false, "- +5\n- -3\n- +0\n", "[i5@signed,i-3@signed,i0@signed]@offsets");
+    WRITES(sg, "offsets", "[ i:5 i:-3 ]", true, "[+5, -3]", "[i5@signed,i-3@signed]@offsets");
+    REFUSES(sg, "offsets", "[ i:5 s:5 ]", false, "/1: no spelling of the string '5' reads back: written 5, '5' does not match");
+    WRITES("p: !int(/[0-9]{4}/)\n", "p", "i:7", false, "--- 0007\n", "i7@p");
+    REFUSES("p: !int(/[0-9]{4}/)\n", "p", "i:12345", false, "no spelling of the integer 12345");
+    WRITES("p: !bigint(/[+][0-9]+/)\n", "p", "B:123456789012345678901234567890", false,
+           "+123456789012345678901234567890", "I123456789012345678901234567890@p");
+
+    /* a float in the fewest digits, then with zeros and a point as a
+       pattern asks; a decimal as written, so 19.9 isn't 19.90 */
+    const char *it = "cents: !decimal(/[0-9]+\\.[0-9]{2}/)\nnone: !null(/(~|null)?/)\n"
+                     "item:\n  price: !cents\n  ratio: !float(/[0-9]*\\.[0-9]+/)\n  note: {!|: [!none, !str]}\n";
+    WRITES(it, "item", "{ s:price D:19.99 s:ratio f:1 s:note n }", false, "price: 19.99\nratio: 1.0\nnote: null\n",
+           "{price:d19.99@cents,ratio:f1,note:n@none}@item");
+    WRITES(it, "item", "{ s:price D:0.50 s:ratio f:0.5 s:note s:null }", true, "{price: 0.50, ratio: 0.5, note: 'null'}",
+           "{price:d0.50@cents,ratio:f0.5,note:snull}@item");
+    REFUSES(it, "item", "{ s:price D:19.9 s:ratio f:1 s:note n }", false,
+            "/price: no spelling of the decimal 19.9 reads back: written 19.9, '19.9' does not match");
+    WRITES("c: !float(/[0-9]+\\.[0-9]{2}/)\n", "c", "f:19.9", false, "--- 19.90\n", "f19.899999999999999@c");
+    WRITES("c: !float(/\\.[0-9]+/)\n", "c", "f:0.25", false, "--- .25\n", "f0.25@c");
+    WRITES("c: !decimal(/[0-9]+\\./)\n", "c", "D:12", false, "--- 12.\n", "d12@c");
+    WRITES("c: [!float, ...]\n", "c", "[[ f:1e21 f:1e-7 f:1e-8 f:-0 f:123456.789 f:5e-324 ]", false,
+           "[1e21, 0.0000001, 1e-8, -0, 123456.789, 5e-324]",
+           "[f1e+21,f9.9999999999999995e-08,f1e-08,f-0,f123456.789,f4.9406564584124654e-324]@c");
+    WRITES("c: {!|: [!int, !float]}\n", "c", "f:2", false, "--- 2.0\n", "f2@c");
+    REFUSES(NULL, NULL, "f:inf", false, "a float that isn't finite");
+    REFUSES(NULL, NULL, "B:007", false, "'007' isn't an integer in the standard spelling");
+    REFUSES(NULL, NULL, "D:+1.5", false, "'+1.5' isn't a number in the standard spelling");
+
+    /* an integer reads back as one, !int or !bigint */
+    WRITES("k: !bigint\n", "k", "i:-5", false, "--- -5\n", "I-5@k");
+    WRITES("k: !int\n", "k", "B:18446744073709551615", false, "--- 18446744073709551615\n", "i18446744073709551615@k");
+    WRITES("k: !int\n", "k", "u:18446744073709551615", false, "--- 18446744073709551615\n", "i18446744073709551615@k");
+    REFUSES("k: !int\n", "k", "B:18446744073709551616", false, "no spelling of the integer 18446744073709551616");
+
+    /* null: null, ~ or empty, where empty reads back */
+    const char *m = "m: {a?: !int, b?: !str, c: !null, d?: !null(/~/), e?: [!null(/(-)?/), ...]}\n";
+    WRITES(m, "m", "{ s:a n s:b n s:c n s:d n s:e [ n n ] }", false, "a:\nb:\nc: null\nd: ~\ne:\n  -\n  -\n",
+           "{a:n,b:n,c:n,d:n,e:[n,n]}@m");
+    WRITES(m, "m", "{ s:a n s:b n s:c n }", true, "{a:, b:, c: null}", "{a:n,b:n,c:n}@m");
+    REFUSES(m, "m", "{ s:c n s:e [[ n ] }", false, "/e/0: no spelling of null reads back: written null, 'null' does not match");
+    WRITES("r: !null(/(-)?/)\n", "r", "n", false, "---\n", "n@r");
+    WRITES("r: {!|: [!null(/(-)?/), !str]}\n", "r", "s:", false, "--- \"\"\n", "s@r");
+
+    /* a string where its type is another: quoted if that reads it back */
+    const char *t = "t: {x: !bool, y: !str, z: !any, w: {!|: [!null, !bool, !int, !str]}, v: {!|: [!date, !str]}}\n";
+    WRITES(t, "t", "{ s:x b:1 s:y s:true s:z i:5 s:w s:true s:v s:x }", false, "x: true\ny: true\nz: 5\nw: 'true'\nv: x\n",
+           "{x:btrue,y:strue,z:A5,w:strue,v:sx}@t");
+    REFUSES(t, "t", "{ s:x s:true s:y s:a s:z n s:w n s:v s:a }", false, "/x: no spelling of the string 'true' reads back: written true, it reads as !bool");
+    REFUSES(t, "t", "{ s:x b:1 s:y s:a s:z n s:w n s:v s:2001-02-03 }", false,
+            "/v: no spelling of the string '2001-02-03' reads back: written 2001-02-03, it reads as !date");
+    REFUSES(t, "t", "{ s:x b:1 s:y i:5 s:z n s:w n s:v s:a }", false, "/y: no spelling of the integer 5 reads back");
+    WRITES("s: !str\n", "s", "s:a_b:_c", false, "--- 'a b: c'\n", "sa b: c@s");
+    REFUSES(t, "t", "{ s:x b:1 }", false, "/: missing y");
+    REFUSES(t, "t", "{ s:x b:1 s:y s:a s:z n s:w n s:v s:a s:q i:1 }", false, "/: unknown key q");
+
+    /* bytes in base64, quoted where plain reads as something else */
+    WRITES("x: !binary\n", "x", "x:686921", false, "--- aGkh\n", "x686921@x");
+    WRITES("x: !binary\n", "x", "x:", false, "--- \"\"\n", "x@x");
+    WRITES("x: {!|: [!int, !binary]}\n", "x", "x:d76df8", false, "--- '1234'\n", "xd76df8@x");
+
+    /* a key is a string */
+    REFUSES(NULL, NULL, "{ i:1 s:a }", false, "a key is a string, and this is !int");
+    REFUSES(NULL, NULL, "{ o:point s:a }", false, "a key is a string, and this is a point object");
+
+    /* with no schema, a value is written in its standard spelling */
+    {
+        emitted r = emit_doc(NULL, NULL, "{ s:a i:5 s:b s:3 s:c n s:d f:0.5 s:e o:point }", false);
+        CHECK(r.st == OYLNG_OK && strstr(r.out, "a: 5\nb: 3\nc: null\nd: 0.5\ne:\n  x: 1\n  y: 2\n"), "no schema: %s %s",
+              r.err, r.out);
+    }
+
+    /* an object (section 12's way back): its value reads back as of its
+       name, so a parser's binding of the name gets it */
+    const char *sh = "point: {x: !int, y: !int}\nsweep: {target: !int}\nshape: {!|: [!point, !sweep]}\n"
+                     "shapes: [!shape, ...]\nw: {a: !any, b?: !point}\nq: {x: !int, y: !int}\n";
+    WRITES(sh, "shapes", "[ o:point { s:target i:3 } ]", false, "- x: 1\n  y: 2\n- target: 3\n",
+           "[{x:i1,y:i2}@point,{target:i3}@sweep]@shapes");
+    REFUSES(sh, "shapes", "[ o:sweep ]", false, "/0: written as a sweep object, it reads as a point");
+    REFUSES(sh, "w", "{ s:a [ o:point ] }", false, "/a: it reads as untyped, and a point object is in it");
+    WRITES(sh, "w", "{ s:a i:1 s:b o:point }", false, "a: 1\nb:\n  x: 1", "{a:A1,b:{x:i1,y:i2}@point}@w");
+    REFUSES(sh, "q", "o:point", false, "/: written as a point object, it reads as a q");
+    REFUSES(sh, "shapes", "[ o!point ]", false, "a point object: it has no x");
+    REFUSES(sh, "shapes", "[ o2point ]", false, "the code bound to point wrote more than one value");
+    {
+        oylng_emitter *e = oylng_emitter_new();
+        pt p = { 1, 2, NULL, 0 };
+        oylng_emit_stream_start(e);
+        oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+        CHECK(oylng_emit_object(e, S("point"), &p) == OYLNG_ERR_INPUT && !oylng_emitter_error(e), "nothing bound");
+        CHECK(oylng_emitter_bind(e, S("point"), unbind_point, NULL) == OYLNG_OK &&
+              oylng_emitter_bind(e, S("point"), NULL, NULL) == OYLNG_OK &&
+              oylng_emit_object(e, S("point"), &p) == OYLNG_ERR_INPUT, "unbound");
+        CHECK(oylng_emitter_bind(e, S("point"), unbind_point, NULL) == OYLNG_OK &&
+              oylng_emit_object(e, S("point"), &p) == OYLNG_OK && oylng_emit_doc_end(e) == OYLNG_OK, "bound again");
+        oylng_emitter_free(e);
+    }
+}
+
+static oylng_schema *schema_of(const char *table, const char *root) {
+    char tx[400];
+    snprintf(tx, sizeof tx, "%%YAML 2.0\n--- &\n%s", table);
+    return oylng_schema_new(tx, strlen(tx), S(root), 0);
+}
+
+static bool same_time(const oylng_datetime *a, const oylng_datetime *b) {
+    return a->year == b->year && a->month == b->month && a->day == b->day && a->hour == b->hour &&
+           a->minute == b->minute && a->second == b->second && a->nanosecond == b->nanosecond &&
+           a->offset == b->offset && a->zulu == b->zulu && a->unknown_offset == b->unknown_offset;
+}
+
+static void emitting_more(void) {
+    /* dates and times, written as RFC 3339 writes them */
+    oylng_schema *ds = schema_of("d: {a: !date, b: !datetime, c: !datetime, e: {!|: [!int, !datetime]}}\n", "d");
+    oylng_emitter *e = oylng_emitter_new();
+    CHECK(oylng_emitter_set_schema(e, ds) == OYLNG_OK, "set a schema");
+    oylng_datetime a = { 2001, 2, 3, 0, 0, 0, 0, 0, false, false };
+    oylng_datetime b = { 2001, 2, 3, 4, 5, 6, 500000000, 330, false, false };
+    oylng_datetime c = { 2001, 2, 3, 4, 5, 6, 0, 0, false, true };
+    oylng_datetime d = { 2016, 12, 31, 23, 59, 60, 123456789, 0, true, false };
+    oylng_emit_stream_start(e);
+    oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+    oylng_emit_map_start(e, false);
+    oylng_emit_scalar(e, S("a"));
+    oylng_emit_datetime(e, OYLNG_T_DATE, &b);   /* the date of it */
+    oylng_emit_scalar(e, S("b"));
+    oylng_emit_datetime(e, OYLNG_T_DATETIME, &b);
+    oylng_emit_scalar(e, S("c"));
+    oylng_emit_datetime(e, OYLNG_T_DATETIME, &c);
+    oylng_emit_scalar(e, S("e"));
+    oylng_emit_datetime(e, OYLNG_T_DATETIME, &d);
+    oylng_emit_map_end(e);
+    oylng_status st = oylng_emit_doc_end(e);
+    oylng_str o = oylng_emitter_output(e);
+    CHECK(st == OYLNG_OK && strstr(o.data, "a: 2001-02-03\nb: 2001-02-03T04:05:06.5+05:30\nc: 2001-02-03T04:05:06-00:00\n"
+                                           "e: 2016-12-31T23:59:60.123456789Z\n"),
+          "dates: %s %.*s", oylng_emitter_error(e) ? oylng_emitter_error(e) : "", (int)o.len, o.data);
+    oylng_parser *p = oylng_parser_new(o.data, o.len);
+    oylng_typed *y;
+    oylng_datetime back[4];
+    bool ok = oylng_parse_typed(p, ds, &y) == OYLNG_OK && y;
+    for (size_t i = 0; ok && i < 4; i++) ok = oylng_value_datetime(y, oylng_value_at(y, oylng_typed_root(y), i), &back[i]);
+    CHECK(ok && same_time(&back[0], &a) && same_time(&back[1], &b) && same_time(&back[2], &c) && same_time(&back[3], &d),
+          "dates read back");
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    oylng_emitter_free(e);
+    oylng_datetime bad[] = { { 2001, 13, 3, 0, 0, 0, 0, 0, false, false },
+                             { 2001, 2, 3, 4, 5, 6, 0, 60, true, false },
+                             { 2001, 2, 3, 4, 5, 6, 1000000000, 0, true, false },
+                             { 10000, 1, 1, 0, 0, 0, 0, 0, true, false } };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        e = oylng_emitter_new();
+        oylng_emit_stream_start(e);
+        oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+        st = oylng_emit_datetime(e, i ? OYLNG_T_DATETIME : OYLNG_T_DATE, &bad[i]);
+        CHECK(st == OYLNG_ERR_EMIT && strstr(oylng_emitter_error(e), "doesn't read back"), "bad time %zu: %s", i,
+              oylng_emitter_error(e) ? oylng_emitter_error(e) : "taken");
+        oylng_emitter_free(e);
+    }
+    oylng_schema_free(ds);
+
+    /* a document is held till it ends: the output stops short of it, and
+       a refused one leaves what came before */
+    oylng_schema *ns = schema_of("n: !int\n", "n");
+    e = oylng_emitter_new();
+    oylng_emitter_set_schema(e, ns);
+    oylng_emit_stream_start(e);
+    oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+    oylng_emit_int(e, 1);
+    oylng_emit_doc_end(e);
+    oylng_emit_doc_start(e, S("x"));
+    o = oylng_emitter_output(e);
+    CHECK(o.len == 16 && !memcmp(o.data, "%YAML 2.0\n--- 1\n", 16), "held: %.*s", (int)o.len, o.data);
+    oylng_str taken;
+    CHECK(oylng_emitter_take(e, &taken) == OYLNG_OK && taken.len == 16, "taken while held");
+    oylng_emit_int(e, 2);
+    o = oylng_emitter_output(e);
+    CHECK(o.len == 0, "still held: %.*s", (int)o.len, o.data);
+    CHECK(oylng_emit_doc_end(e) == OYLNG_OK, "ended");
+    o = oylng_emitter_output(e);
+    CHECK(o.len == 9 && !memcmp(o.data, "--- !x 2\n", 9), "written at its end: %.*s", (int)o.len, o.data);
+    oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+    oylng_emit_scalar(e, S("three"));
+    CHECK(oylng_emit_doc_end(e) == OYLNG_ERR_EMIT && strstr(oylng_emitter_error(e), "/: no spelling of the string 'three'"),
+          "refused: %s", oylng_emitter_error(e));
+    o = oylng_emitter_output(e);
+    CHECK(o.len == 9 && !memcmp(o.data, "--- !x 2\n", 9), "what came before: %.*s", (int)o.len, o.data);
+    oylng_emitter_free(e);
+
+    /* a literal block reads back as the string it is */
+    e = oylng_emitter_new();
+    oylng_emitter_set_schema(e, ns);
+    oylng_emit_stream_start(e);
+    oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+    oylng_emit_int(e, -12);
+    CHECK(oylng_emit_doc_end(e) == OYLNG_OK, "an int");
+    CHECK(oylng_emitter_set_schema(e, NULL) == OYLNG_OK, "no schema");
+    oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+    o = oylng_emitter_output(e);
+    CHECK(strstr(o.data, "--- "), "not held: %.*s", (int)o.len, o.data);
+    oylng_emitter_free(e);
+
+    /* a schema that types nothing, or is in error, can't be set */
+    const char *only = "%YAML 2.0\n--- &\nn: !int\n";
+    oylng_schema *chk = oylng_schema_new(only, strlen(only), (oylng_str){ NULL, 0 }, 0);
+    oylng_schema *bad_s = schema_of("n: !nope\n", "n");
+    e = oylng_emitter_new();
+    CHECK(oylng_schema_status(chk) == OYLNG_OK && oylng_emitter_set_schema(e, chk) == OYLNG_ERR_INPUT, "a check's schema");
+    CHECK(oylng_schema_status(bad_s) != OYLNG_OK && oylng_emitter_set_schema(e, bad_s) == OYLNG_ERR_INPUT,
+          "a schema in error");
+    CHECK(oylng_emit_number(e, OYLNG_T_INT, S("5")) == OYLNG_ERR_INPUT &&
+              oylng_emit_datetime(e, OYLNG_T_STR, &a) == OYLNG_ERR_INPUT && !oylng_emitter_error(e),
+          "not a number's or a date's type");
+    oylng_emitter_free(e);
+    oylng_schema_free(chk);
+    oylng_schema_free(bad_s);
+    oylng_schema_free(ns);
+
+    WRITES("s: [!str, ...]\n", "s", "[ s:a\nb\n ]", false, "- |\n  a\n  b\n", "[sa\nb\n]@s");
+
+    /* a typed document written again: where no standard spelling reads
+       back, how each value was written does */
+    const char *src = "%YAML 2.0\n--- &\nz: !int(/0{25}[0-9]/)\nnl: !null(/nil/)\n"
+                      "r:\n  a: !z\n  b: !nl\n  c: !float(/[0-9]\\.[0-9]{30}/)\n  d: !datetime\n"
+                      "--- !r\na: 00000000000000000000000007\nb: nil\nc: 0.100000000000000005551115123125\n"
+                      "d: 2001-02-03t04:05:06z\n";
+    oylng_schema *rs = oylng_schema_new(src, strlen(src), S("r"), 0);
+    p = oylng_parser_new(src, strlen(src));
+    y = NULL;
+    CHECK(oylng_schema_status(rs) == OYLNG_OK && oylng_parse_typed(p, NULL, &y) == OYLNG_OK && y, "read: %s",
+          oylng_parser_error(p));
+    e = oylng_emitter_new();
+    oylng_emitter_set_schema(e, rs);
+    oylng_emit_stream_start(e);
+    oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+    oylng_emit_value(e, y, oylng_typed_root(y));
+    st = oylng_emit_doc_end(e);
+    o = oylng_emitter_output(e);
+    CHECK(st == OYLNG_OK && strstr(o.data, "a: 00000000000000000000000007\nb: nil\nc: 0.100000000000000005551115123125\n"
+                                           "d: 2001-02-03T04:05:06Z\n"),
+          "as written: %s %.*s", oylng_emitter_error(e) ? oylng_emitter_error(e) : "", (int)o.len, o.data);
+    oylng_emitter_free(e);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    oylng_schema_free(rs);
+}
+
 static void api(void) {
     oylng_parser *p;
     const char *err;
@@ -1193,6 +1785,8 @@ static void api(void) {
     published_names();
     ignored_stamps();
     bindings();
+    emitting();
+    emitting_more();
 }
 
 int main(int argc, char **argv) {

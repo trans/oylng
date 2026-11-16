@@ -199,7 +199,9 @@ OYLNG_API oylng_status oylng_emit_seq_start(oylng_emitter *e, bool flow);
 OYLNG_API oylng_status oylng_emit_seq_end(oylng_emitter *e);
 
 /** The output written since the last oylng_emitter_take(), valid until the
- *  next call on the emitter. */
+ *  next call on the emitter. With a schema (part 2's
+ *  oylng_emitter_set_schema), a document is written when it ends, so the
+ *  output stops short of one that is open. */
 OYLNG_API oylng_str oylng_emitter_output(const oylng_emitter *e);
 
 /** Take the output written since the last take, at any point, so that a

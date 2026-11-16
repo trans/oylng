@@ -24,6 +24,10 @@
  * the objects of the bound values just below it made, a value written at
  * an offset of 5 mod 8 is refused, each bound value has its object, at one place only,
  * and every object made is let go.
+ * A document the application's schema typed, or that nothing typed, is
+ * written again with that schema (section 13), under a size budget: in
+ * block style it must be accepted, and in flow refused only for a value
+ * with no spelling there, and it must read back the same.
  * Where the stream holds a NUL, what comes before it is also a published
  * file (section 3.1), and what comes after a stream typed with a lookup
  * that gives it, once each #sha256= and the 64 hex digits after it are set
@@ -261,6 +265,150 @@ static void check_objects(const oylng_typed *t, oylng_value v, uint8_t **seen, s
 }
 
 /* The published file, for any hash: the parser checks it */
+/* ── Typed documents written again (section 13) ─────────── */
+
+static bool same_nodes(const oylng_tree *a, oylng_node n, const oylng_tree *b, oylng_node m) {
+    oylng_kind k = oylng_node_kind(a, n);
+    if (k != oylng_node_kind(b, m)) return false;
+    if (k == OYLNG_NODE_STRING) {
+        oylng_str x = oylng_node_text(a, n), y = oylng_node_text(b, m);
+        return x.len == y.len && (!x.len || !memcmp(x.data, y.data, x.len));
+    }
+    size_t c = oylng_node_count(a, n);
+    if (c != oylng_node_count(b, m)) return false;
+    for (size_t i = 0; i < c; i++)
+        if (k == OYLNG_NODE_SEQUENCE ? !same_nodes(a, oylng_node_item(a, n, i), b, oylng_node_item(b, m, i))
+                                     : !same_nodes(a, oylng_node_key(a, n, i), b, oylng_node_key(b, m, i)) ||
+                                           !same_nodes(a, oylng_node_value(a, n, i), b, oylng_node_value(b, m, i)))
+            return false;
+    return true;
+}
+
+static bool same_str(oylng_str x, oylng_str y) { return x.len == y.len && (!x.len || !memcmp(x.data, y.data, x.len)); }
+
+/* Whether two typed values are the same: type, value and name */
+static bool same_typed(const oylng_typed *a, oylng_value v, const oylng_typed *b, oylng_value w) {
+    oylng_type t = oylng_value_type(a, v);
+    if (t != oylng_value_type(b, w)) return false;
+    oylng_str na = oylng_value_name(a, v), nb = oylng_value_name(b, w);
+    if (!na.data != !nb.data || (na.data && !same_str(na, nb))) return false;
+    switch (t) {
+    case OYLNG_T_ANY:
+        return same_nodes(oylng_typed_tree(a), oylng_value_node(a, v), oylng_typed_tree(b), oylng_value_node(b, w));
+    case OYLNG_T_SEQUENCE:
+    case OYLNG_T_MAPPING: {
+        size_t c = oylng_value_count(a, v);
+        if (c != oylng_value_count(b, w)) return false;
+        for (size_t i = 0; i < c; i++) {
+            if (t == OYLNG_T_MAPPING && !same_str(oylng_value_key(a, v, i), oylng_value_key(b, w, i))) return false;
+            if (t == OYLNG_T_SEQUENCE ? !same_typed(a, oylng_value_item(a, v, i), b, oylng_value_item(b, w, i))
+                                      : !same_typed(a, oylng_value_at(a, v, i), b, oylng_value_at(b, w, i)))
+                return false;
+        }
+        return true;
+    }
+    case OYLNG_T_STR:
+    case OYLNG_T_BIGINT:
+    case OYLNG_T_DECIMAL:
+        return same_str(oylng_value_text(a, v), oylng_value_text(b, w));
+    case OYLNG_T_INT: {
+        int64_t i, j;
+        uint64_t u, k;
+        bool si = oylng_value_int(a, v, &i), sj = oylng_value_int(b, w, &j);
+        if (si || sj) return si && sj && i == j;
+        return oylng_value_uint(a, v, &u) && oylng_value_uint(b, w, &k) && u == k;
+    }
+    case OYLNG_T_FLOAT: {
+        double f = oylng_value_float(a, v), g = oylng_value_float(b, w);
+        return !memcmp(&f, &g, sizeof f);
+    }
+    case OYLNG_T_BOOL: return oylng_value_bool(a, v) == oylng_value_bool(b, w);
+    case OYLNG_T_NULL: return true;
+    case OYLNG_T_DATE:
+    case OYLNG_T_DATETIME: {
+        oylng_datetime d, e;
+        if (!oylng_value_datetime(a, v, &d) || !oylng_value_datetime(b, w, &e)) return false;
+        return d.year == e.year && d.month == e.month && d.day == e.day && d.hour == e.hour &&
+               d.minute == e.minute && d.second == e.second && d.nanosecond == e.nanosecond &&
+               d.offset == e.offset && d.zulu == e.zulu && d.unknown_offset == e.unknown_offset;
+    }
+    case OYLNG_T_BINARY: return same_str(oylng_value_bytes(a, v), oylng_value_bytes(b, w));
+    default: return false;
+    }
+}
+
+/* Whether node n and what is in it, every place counted, fit the budget */
+static bool nodes_fit(const oylng_tree *t, oylng_node n, size_t *budget) {
+    if (!*budget) return false;
+    --*budget;
+    oylng_kind k = oylng_node_kind(t, n);
+    size_t c = oylng_node_count(t, n);
+    for (size_t i = 0; i < c; i++)
+        if (!nodes_fit(t, k == OYLNG_NODE_SEQUENCE ? oylng_node_item(t, n, i) : oylng_node_value(t, n, i), budget))
+            return false;
+    return true;
+}
+
+/* The same, of value v */
+static bool fits_budget(const oylng_typed *y, oylng_value v, size_t *budget) {
+    if (!*budget) return false;
+    --*budget;
+    oylng_type t = oylng_value_type(y, v);
+    if (t == OYLNG_T_ANY) return nodes_fit(oylng_typed_tree(y), oylng_value_node(y, v), budget);
+    size_t c = oylng_value_count(y, v);
+    for (size_t i = 0; i < c; i++)
+        if (!fits_budget(y, t == OYLNG_T_SEQUENCE ? oylng_value_item(y, v, i) : oylng_value_at(y, v, i), budget))
+            return false;
+    return true;
+}
+
+static void write_again(const oylng_typed *y, const oylng_schema *sc, unsigned opt) {
+    size_t budget = 2048;
+    if (!fits_budget(y, oylng_typed_root(y), &budget)) return;
+    for (int flow = 0; flow < 2; flow++) {
+        oylng_emitter *e = oylng_emitter_new();
+        if (!e) return;
+        oylng_emitter_set_flow(e, flow);
+        oylng_emitter_set_indent(e, ((opt >> 3) & 7) + 1);
+        if (sc && oylng_emitter_set_schema(e, sc) != OYLNG_OK) abort();
+        oylng_status st = oylng_emit_stream_start(e);
+        if (st == OYLNG_OK) st = oylng_emit_doc_start(e, oylng_tree_name(oylng_typed_tree(y)));
+        if (st == OYLNG_OK) st = oylng_emit_value(e, y, oylng_typed_root(y));
+        if (st == OYLNG_OK) st = oylng_emit_doc_end(e);
+        if (st == OYLNG_OK) st = oylng_emit_stream_end(e);
+        if (st != OYLNG_OK) {
+            const char *why = oylng_emitter_error(e);
+            if (st == OYLNG_ERR_MEMORY) {
+                oylng_emitter_free(e);
+                return;
+            }
+            if (!flow || st != OYLNG_ERR_EMIT || !why || !strstr(why, "no spelling of")) abort();
+            oylng_emitter_free(e);
+            continue;
+        }
+        oylng_str out = oylng_emitter_output(e);
+        char *copy = malloc(out.len ? out.len : 1);
+        if (copy) {
+            memcpy(copy, out.data, out.len);
+            oylng_parser *q = oylng_parser_new(copy, out.len);
+            if (q) {
+                oylng_parser_set_limit(q, UINT64_MAX);
+                oylng_parser_set_levels(q, OYLNG_MAX_LEVELS);   /* references may have made it deeper */
+                oylng_parser_set_cut(q, (opt & 0x40) != 0);
+                oylng_typed *back = NULL;
+                st = oylng_parse_typed(q, sc, &back);
+                if (st != OYLNG_ERR_MEMORY &&
+                    (st != OYLNG_OK || !back || !same_typed(y, oylng_typed_root(y), back, oylng_typed_root(back))))
+                    abort();
+                oylng_typed_free(back);
+                oylng_parser_free(q);
+            }
+            free(copy);
+        }
+        oylng_emitter_free(e);
+    }
+}
+
 static bool lookup(void *ctx, oylng_str address, oylng_str sha256, oylng_str *file) {
     (void)address;
     (void)sha256;
@@ -461,6 +609,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             size_t cap = 0, ob = 1 << 16;
             check_objects(y, root, &seen, &cap, &ob);
             free(seen);
+            if (how == OYLNG_TYPED_APP || how == OYLNG_TYPED_NOT) write_again(y, how == OYLNG_TYPED_APP ? app : NULL, opt);
             oylng_typed_free(y);
         }
         if (fb.made != fb.dropped) abort();

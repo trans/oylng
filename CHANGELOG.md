@@ -67,8 +67,33 @@
   fuzzer checks the table after each tree, types each stream with its
   stamps ignored, which must read as its trees do, and ignores every third
   document's stamp when typing.
-- Tested: 165 API checks and the draft's 70 examples (`make test`); part 2's
-  suite (yaml2 `0b88244`), 793 of its 842 tests passed and none failed, 23
+- **Typed data written back** (part 2, section 13). With
+  `oylng_emitter_set_schema(e, s)`, the emitter writes each document so
+  that a parser with `s` as its application's schema reads back what it
+  was given. A document is held until it ends, typed with `s` as the
+  parser types it, and each scalar written in the first of its spellings
+  that reads back as given. A string is plain, else quoted, so under
+  `{!|: [!int, !str]}` the string `3` is written `'3'`. A number is in its
+  standard spelling, then with a `+`, then with up to 20 zeros before its
+  digits, and for a float after its point too, as a pattern may ask, so 5
+  under `!signed` is `+5`. Null is `null`, `~` or an empty value. A
+  value that reads back as nothing given, or a document that doesn't fit,
+  refuses the document, `OYLNG_ERR_EMIT` with the path, and none of it is
+  written. Typed calls: `oylng_emit_int`, `_uint`, `_float` (the fewest
+  digits that read back), `_bool`, `_null`, `_number` (a bigint or
+  decimal's text), `_datetime` (RFC 3339) and `_bytes` (base64), and
+  `oylng_emit_value`, which writes a typed document again; a value's own
+  spelling is tried second, so one a pattern took reads back where no
+  standard one does. `oylng_emitter_bind` and `oylng_emit_object` give a
+  bound type its way back: the application's code writes its object as the
+  value its entry takes, which must read back as of that name, so that a
+  parser's binding gets it. 76 new API checks; each typed document of the
+  draft's examples (49) and of part 2's suite (392) is written again, in
+  block and in flow style, and reads back the same; the fuzzer writes each
+  document the application's schema typed again, which must be accepted
+  in block style and read back the same.
+- Tested: 241 API checks and the draft's 70 examples (`make test`); part 2's
+  suite (yaml2 `25bfb66`), 797 of its 846 tests passed and none failed, 23
   of them with a store of published files, the rest skipped for times held
   otherwise (25) and `keep` (24) (`make test-yes`); all 859 of the streams
   the draft's schema checker (yaml2's `schemacheck.py`) types in its

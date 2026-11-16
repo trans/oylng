@@ -479,6 +479,59 @@ oylng_mark oylng_node_mark(const oylng_tree *T, oylng_node n) {
     return m;
 }
 
+/* ── A tree the emitter builds (part 2, section 13) ──────── */
+
+oylng_status oylng__tree_make(const oylng__tnew *nd, size_t n, const char *text, oylng_tree **out) {
+    *out = NULL;
+    builder B = { .st = OYLNG_OK };
+    B.T = calloc(1, sizeof *B.T);
+    if (!B.T) return OYLNG_ERR_MEMORY;
+    B.T->in = "";
+    B.T->root = OYLNG_NO_NODE;
+    for (size_t i = 0; i < n && B.st == OYLNG_OK; i++) {
+        bool str = nd[i].kind == OYLNG_NODE_STRING;
+        oylng_node id = str ? new_str(&B, text + nd[i].off, nd[i].len, 0, nd[i].plain ? F_PLAIN : 0)
+                            : new_node(&B, nd[i].kind, 0);
+        if (id == OYLNG_NO_NODE) break;
+        if (B.no) push_child(&B, id);
+        else B.T->root = id;
+        if (!str && ROOM(&B, B.open, B.capo, B.no + 1)) B.open[B.no++] = (struct open){ id, B.ns };
+        /* a node is its record's number, so each collection open knows how
+           many children it takes */
+        while (B.st == OYLNG_OK && B.no && B.ns - B.open[B.no - 1].s0 == nd[B.open[B.no - 1].id].n) {
+            struct open o = B.open[--B.no];
+            close_coll(&B, o.id, o.s0);
+        }
+    }
+    free(B.stk);
+    free(B.open);
+    if (B.st == OYLNG_OK && (B.no || B.T->nn != n)) B.st = OYLNG_ERR_INPUT;
+    if (B.st != OYLNG_OK) {
+        oylng_tree_free(B.T);
+        return B.st;
+    }
+    *out = B.T;
+    return OYLNG_OK;
+}
+
+bool oylng__tree_set_str(oylng_tree *T, oylng_node n, const char *s, size_t len, bool plain) {
+    tnode *nd = &T->nodes[n];
+    oylng_str now = text_of(T, nd);
+    if (!same(now, (oylng_str){ s, len })) {
+        if ((nd->flags & F_POOLED) && nd->a + (size_t)nd->n == T->npool) T->npool = nd->a;   /* the last tried */
+        builder B = { .T = T, .st = OYLNG_OK };
+        uint32_t a;
+        uint8_t fl;
+        if (!place_text(&B, s, len, &a, &fl)) return false;
+        nd = &T->nodes[n];
+        nd->a = a;
+        nd->n = (uint32_t)len;
+        nd->flags = fl;
+    }
+    nd->flags = (uint8_t)((nd->flags & ~F_PLAIN) | (plain ? F_PLAIN : 0));
+    return true;
+}
+
 /* ── Writing a tree ──────────────────────────────────────── */
 
 oylng_status oylng_emit_tree(oylng_emitter *E, const oylng_tree *T) {

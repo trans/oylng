@@ -125,6 +125,9 @@ static void cut_time(strbuf *b, oylng_str s) {
     sb_str(b, "\n");
 }
 
+/* Times by their fields, not as written: for values written again */
+static bool time_fields;
+
 static void typed_events(strbuf *b, const oylng_typed *y, oylng_value v, bool cut) {
     char num[48];
     oylng_str s = oylng_value_text(y, v);
@@ -151,7 +154,13 @@ static void typed_events(strbuf *b, const oylng_typed *y, oylng_value v, bool cu
     case OYLNG_T_NULL: sb_str(b, "=NULL\n"); break;
     case OYLNG_T_DATE: ev(b, "=DATE :", s.data, s.len); break;
     case OYLNG_T_DATETIME:
-        if (cut) cut_time(b, s);
+        if (time_fields) {
+            oylng_datetime d;
+            oylng_value_datetime(y, v, &d);
+            snprintf(num, sizeof num, "%d-%u-%u %u:%u:%u.%lu %d%s%s", (int)d.year, d.month, d.day, d.hour, d.minute,
+                     d.second, (unsigned long)d.nanosecond, d.offset, d.zulu ? " Z" : "", d.unknown_offset ? " ?" : "");
+            ev(b, "=DATETIME :", num, strlen(num));
+        } else if (cut) cut_time(b, s);
         else ev(b, "=DATETIME :", s.data, s.len);
         break;
     case OYLNG_T_BINARY: {
@@ -200,6 +209,141 @@ static bool same_events(const char *got, const char *want) {
         got++;
         want++;
     }
+}
+
+/* Section 13: typed document y written again, under the schema that typed
+ * it, in block style and then in flow, and read back with that schema as
+ * the application's: NULL if it gives the same values, else why not */
+static int trips, trips_skipped;
+
+/* s in double quotes, with JSON's escapes */
+static void sb_json(strbuf *b, const char *s, size_t n) {
+    sb_str(b, "\"");
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)s[i];
+        char hex[8];
+        if (c == '"' || c == '\\') {
+            hex[0] = '\\';
+            hex[1] = (char)c;
+            sb_add(b, hex, 2);
+        } else if (c < 0x20 || c == 0x7F) {
+            snprintf(hex, sizeof hex, "\\u%04X", c);
+            sb_str(b, hex);
+        } else sb_add(b, s + i, 1);
+    }
+    sb_str(b, "\"");
+}
+
+/* A table's tree written as a schema's text: block style, a scalar plain
+ * as it was, else in double quotes */
+static void table_text(strbuf *b, const oylng_tree *t, oylng_node n, int ind) {
+    oylng_kind k = oylng_node_kind(t, n);
+    size_t c = oylng_node_count(t, n);
+    for (size_t i = 0; i < c; i++) {
+        for (int j = 0; j < ind; j++) sb_str(b, " ");
+        oylng_node v = k == OYLNG_NODE_MAPPING ? oylng_node_value(t, n, i) : oylng_node_item(t, n, i);
+        if (k == OYLNG_NODE_MAPPING) {
+            oylng_node kn = oylng_node_key(t, n, i);
+            oylng_str ks = oylng_node_text(t, kn);
+            if (oylng_node_plain(t, kn)) sb_add(b, ks.data, ks.len);
+            else sb_json(b, ks.data, ks.len);
+            sb_str(b, ":");
+        } else sb_str(b, "-");
+        oylng_kind vk = oylng_node_kind(t, v);
+        if (vk == OYLNG_NODE_STRING) {
+            oylng_str vs = oylng_node_text(t, v);
+            if (oylng_node_plain(t, v)) {
+                if (vs.len) sb_str(b, " ");
+                sb_add(b, vs.data, vs.len);
+            } else {
+                sb_str(b, " ");
+                sb_json(b, vs.data, vs.len);
+            }
+            sb_str(b, "\n");
+        } else if (!oylng_node_count(t, v)) sb_str(b, vk == OYLNG_NODE_MAPPING ? " {}\n" : " []\n");
+        else {
+            sb_str(b, "\n");
+            table_text(b, t, v, ind + 2);
+        }
+    }
+}
+
+static const char *again(oylng_parser *rp, const oylng_typed *y, const oylng_schema *app, bool cut, uint64_t lim,
+                         char *why, size_t whyn) {
+    oylng_str name = oylng_tree_name(oylng_typed_tree(y));
+    oylng_schema *own = NULL;
+    const oylng_schema *sc = NULL;
+    switch (oylng_typed_how(y)) {
+    case OYLNG_TYPED_APP: sc = app; break;
+    case OYLNG_TYPED_STAMP: {
+        /* the stream's table as it stood for this document, as a schema */
+        oylng_tree *tt;
+        if (oylng_parser_table(rp, &tt) != OYLNG_OK || !tt) {
+            snprintf(why, whyn, "its table can't be had");
+            return why;
+        }
+        strbuf tx = { 0 };
+        sb_str(&tx, "%YAML 2.0\n--- &\n");
+        table_text(&tx, tt, oylng_tree_root(tt), 0);
+        oylng_tree_free(tt);
+        sc = own = oylng_schema_new(tx.data, tx.len, name, lim);
+        if (oylng_schema_status(own) != OYLNG_OK) {
+            snprintf(why, whyn, "its schema: %s\n%s", oylng_schema_error(own), tx.data);
+            free(tx.data);
+            oylng_schema_free(own);
+            return why;
+        }
+        free(tx.data);
+        break;
+    }
+    case OYLNG_TYPED_PUBLISHED: trips_skipped++; return NULL;
+    default: break;
+    }
+    strbuf want = { 0 };
+    time_fields = true;
+    typed_events(&want, y, oylng_typed_root(y), cut);
+    const char *res = NULL;
+    for (int flow = 0; flow < 2 && !res; flow++) {
+        oylng_emitter *e = oylng_emitter_new();
+        oylng_emitter_set_flow(e, flow);
+        oylng_emitter_set_schema(e, sc);
+        oylng_status st = oylng_emit_stream_start(e);
+        if (st == OYLNG_OK) st = oylng_emit_doc_start(e, name);
+        if (st == OYLNG_OK) st = oylng_emit_value(e, y, oylng_typed_root(y));
+        if (st == OYLNG_OK) st = oylng_emit_doc_end(e);
+        if (st == OYLNG_OK) st = oylng_emit_stream_end(e);
+        oylng_str out = oylng_emitter_output(e);
+        const char *how = flow ? "in flow" : "in block";
+        if (st != OYLNG_OK) {
+            snprintf(why, whyn, "written %s: %s", how, oylng_emitter_error(e));
+            res = why;
+        } else {
+            oylng_parser *p = oylng_parser_new(out.data, out.len);
+            oylng_parser_set_limit(p, UINT64_MAX);
+            oylng_parser_set_cut(p, cut);
+            oylng_typed *back = NULL;
+            st = oylng_parse_typed(p, sc, &back);
+            strbuf got = { 0 };
+            if (back) typed_events(&got, back, oylng_typed_root(back), cut);
+            if (st != OYLNG_OK || !back) {
+                snprintf(why, whyn, "written %s, it doesn't read: %s\n%.*s", how, st ? oylng_parser_error(p) : "no document",
+                         (int)(out.len > 2000 ? 2000 : out.len), out.data);
+                res = why;
+            } else if (!same_events(got.data, want.data)) {
+                snprintf(why, whyn, "written %s, it reads back otherwise:\n%.*s--- want\n%s--- got\n%s", how,
+                         (int)(out.len > 2000 ? 2000 : out.len), out.data, want.data, got.data);
+                res = why;
+            }
+            free(got.data);
+            oylng_typed_free(back);
+            oylng_parser_free(p);
+        }
+        oylng_emitter_free(e);
+    }
+    time_fields = false;
+    free(want.data);
+    oylng_schema_free(own);
+    return res;
 }
 
 static void run(const char *dir) {
@@ -262,6 +406,10 @@ static void run(const char *dir) {
             else sb_str(&got, "+DOC\n");
             typed_events(&got, y, oylng_typed_root(y), cut);
             sb_str(&got, "-DOC\n");
+            if (!want_error && !why) {
+                if (again(p, y, app, cut, lim, detail, sizeof detail)) why = "written again:";
+                else trips++;
+            }
             oylng_typed_free(y);
         }
         sb_str(&got, "-STR\n");
@@ -280,6 +428,8 @@ static void run(const char *dir) {
             if (verbose) printf("PATH %s (%s): the suite's %s, the engine's %s\n", dir, name ? name : "?", at, err);
         }
         if (why && err) snprintf(detail, sizeof detail, "%zu:%zu: %s", m.line, m.col, err);
+    } else if (why) {
+        /* written again, it didn't read back: detail says how */
     } else if (err) {
         why = "refused";
         snprintf(detail, sizeof detail, "%zu:%zu: %s", m.line, m.col, err);
@@ -351,5 +501,7 @@ int main(int argc, char **argv) {
     printf("yes: %d passed, %d failed (%d run with a store); skipped %d with keep, %d holding more,"
            " %d with a limit of 0; %d refused at another path\n",
            passed, failed, published, skip_keep, skip_holds, skip_zero, paths);
+    printf("yes: %d typed documents written again read back the same (%d with published names not tried)\n", trips,
+           trips_skipped);
     return failed ? 1 : 0;
 }

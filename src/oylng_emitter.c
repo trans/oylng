@@ -13,9 +13,17 @@
  * next line starts, and a space only when an inline node follows it, so a
  * block collection's start writes nothing until its first child shows
  * whether it goes on the next line, or it ends empty as {} or [].
+ *
+ * With a schema (part 2, section 13), a document is written as it goes
+ * too, so that every call is checked where it is made, and its nodes are
+ * kept as records. At its end the records make a tree, which the typer
+ * types as a parser would, trying each scalar's spellings in turn until
+ * one reads back as given; then the document is written again, over what
+ * was written of it, each scalar as the typer chose.
  */
 
-#include "oylng_internal.h"
+#include "oylng_yes.h"
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,6 +33,10 @@
 #define EMPTY_SLOT UINT32_MAX
 
 enum { E_BEFORE, E_STREAM, E_ROOT, E_DONE, E_END, E_FAILED };
+
+/* How a scalar is written: as it reads back best, or plain, which the
+ * caller has found reads back, or not plain, or as an empty value */
+enum { F_AUTO, F_PLAIN, F_QUOTED, F_EMPTY };
 
 /* An open collection */
 typedef struct {
@@ -52,7 +64,7 @@ struct oylng_emitter {
     bool   oom;
     int    state;
     oylng_status status;
-    char   msg[192];
+    char   msg[448];
 
     unsigned indent;
     bool     flow_all;
@@ -70,6 +82,32 @@ struct oylng_emitter {
     uint32_t  nlix, caplix;
     oylng_hash_key hkey;
     bool      hkey_set;
+
+    /* typed data (part 2, section 13): a document held till its end, as
+       records of its nodes, then typed and written again */
+    const oylng_schema *schema;   /* types each document from the next on */
+    const oylng_schema *held;     /* types the document open */
+    bool      replay;             /* it is being written again */
+    int       force;              /* how replay writes the next scalar */
+    size_t    mark;               /* the output before it */
+    bool      mbol, mspace;
+    struct erec *rec;
+    oylng__tnew *tn;              /* the same nodes, for the tree */
+    size_t    nrec, caprec, captn;
+    uint32_t *opn;                /* the records of its collections open */
+    uint32_t  nopn, capopn;
+    char     *tb;                 /* its text */
+    size_t    tlen, tcap;
+    size_t    dname, dnlen;       /* its name in tb, or SIZE_MAX */
+    char     *cb;                 /* a spelling */
+    size_t    ccap;
+    oylng_str hint;               /* how the next typed value was written, if it was read */
+    bool      hplain;
+    uint32_t  cnode;              /* the node being spelled */
+    char      why[160];           /* why its spelling doesn't read back */
+    unsigned  craw;               /* and its next spelling to look at */
+    struct ebind { char *name; size_t len; oylng_unbind_fn fn; void *ctx; } *binds;
+    size_t    nbinds, capbinds;
 };
 
 /* Where the next node goes */
@@ -310,11 +348,17 @@ static inline bool body_byte(unsigned c) {
     return c < 64 ? (body_lo >> c) & 1 : c < 128 && (body_hi >> (c - 64)) & 1;
 }
 
-static oylng_status scalar_out(oylng_emitter *E, const char *s, size_t n, const place *pl) {
+static oylng_status scalar_out(oylng_emitter *E, const char *s, size_t n, const place *pl, int style) {
     const unsigned char *u = (const unsigned char *)s;
+    if (style == F_EMPTY) return OYLNG_OK;
+    if (style == F_PLAIN) {
+        inline_space(E);
+        out_add(E, s, n);
+        return OYLNG_OK;
+    }
     /* the common string, one pass: such bytes throughout, written plain
        unless its first or last byte, or what it is as a key, says not */
-    if (n) {
+    if (n && style == F_AUTO) {
         size_t i = 1;
         while (i < n && body_byte(u[i])) i++;
         if (i == n && (body_byte(u[0]) || u[0] == ':') && u[n - 1] != ' ' && first_ok(s, n, pl)) {
@@ -345,7 +389,7 @@ static oylng_status scalar_out(oylng_emitter *E, const char *s, size_t n, const 
        scalar's lines it stays, as text such as a Makefile has it */
     inline_space(E);
     if (n == 0) OUT(E, "\"\"");
-    else if (!lf && !dq && !tab && plain_ok(s, n, pl)) out_add(E, s, n);
+    else if (style == F_AUTO && !lf && !dq && !tab && plain_ok(s, n, pl)) out_add(E, s, n);
     else if (lf && !dq && pl->lit >= 0 && literal_ok(s, n)) literal_out(E, s, n, (size_t)pl->lit);
     else if (!lf && !dq && !tab && !sq) {
         OUT(E, "'");
@@ -484,6 +528,413 @@ static void node_done(oylng_emitter *E) {
 
 static bool live(const oylng_emitter *E) { return E && E->state != E_FAILED; }
 
+/* ── Typed data (part 2, section 13) ─────────────────────── */
+
+/* A node of the held document. Its text, and whether it is first written
+ * plain, are in tn. */
+typedef struct erec {
+    uint8_t  want;          /* a value's type, OYLNG_T_STR for a string; OYLNG_T_NONE for a key
+                               or a collection */
+    bool     flow;          /* a value in a flow collection; a collection in flow style */
+    bool     empty;         /* a value that reads back here written empty */
+    uint32_t end;           /* the record after its last descendant */
+    size_t   name, nlen;    /* in tb, an object's named type (section 12), or SIZE_MAX */
+    size_t   b, blen;       /* in tb, OYLNG_T_BINARY's bytes */
+    size_t   hint, hlen;    /* in tb, how it was written where it was read, or SIZE_MAX */
+    bool     hplain;
+    union {
+        double         f;
+        oylng_datetime dt;
+    } x;
+} erec;
+
+static const char *const type_names[] = {
+    "nothing", "untyped", "!str", "!int", "!bigint", "!float", "!decimal", "!bool", "!null",
+    "!date", "!datetime", "!binary", "a sequence", "a mapping",
+};
+
+/* Text added to the held document's: where it is, or SIZE_MAX if memory
+ * runs out */
+static size_t text_add(oylng_emitter *E, const void *s, size_t n) {
+    if (!grow(E, (void **)&E->tb, &E->tcap, E->tlen + n + 1, 1)) return SIZE_MAX;
+    size_t at = E->tlen;
+    if (n) memcpy(E->tb + at, s, n);
+    E->tlen += n;
+    return at;
+}
+
+/* The next node of the held document; NULL if it can't be */
+static erec *rec_add(oylng_emitter *E, uint8_t kind, const char *s, size_t n, bool plain) {
+    if (E->nrec >= UINT32_MAX - 1) {
+        fail(E, OYLNG_ERR_LIMIT, "a typed document of 4G nodes or more");
+        return NULL;
+    }
+    if (!grow(E, (void **)&E->rec, &E->caprec, E->nrec + 1, sizeof *E->rec) ||
+        !grow(E, (void **)&E->tn, &E->captn, E->nrec + 1, sizeof *E->tn))
+        return NULL;
+    size_t off = 0;
+    if (kind == OYLNG_NODE_STRING && (off = text_add(E, s, n)) == SIZE_MAX) return NULL;
+    E->tn[E->nrec] = (oylng__tnew){ kind, plain, 0, off, n };
+    erec *r = &E->rec[E->nrec++];
+    *r = (erec){ .name = SIZE_MAX, .hint = SIZE_MAX };
+    r->end = (uint32_t)E->nrec;
+    return r;
+}
+
+static bool holding(const oylng_emitter *E) { return E->held && !E->replay; }
+
+/* Whether an empty value reads back as one here: the root, a mapping's
+ * value, or a block sequence's item */
+static bool empty_ok(const place *pl) {
+    return !pl->parent || (!pl->key && (pl->parent->map || !pl->flow));
+}
+
+/* Whether s, as scalar_out sees it, reads back written plain here */
+static bool can_plain(const char *s, size_t n, const place *pl) {
+    if (!n) return false;
+    const unsigned char *u = (const unsigned char *)s;
+    for (size_t i = 0; i < n;) {
+        if (u[i] < 0x80) {
+            if (u[i] < 0x20 || u[i] == 0x7F) return false;
+            i++;
+            continue;
+        }
+        size_t len;
+        uint32_t cp = oylng_utf8(u + i, u + n, &len);
+        if (cp == OYLNG_BAD_CP || !oylng_allowed(cp, false)) return false;
+        i += len;
+    }
+    return plain_ok(s, n, pl);
+}
+
+/* Spelling i of a value of type want whose standard spelling is t, n
+ * long: 1, with it in *out; 0 past the last; -1 if spelling i is none.
+ * A number's spellings are in an order: its sign, its form, the zeros
+ * after its point and those before its digits, the first changing
+ * fastest. */
+static int raw_spelling(oylng_emitter *E, uint8_t want, const char *t, size_t n, unsigned i, oylng_str *out,
+                        bool *plain) {
+    *plain = true;
+    switch (want) {
+    case OYLNG_T_STR:
+    case OYLNG_T_DATE:
+    case OYLNG_T_DATETIME:
+    case OYLNG_T_BINARY:
+        if (i > 1) return 0;
+        if (!n && !i) return -1;   /* an empty string is "", not an empty value */
+        *out = (oylng_str){ t, n };
+        *plain = i == 0;
+        return 1;
+    case OYLNG_T_BOOL:
+        if (i) return 0;
+        *out = (oylng_str){ t, n };
+        return 1;
+    case OYLNG_T_NULL: {
+        static const char *const nulls[] = { "null", "~", "" };
+        if (i > 2) return 0;
+        *out = (oylng_str){ nulls[i], strlen(nulls[i]) };
+        return 1;
+    }
+    default:
+        break;
+    }
+    bool neg = n && t[0] == '-';
+    const char *ib = t + neg, *end = t + n, *ie = ib;
+    while (ie < end && *ie >= '0' && *ie <= '9') ie++;
+    const char *fb = ie, *fe = ie;
+    if (fe < end && *fe == '.') {
+        fb = ++fe;
+        while (fe < end && *fe >= '0' && *fe <= '9') fe++;
+    }
+    const char *xb = fe;   /* the exponent, from its e */
+    bool real = want == OYLNG_T_FLOAT || want == OYLNG_T_DECIMAL;
+    unsigned ns = neg ? 1 : 2, nf = real ? 3 : 1, nt = want == OYLNG_T_FLOAT ? 21 : 1;
+    unsigned sgn = i % ns, form = i / ns % nf, tz = i / ns / nf % nt, z = i / ns / nf / nt;
+    if (z > 20) return 0;
+    bool frac = fe > fb, exp = xb < end;
+    /* form 1 is .5 for 0.5, form 2 is 1. for 1 */
+    if ((form == 1 && !(ie - ib == 1 && *ib == '0' && frac)) || (form == 2 && (frac || exp || tz)) ||
+        (tz && exp))
+        return -1;
+    if (!grow(E, (void **)&E->cb, &E->ccap, n + 48, 1)) return 0;
+    char *o = E->cb;
+    size_t k = 0;
+    if (neg) o[k++] = '-';
+    else if (sgn) o[k++] = '+';
+    memset(o + k, '0', z);
+    k += z;
+    if (form != 1) {
+        memcpy(o + k, ib, (size_t)(ie - ib));
+        k += (size_t)(ie - ib);
+    }
+    if (frac || tz || form == 2) o[k++] = '.';
+    memcpy(o + k, fb, (size_t)(fe - fb));
+    k += (size_t)(fe - fb);
+    memset(o + k, '0', tz);
+    k += tz;
+    memcpy(o + k, xb, (size_t)(end - xb));
+    k += (size_t)(end - xb);
+    *out = (oylng_str){ o, k };
+    return 1;
+}
+
+static bool str_is(oylng_str a, const char *s, size_t n) {
+    return a.data && a.len == n && (!n || memcmp(a.data, s, n) == 0);
+}
+
+static bool writable(oylng_str s, bool plain, const place *pl, bool empty) {
+    return !plain || (s.len ? can_plain(s.data, s.len, pl) : empty);
+}
+
+/* The first spelling of a value that reads back written here */
+static void first_spelling(oylng_emitter *E, uint8_t want, const char *t, size_t n, const place *pl, bool empty,
+                           oylng_str *out, bool *plain) {
+    for (unsigned i = 0;; i++) {
+        int got = raw_spelling(E, want, t, n, i, out, plain);
+        if (got > 0 && writable(*out, *plain, pl, empty)) return;
+        if (!got) break;
+    }
+    *out = (oylng_str){ t, n };   /* none: quoted, which always reads back as written */
+    *plain = false;
+}
+
+/* Spelling i of record r: the standard one, then how it was written where
+ * it was read, if it was, which reads back there, then the others */
+static int spelling(oylng_emitter *E, const erec *r, const oylng__tnew *t, unsigned i, oylng_str *out, bool *plain) {
+    if (r->hint != SIZE_MAX && i) {
+        if (i > 1) return raw_spelling(E, r->want, E->tb + t->off, t->len, i - 1, out, plain);
+        *out = (oylng_str){ E->tb + r->hint, r->hlen };
+        *plain = r->hplain;
+        oylng_str first;
+        bool fp;
+        if (raw_spelling(E, r->want, E->tb + t->off, t->len, 0, &first, &fp) > 0 && fp == *plain &&
+            str_is(first, out->data, out->len))
+            return -1;   /* the same */
+        return 1;
+    }
+    return raw_spelling(E, r->want, E->tb + t->off, t->len, i, out, plain);
+}
+
+/* For the typer (oylng__speller) */
+static bool next_spelling(void *ctx, uint32_t node, unsigned k, oylng_str *out, bool *plain) {
+    oylng_emitter *E = ctx;
+    if (!k || node != E->cnode) {
+        E->cnode = node;
+        E->craw = 0;
+    }
+    const erec *r = &E->rec[node];
+    const oylng__tnew *t = &E->tn[node];
+    place pl = { NULL, r->flow, false, false, -1 };
+    for (;;) {
+        int got = spelling(E, r, t, E->craw++, out, plain);
+        if (!got) return false;
+        if (got > 0 && writable(*out, *plain, &pl, r->empty)) return true;
+    }
+}
+
+/* An integer's standard spelling, of a value OYLNG_T_INT or _BIGINT */
+static oylng_str int_text(const oylng_typed *Y, oylng_value v, char *buf, size_t cap) {
+    if (oylng_value_type(Y, v) == OYLNG_T_BIGINT) return oylng_value_text(Y, v);
+    int64_t i;
+    uint64_t u;
+    int w = oylng_value_int(Y, v, &i) ? snprintf(buf, cap, "%lld", (long long)i)
+          : oylng_value_uint(Y, v, &u) ? snprintf(buf, cap, "%llu", (unsigned long long)u) : 0;
+    return (oylng_str){ buf, w > 0 ? (size_t)w : 0 };
+}
+
+static const char *fits(void *ctx, uint32_t node, const oylng_typed *Y, uint32_t v) {
+    oylng_emitter *E = ctx;
+    const erec *r = &E->rec[node];
+    const oylng__tnew *t = &E->tn[node];
+    const char *tx = E->tb + t->off;
+    oylng_type ty = oylng_value_type(Y, v);
+    char *why = E->why;   /* read before the next call */
+    bool ok = true;
+    if (t->kind != OYLNG_NODE_STRING) {
+        if (ty == OYLNG_T_ANY)   /* nothing below it is typed, so no object below it reads back */
+            for (uint32_t i = node + 1; i < r->end; i++)
+                if (E->rec[i].name != SIZE_MAX) {
+                    snprintf(why, sizeof E->why, "it reads as untyped, and a %.*s object is in it",
+                             (int)(E->rec[i].nlen > 40 ? 40 : E->rec[i].nlen), E->tb + E->rec[i].name);
+                    return why;
+                }
+    } else if (ty != OYLNG_T_ANY) {
+        bool ints = (r->want == OYLNG_T_INT || r->want == OYLNG_T_BIGINT) &&
+                    (ty == OYLNG_T_INT || ty == OYLNG_T_BIGINT);
+        if (ty != r->want && !ints) ok = false;
+        else if (ints) {
+            char buf[24];
+            ok = str_is(int_text(Y, v, buf, sizeof buf), tx, t->len);
+        } else
+            switch (ty) {
+            case OYLNG_T_STR:
+            case OYLNG_T_DECIMAL:
+                ok = str_is(oylng_value_text(Y, v), tx, t->len);
+                break;
+            case OYLNG_T_FLOAT: {
+                double f = oylng_value_float(Y, v);
+                ok = memcmp(&f, &r->x.f, sizeof f) == 0;
+                break;
+            }
+            case OYLNG_T_BOOL:
+                ok = oylng_value_bool(Y, v) == (tx[0] == 't');
+                break;
+            case OYLNG_T_DATE:
+            case OYLNG_T_DATETIME: {
+                oylng_datetime d;
+                const oylng_datetime *w = &r->x.dt;
+                ok = oylng_value_datetime(Y, v, &d) && d.year == w->year && d.month == w->month && d.day == w->day;
+                if (ok && ty == OYLNG_T_DATETIME)
+                    ok = d.hour == w->hour && d.minute == w->minute && d.second == w->second &&
+                         d.nanosecond == w->nanosecond && d.offset == w->offset && d.zulu == w->zulu &&
+                         d.unknown_offset == w->unknown_offset;
+                break;
+            }
+            case OYLNG_T_BINARY:
+                ok = str_is(oylng_value_bytes(Y, v), E->tb + r->b, r->blen);
+                break;
+            default:
+                break;
+            }
+        if (!ok) {
+            if (ty == r->want || ints) snprintf(why, sizeof E->why, "it reads as another %s", type_names[ty]);
+            else snprintf(why, sizeof E->why, "it reads as %s", type_names[ty]);
+            return why;
+        }
+    }
+    if (r->name != SIZE_MAX) {
+        oylng_str nm = oylng_value_name(Y, v);
+        if (!str_is(nm, E->tb + r->name, r->nlen)) {
+            int a = (int)(r->nlen > 40 ? 40 : r->nlen), b = (int)(nm.len > 40 ? 40 : nm.len);
+            if (nm.data)
+                snprintf(why, sizeof E->why, "written as a %.*s object, it reads as a %.*s", a, E->tb + r->name, b, nm.data);
+            else snprintf(why, sizeof E->why, "written as a %.*s object, it reads as no named type", a, E->tb + r->name);
+            return why;
+        }
+    }
+    return NULL;
+}
+
+static void describe(void *ctx, uint32_t node, char *buf, size_t cap) {
+    const oylng_emitter *E = ctx;
+    const erec *r = &E->rec[node];
+    const oylng__tnew *t = &E->tn[node];
+    int n = (int)(t->len > 40 ? 40 : t->len);
+    const char *s = E->tb + t->off, *more = (size_t)n < t->len ? "..." : "";
+    switch (r->want) {
+    case OYLNG_T_STR:      snprintf(buf, cap, "the string '%.*s%s'", n, s, more); break;
+    case OYLNG_T_INT:
+    case OYLNG_T_BIGINT:   snprintf(buf, cap, "the integer %.*s%s", n, s, more); break;
+    case OYLNG_T_FLOAT:    snprintf(buf, cap, "the float %.*s%s", n, s, more); break;
+    case OYLNG_T_DECIMAL:  snprintf(buf, cap, "the decimal %.*s%s", n, s, more); break;
+    case OYLNG_T_DATE:     snprintf(buf, cap, "the date %.*s", n, s); break;
+    case OYLNG_T_DATETIME: snprintf(buf, cap, "the time %.*s", n, s); break;
+    case OYLNG_T_BINARY:   snprintf(buf, cap, "the bytes %.*s%s", n, s, more); break;
+    default:               snprintf(buf, cap, "%.*s", n, s); break;
+    }
+}
+
+/* A value of a standard type, its standard spelling s */
+static oylng_status typed_out(oylng_emitter *E, uint8_t want, const char *s, size_t n, const erec *extra) {
+    place pl;
+    oylng_status st = where(E, &pl, false);
+    if (st != OYLNG_OK) return st;
+    if (pl.key) return fail(E, OYLNG_ERR_EMIT, "a key is a string, and this is %s", type_names[want]);
+    bool empty = empty_ok(&pl);
+    if (holding(E)) {
+        erec *r = rec_add(E, OYLNG_NODE_STRING, s, n, false);
+        if (!r) return done(E);
+        if (extra) *r = *extra;
+        r->name = r->hint = SIZE_MAX;
+        r->end = (uint32_t)E->nrec;
+        r->want = want;
+        r->flow = pl.flow;
+        r->empty = empty;
+        if (E->hint.data) {
+            size_t at = text_add(E, E->hint.data, E->hint.len);
+            if (at == SIZE_MAX) return done(E);
+            r = &E->rec[E->nrec - 1];
+            r->hint = at;
+            r->hlen = E->hint.len;
+            r->hplain = E->hplain;
+        }
+        oylng__tnew *t = &E->tn[E->nrec - 1];
+        s = E->tb + t->off;   /* the record's, which lasts */
+    }
+    oylng_str c;
+    bool plain;
+    first_spelling(E, want, s, n, &pl, empty, &c, &plain);
+    if (holding(E)) E->tn[E->nrec - 1].plain = plain;
+    st = scalar_out(E, c.data, c.len, &pl, plain ? (c.len ? F_PLAIN : F_EMPTY) : F_QUOTED);
+    if (st != OYLNG_OK) return st;
+    node_done(E);
+    return done(E);
+}
+
+/* ── The held document's end ─────────────────────────────── */
+
+/* Typed, then written again as typed */
+static oylng_status held_end(oylng_emitter *E) {
+    oylng_tree *T;
+    oylng_status st = oylng__tree_make(E->tn, E->nrec, E->tb, &T);
+    if (st != OYLNG_OK)
+        return fail(E, st, "%s", st == OYLNG_ERR_MEMORY ? "out of memory" : "a typed document too large to hold");
+    oylng__speller sp = { E, next_spelling, fits, describe };
+    oylng_typed *Y;
+    char msg[400];
+    st = oylng__type_emit(E->held, T, &sp, &Y, msg, sizeof msg);
+    if (st != OYLNG_OK) {
+        E->len = E->mark;
+        if (E->oom) return done(E);   /* a spelling had no room */
+        return fail(E, st == OYLNG_ERR_MEMORY ? st : OYLNG_ERR_EMIT, "%s", msg);
+    }
+    T = (oylng_tree *)oylng_typed_tree(Y);
+    E->len = E->mark;
+    E->bol = E->mbol;
+    E->space = E->mspace;
+    E->state = E_STREAM;
+    E->replay = true;
+    st = oylng_emit_doc_start(E, E->dname == SIZE_MAX ? (oylng_str){ NULL, 0 }
+                                                      : (oylng_str){ E->tb + E->dname, E->dnlen });
+    /* opn holds what each collection open still takes */
+    E->nopn = 0;
+    for (size_t i = 0; i < E->nrec && st == OYLNG_OK; i++) {
+        const oylng__tnew *t = &E->tn[i];
+        bool whole = true;
+        if (t->kind == OYLNG_NODE_STRING) {
+            oylng_str s = { E->tb + t->off, t->len };
+            E->force = F_AUTO;
+            if (E->rec[i].want != OYLNG_T_NONE) {
+                s = oylng_node_text(T, (oylng_node)i);
+                E->force = !oylng_node_plain(T, (oylng_node)i) ? F_QUOTED : s.len ? F_PLAIN : F_EMPTY;
+            }
+            st = oylng_emit_scalar(E, s);
+        } else {
+            bool map = t->kind == OYLNG_NODE_MAPPING;
+            st = map ? oylng_emit_map_start(E, E->rec[i].flow) : oylng_emit_seq_start(E, E->rec[i].flow);
+            if (st == OYLNG_OK && t->n) {
+                if (grow32(E, (void **)&E->opn, &E->capopn, (uint64_t)E->nopn + 1, sizeof *E->opn))
+                    E->opn[E->nopn++] = t->n;
+                else st = done(E);
+                whole = false;
+            } else if (st == OYLNG_OK) st = map ? oylng_emit_map_end(E) : oylng_emit_seq_end(E);
+        }
+        while (st == OYLNG_OK && whole && E->nopn && !--E->opn[E->nopn - 1]) {
+            E->nopn--;
+            st = E->fr[E->sp - 1].map ? oylng_emit_map_end(E) : oylng_emit_seq_end(E);
+        }
+    }
+    E->replay = false;
+    E->force = F_AUTO;
+    E->held = NULL;
+    oylng_typed_free(Y);
+    if (st != OYLNG_OK) return st;
+    if (!E->bol) out_nl(E);
+    E->space = false;
+    E->state = E_STREAM;
+    return done(E);
+}
+
 /* ── Public API ──────────────────────────────────────────── */
 
 oylng_emitter *oylng_emitter_new(void) {
@@ -554,6 +1005,17 @@ oylng_status oylng_emit_doc_start(oylng_emitter *E, oylng_str name) {
             q += n;
         }
     }
+    if (!E->replay && E->schema) {   /* held till its end (section 13) */
+        E->held = E->schema;
+        E->mark = E->len;
+        E->mbol = E->bol;
+        E->mspace = E->space;
+        E->nrec = E->tlen = 0;
+        E->nopn = 0;
+        E->dname = SIZE_MAX;
+        if (name.data && (E->dname = text_add(E, name.data, name.len)) == SIZE_MAX) return done(E);
+        E->dnlen = name.len;
+    }
     new_line(E, 0);
     OUT(E, "---");
     if (name.data) {
@@ -573,6 +1035,7 @@ oylng_status oylng_emit_doc_end(oylng_emitter *E) {
                                              E->state == E_ROOT ? "the document has no value: give it one, "
                                                                   "an empty string if nothing else" :
                                              "no document is open");
+    if (holding(E)) return held_end(E);
     if (!E->bol) out_nl(E);
     E->space = false;
     E->state = E_STREAM;
@@ -589,7 +1052,17 @@ oylng_status oylng_emit_scalar(oylng_emitter *E, oylng_str value) {
         int n = value.len > 60 ? 60 : (int)value.len;
         return fail(E, OYLNG_ERR_EMIT, "the key \"%.*s\" is given twice in one mapping", n, value.data);
     }
-    st = scalar_out(E, value.data, value.len, &pl);
+    if (holding(E)) {
+        erec *r = rec_add(E, OYLNG_NODE_STRING, value.data, value.len,
+                          !pl.key && can_plain(value.data, value.len, &pl));
+        if (!r) return done(E);
+        if (!pl.key) {
+            r->want = OYLNG_T_STR;
+            r->flow = pl.flow;
+            r->empty = empty_ok(&pl);
+        }
+    }
+    st = scalar_out(E, value.data, value.len, &pl, E->replay ? E->force : F_AUTO);
     if (st != OYLNG_OK) return st;
     node_done(E);
     return done(E);
@@ -614,6 +1087,13 @@ static oylng_status coll_start(oylng_emitter *E, bool map, bool flow) {
     f.k0 = E->nkeys;
     f.b0 = E->klen;
     f.t0 = E->nlix;
+    if (holding(E)) {
+        uint32_t at = (uint32_t)E->nrec;
+        erec *r = rec_add(E, map ? OYLNG_NODE_MAPPING : OYLNG_NODE_SEQUENCE, NULL, 0, false);
+        if (!r || !grow32(E, (void **)&E->opn, &E->capopn, (uint64_t)E->nopn + 1, sizeof *E->opn)) return done(E);
+        r->flow = fl;
+        E->opn[E->nopn++] = at;
+    }
     if (fl) {
         inline_space(E);
         if (map) OUT(E, "{");
@@ -632,6 +1112,11 @@ static oylng_status coll_end(oylng_emitter *E, bool map) {
                                                    "this ends a sequence, and a mapping is open");
     eframe *f = &E->fr[E->sp - 1];
     if (map && f->n % 2) return fail(E, OYLNG_ERR_EMIT, "the mapping's last key has no value");
+    if (holding(E)) {
+        uint32_t at = E->opn[--E->nopn];
+        E->tn[at].n = (uint32_t)f->n;
+        E->rec[at].end = (uint32_t)E->nrec;
+    }
     if (f->flow) {
         if (map) OUT(E, "}");
         else OUT(E, "]");
@@ -677,7 +1162,7 @@ oylng_status oylng__emitter_fail(oylng_emitter *E, oylng_status st, const char *
 
 oylng_str oylng_emitter_output(const oylng_emitter *E) {
     if (!E || !E->out) return (oylng_str){ "", 0 };
-    return (oylng_str){ E->out, E->len };
+    return (oylng_str){ E->out, E->held ? E->mark : E->len };   /* a document held isn't output yet */
 }
 
 oylng_status oylng_emitter_take(oylng_emitter *E, oylng_str *out) {
@@ -685,7 +1170,7 @@ oylng_status oylng_emitter_take(oylng_emitter *E, oylng_str *out) {
     *out = (oylng_str){ "", 0 };
     if (!live(E)) return E->status;
     *out = oylng_emitter_output(E);
-    E->len = 0;
+    E->len = E->mark = 0;   /* what a held document has written so far is thrown away at its end */
     return OYLNG_OK;
 }
 
@@ -700,5 +1185,355 @@ void oylng_emitter_free(oylng_emitter *E) {
     free(E->keys);
     free(E->kbuf);
     free(E->lix);
+    free(E->rec);
+    free(E->tn);
+    free(E->opn);
+    free(E->tb);
+    free(E->cb);
+    for (size_t i = 0; i < E->nbinds; i++) free(E->binds[i].name);
+    free(E->binds);
     free(E);
 }
+
+/* ── Typed data: the calls (part 2, section 13) ──────────── */
+
+oylng_status oylng_emitter_set_schema(oylng_emitter *E, const oylng_schema *s) {
+    if (!E || (s && (s->st != OYLNG_OK || !s->root))) return OYLNG_ERR_INPUT;
+    E->schema = s;
+    return OYLNG_OK;
+}
+
+oylng_status oylng_emit_int(oylng_emitter *E, int64_t v) {
+    if (!E) return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    char b[24];
+    int n = snprintf(b, sizeof b, "%lld", (long long)v);
+    return typed_out(E, OYLNG_T_INT, b, (size_t)n, NULL);
+}
+
+oylng_status oylng_emit_uint(oylng_emitter *E, uint64_t v) {
+    if (!E) return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    char b[24];
+    int n = snprintf(b, sizeof b, "%llu", (unsigned long long)v);
+    return typed_out(E, OYLNG_T_INT, b, (size_t)n, NULL);
+}
+
+/* f, which is finite, in the fewest digits that read back as it:
+ * positional from 1e-7 to below 1e21, else with an exponent, as JSON's
+ * writers have it. The digits are found by printf, whatever the locale's
+ * point, and read back by the parser's own reader. */
+static size_t float_text(double f, char *out) {
+    char buf[48], dig[24] = "0";
+    int nd = 1, x = 0;
+    bool neg = signbit(f);
+    for (int p = 1; p <= 17; p++) {
+        snprintf(buf, sizeof buf, "%.*e", p - 1, f);
+        const char *q = buf;
+        nd = 0;
+        for (; *q && *q != 'e' && *q != 'E'; q++)
+            if (*q >= '0' && *q <= '9' && nd < 20) dig[nd++] = *q;
+        x = *q ? atoi(q + 1) : 0;
+        char c[48];
+        size_t cn = 0;
+        if (neg) c[cn++] = '-';
+        c[cn++] = dig[0];
+        if (nd > 1) {
+            c[cn++] = '.';
+            memcpy(c + cn, dig + 1, (size_t)nd - 1);
+            cn += (size_t)nd - 1;
+        }
+        cn += (size_t)snprintf(c + cn, sizeof c - cn, "e%d", x);
+        double g;
+        if (oylng__float(c, cn, &g) && g == f) break;
+    }
+    size_t k = 0;   /* the fewest digits never end in 0: one fewer would do */
+    if (neg) out[k++] = '-';
+    if (x >= 21 || x < -7) {
+        out[k++] = dig[0];
+        if (nd > 1) {
+            out[k++] = '.';
+            memcpy(out + k, dig + 1, (size_t)nd - 1);
+            k += (size_t)nd - 1;
+        }
+        k += (size_t)snprintf(out + k, 16, "e%d", x);
+    } else if (x >= 0) {
+        for (int i = 0; i <= x; i++) out[k++] = i < nd ? dig[i] : '0';
+        if (nd > x + 1) {
+            out[k++] = '.';
+            memcpy(out + k, dig + x + 1, (size_t)(nd - x - 1));
+            k += (size_t)(nd - x - 1);
+        }
+    } else {
+        out[k++] = '0';
+        out[k++] = '.';
+        for (int i = 0; i < -x - 1; i++) out[k++] = '0';
+        memcpy(out + k, dig, (size_t)nd);
+        k += (size_t)nd;
+    }
+    return k;
+}
+
+oylng_status oylng_emit_float(oylng_emitter *E, double v) {
+    if (!E) return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    if (!isfinite(v)) return fail(E, OYLNG_ERR_EMIT, "a float that isn't finite: YAML 2.0 writes none");
+    char b[64];
+    size_t n = float_text(v, b);
+    erec x = { .x.f = v };
+    return typed_out(E, OYLNG_T_FLOAT, b, n, &x);
+}
+
+oylng_status oylng_emit_bool(oylng_emitter *E, bool v) {
+    if (!E) return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    return typed_out(E, OYLNG_T_BOOL, v ? "true" : "false", v ? 4 : 5, NULL);
+}
+
+oylng_status oylng_emit_null(oylng_emitter *E) {
+    if (!E) return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    return typed_out(E, OYLNG_T_NULL, "null", 4, NULL);
+}
+
+oylng_status oylng_emit_number(oylng_emitter *E, oylng_type type, oylng_str text) {
+    if (!E || (type != OYLNG_T_BIGINT && type != OYLNG_T_DECIMAL) || (text.len && !text.data))
+        return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    bool ok = type == OYLNG_T_BIGINT ? oylng__int_spelling(text.data, text.len)
+                                     : oylng__float_spelling(text.data, text.len);
+    if (!ok)
+        return fail(E, OYLNG_ERR_EMIT, "'%.*s' isn't %s in the standard spelling", (int)(text.len > 40 ? 40 : text.len),
+                    text.data ? text.data : "", type == OYLNG_T_BIGINT ? "an integer" : "a number");
+    return typed_out(E, (uint8_t)type, text.data, text.len, NULL);
+}
+
+static bool same_dt(const oylng_datetime *a, const oylng_datetime *b, bool full) {
+    if (a->year != b->year || a->month != b->month || a->day != b->day) return false;
+    return !full || (a->hour == b->hour && a->minute == b->minute && a->second == b->second &&
+                     a->nanosecond == b->nanosecond && a->offset == b->offset && a->zulu == b->zulu &&
+                     a->unknown_offset == b->unknown_offset);
+}
+
+oylng_status oylng_emit_datetime(oylng_emitter *E, oylng_type type, const oylng_datetime *dt) {
+    if (!E || !dt || (type != OYLNG_T_DATE && type != OYLNG_T_DATETIME)) return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    bool full = type == OYLNG_T_DATETIME;
+    char b[64];
+    int n = snprintf(b, sizeof b, "%04d-%02u-%02u", (int)dt->year, dt->month, dt->day);
+    if (full && n > 0 && n < 40) {
+        n += snprintf(b + n, sizeof b - (size_t)n, "T%02u:%02u:%02u", dt->hour, dt->minute, dt->second);
+        if (dt->nanosecond) {
+            char f[16];
+            snprintf(f, sizeof f, "%09lu", (unsigned long)dt->nanosecond);
+            int fl = (int)strlen(f);
+            while (fl > 1 && f[fl - 1] == '0') fl--;
+            n += snprintf(b + n, sizeof b - (size_t)n, ".%.*s", fl, f);
+        }
+        int off = dt->offset < 0 ? -dt->offset : dt->offset;
+        if (dt->zulu) n += snprintf(b + n, sizeof b - (size_t)n, "Z");
+        else n += snprintf(b + n, sizeof b - (size_t)n, "%c%02d:%02d",
+                           dt->offset < 0 || dt->unknown_offset ? '-' : '+', off / 60, off % 60);
+    }
+    oylng_datetime back;
+    if (n <= 0 || (size_t)n >= sizeof b || oylng__date(b, (size_t)n, full, false, &back) != 1 ||
+        !same_dt(&back, dt, full))
+        return fail(E, OYLNG_ERR_EMIT, "%s, as RFC 3339 writes it, doesn't read back as that %s",
+                    n > 0 && (size_t)n < sizeof b ? b : "a date", full ? "date and time" : "date");
+    erec x = { .x.dt = *dt };
+    return typed_out(E, (uint8_t)type, b, (size_t)n, &x);
+}
+
+oylng_status oylng_emit_bytes(oylng_emitter *E, oylng_str bytes) {
+    static const char A[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    if (!E || (bytes.len && !bytes.data)) return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    if (bytes.len > (SIZE_MAX - 8) / 4 * 3) return fail(E, OYLNG_ERR_LIMIT, "too many bytes to write");
+    if (!grow(E, (void **)&E->cb, &E->ccap, (bytes.len + 2) / 3 * 4 + 1, 1)) return done(E);
+    const unsigned char *s = (const unsigned char *)bytes.data;
+    size_t k = 0, n = bytes.len;
+    for (size_t i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)s[i] << 16 | (i + 1 < n ? (uint32_t)s[i + 1] << 8 : 0) | (i + 2 < n ? s[i + 2] : 0);
+        E->cb[k++] = A[v >> 18 & 63];
+        E->cb[k++] = A[v >> 12 & 63];
+        E->cb[k++] = i + 1 < n ? A[v >> 6 & 63] : '=';
+        E->cb[k++] = i + 2 < n ? A[v & 63] : '=';
+    }
+    erec x = { 0 };
+    if (holding(E)) {
+        if ((x.b = text_add(E, bytes.data, bytes.len)) == SIZE_MAX) return done(E);
+        x.blen = bytes.len;
+    }
+    return typed_out(E, OYLNG_T_BINARY, E->cb, k, &x);
+}
+
+oylng_status oylng_emit_value(oylng_emitter *E, const oylng_typed *t, oylng_value v) {
+    if (!E || !t || oylng_value_type(t, v) == OYLNG_T_NONE) return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    const oylng_tree *T = oylng_typed_tree(t);
+    /* the collections open: a value's or, below an untyped one, a node's */
+    struct vw { bool node, map; uint32_t id; size_t next, n; } local[32], *stk = local;
+    size_t n = 0, cap = 32;
+    bool node = false;
+    uint32_t id = v;
+    oylng_status st = OYLNG_OK;
+    for (;;) {
+        bool coll = false, map = false;
+        size_t count = 0;
+        if (!node && oylng_value_type(t, id) == OYLNG_T_ANY) {
+            node = true;
+            id = oylng_value_node(t, id);
+        }
+        if (node) {
+            oylng_kind k = oylng_node_kind(T, id);
+            if (k == OYLNG_NODE_STRING) st = oylng_emit_scalar(E, oylng_node_text(T, id));
+            else {
+                coll = true;
+                map = k == OYLNG_NODE_MAPPING;
+                count = oylng_node_count(T, id);
+            }
+        } else {
+            oylng_type ty = oylng_value_type(t, id);
+            if (ty != OYLNG_T_STR && ty != OYLNG_T_SEQUENCE && ty != OYLNG_T_MAPPING) {
+                /* how it was written reads back too, where the standard
+                   spelling doesn't: a pattern's, say */
+                oylng_node nd = oylng_value_node(t, id);
+                E->hint = oylng_node_text(T, nd);
+                E->hplain = oylng_node_plain(T, nd);
+            }
+            switch (ty) {
+            case OYLNG_T_STR: st = oylng_emit_scalar(E, oylng_value_text(t, id)); break;
+            case OYLNG_T_INT: {
+                int64_t i;
+                uint64_t u = 0;
+                if (oylng_value_int(t, id, &i)) st = oylng_emit_int(E, i);
+                else {
+                    oylng_value_uint(t, id, &u);
+                    st = oylng_emit_uint(E, u);
+                }
+                break;
+            }
+            case OYLNG_T_BIGINT:
+            case OYLNG_T_DECIMAL: st = oylng_emit_number(E, ty, oylng_value_text(t, id)); break;
+            case OYLNG_T_FLOAT:   st = oylng_emit_float(E, oylng_value_float(t, id)); break;
+            case OYLNG_T_BOOL:    st = oylng_emit_bool(E, oylng_value_bool(t, id)); break;
+            case OYLNG_T_NULL:    st = oylng_emit_null(E); break;
+            case OYLNG_T_DATE:
+            case OYLNG_T_DATETIME: {
+                oylng_datetime d;
+                oylng_value_datetime(t, id, &d);
+                st = oylng_emit_datetime(E, ty, &d);
+                break;
+            }
+            case OYLNG_T_BINARY: st = oylng_emit_bytes(E, oylng_value_bytes(t, id)); break;
+            default:
+                coll = true;
+                map = ty == OYLNG_T_MAPPING;
+                count = oylng_value_count(t, id);
+                break;
+            }
+            E->hint = (oylng_str){ NULL, 0 };
+        }
+        if (coll) {
+            st = map ? oylng_emit_map_start(E, false) : oylng_emit_seq_start(E, false);
+            if (st == OYLNG_OK && n == cap) {
+                struct vw *ns = malloc(2 * cap * sizeof *ns);
+                if (!ns) st = fail(E, OYLNG_ERR_MEMORY, "out of memory");
+                else {
+                    memcpy(ns, stk, n * sizeof *ns);
+                    if (stk != local) free(stk);
+                    stk = ns;
+                    cap *= 2;
+                }
+            }
+            if (st == OYLNG_OK) stk[n++] = (struct vw){ node, map, id, 0, count };
+        }
+        /* the next: a child of the innermost collection with one left */
+        while (st == OYLNG_OK && n && stk[n - 1].next == stk[n - 1].n) {
+            st = stk[n - 1].map ? oylng_emit_map_end(E) : oylng_emit_seq_end(E);
+            n--;
+        }
+        if (st != OYLNG_OK || !n) break;
+        struct vw *w = &stk[n - 1];
+        size_t i = w->next++;
+        node = w->node;
+        if (w->map) {
+            st = oylng_emit_scalar(E, node ? oylng_node_text(T, oylng_node_key(T, w->id, i)) : oylng_value_key(t, w->id, i));
+            if (st != OYLNG_OK) break;
+            id = node ? oylng_node_value(T, w->id, i) : oylng_value_at(t, w->id, i);
+        } else id = node ? oylng_node_item(T, w->id, i) : oylng_value_item(t, w->id, i);
+    }
+    if (stk != local) free(stk);
+    return st;
+}
+
+static struct ebind *bind_of(oylng_emitter *E, oylng_str name) {
+    for (size_t i = 0; i < E->nbinds; i++)
+        if (E->binds[i].len == name.len && (!name.len || memcmp(E->binds[i].name, name.data, name.len) == 0))
+            return &E->binds[i];
+    return NULL;
+}
+
+oylng_status oylng_emitter_bind(oylng_emitter *E, oylng_str name, oylng_unbind_fn fn, void *ctx) {
+    if (!E || (name.len && !name.data)) return OYLNG_ERR_INPUT;
+    struct ebind *b = bind_of(E, name);
+    if (b && fn) {
+        b->fn = fn;
+        b->ctx = ctx;
+        return OYLNG_OK;
+    }
+    if (b) {
+        free(b->name);
+        *b = E->binds[--E->nbinds];
+        return OYLNG_OK;
+    }
+    if (!fn) return OYLNG_OK;
+    if (E->nbinds == E->capbinds) {
+        size_t c = E->capbinds ? 2 * E->capbinds : 8;
+        struct ebind *nb = realloc(E->binds, c * sizeof *nb);
+        if (!nb) return OYLNG_ERR_MEMORY;
+        E->binds = nb;
+        E->capbinds = c;
+    }
+    char *nm = malloc(name.len + 1);
+    if (!nm) return OYLNG_ERR_MEMORY;
+    if (name.len) memcpy(nm, name.data, name.len);
+    E->binds[E->nbinds++] = (struct ebind){ nm, name.len, fn, ctx };
+    return OYLNG_OK;
+}
+
+oylng_status oylng_emit_object(oylng_emitter *E, oylng_str name, const void *object) {
+    if (!E || (name.len && !name.data)) return OYLNG_ERR_INPUT;
+    if (!live(E)) return E->status;
+    const struct ebind *b = bind_of(E, name);
+    if (!b) return OYLNG_ERR_INPUT;
+    int nl = (int)(name.len > 40 ? 40 : name.len);
+    if (E->sp && E->fr[E->sp - 1].map && E->fr[E->sp - 1].n % 2 == 0)
+        return fail(E, OYLNG_ERR_EMIT, "a key is a string, and this is a %.*s object", nl, name.data);
+    oylng_unbind_fn fn = b->fn;
+    void *ctx = b->ctx;
+    uint32_t sp = E->sp;
+    uint64_t n0 = sp ? E->fr[sp - 1].n : 0;
+    bool root = !sp && E->state == E_ROOT, rec = holding(E);
+    size_t r0 = E->nrec;
+    const char *why = fn(ctx, E, object);
+    if (!live(E)) return E->status;
+    if (why) return fail(E, OYLNG_ERR_EMIT, "a %.*s object: %s", nl, name.data, why);
+    uint64_t wrote = sp ? (E->sp == sp ? E->fr[sp - 1].n - n0 : 0) : root && E->state == E_DONE;
+    const char *bad = E->sp > sp ? "a collection it didn't end" : E->sp < sp ? "past its collection's end"
+                    : !wrote ? "nothing" : wrote > 1 ? "more than one value" : NULL;
+    if (bad) return fail(E, OYLNG_ERR_EMIT, "the code bound to %.*s wrote %s", nl, name.data, bad);
+    if (rec) {
+        erec *r = &E->rec[r0];
+        if (r->name != SIZE_MAX && !(r->nlen == name.len && memcmp(E->tb + r->name, name.data, name.len) == 0))
+            return fail(E, OYLNG_ERR_EMIT, "a value can't be both a %.*s object and a %.*s",
+                        (int)(r->nlen > 40 ? 40 : r->nlen), E->tb + r->name, nl, name.data);
+        size_t at = text_add(E, name.data, name.len);
+        if (at == SIZE_MAX) return done(E);
+        r = &E->rec[r0];
+        r->name = at;
+        r->nlen = name.len;
+    }
+    return OYLNG_OK;
+}
+
