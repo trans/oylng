@@ -121,6 +121,26 @@ OYLNG_API void oylng_parser_set_limit(oylng_parser *p, uint64_t limit);
  *  most OYLNG_MAX_LEVELS. Past it the stream is refused. */
 OYLNG_API void oylng_parser_set_levels(oylng_parser *p, unsigned levels);
 
+/** Keep references (sections 10 and 11): set before the first read, and
+ *  after it this changes nothing. The limit then applies to held alone, as
+ *  for any interface that keeps references, so a short chain of them that
+ *  reads as terabytes is accepted. Its documents are read with
+ *  oylng_parse_tree, as kept trees, which spread nothing: a reference is
+ *  the node it names, shared, as in any tree; a -<< is an item of its own,
+ *  OYLNG_NODE_SPLICE; and a mapping's <<: lines are OYLNG_NODE_MERGE nodes,
+ *  apart from its pairs (oylng_node_merges). oylng_parse_next is then
+ *  OYLNG_ERR_INPUT, since events would deliver every reference in full,
+ *  and so is oylng_emit_tree on a kept tree. What walks one in full checks
+ *  full and levels first (section 10). */
+OYLNG_API void oylng_parser_set_keep(oylng_parser *p, bool keep);
+
+/** For an application that keeps every document it reads (section 10):
+ *  set before the first read, and after it this changes nothing. The
+ *  documents' sizes then add up, rather than each document starting again,
+ *  and with references kept, ... takes nothing off held either, as the
+ *  documents still name the old table. */
+OYLNG_API void oylng_parser_set_together(oylng_parser *p, bool together);
+
 /** The next event. On OYLNG_OK, *evt points to an event the parser owns,
  *  valid until the next call. A document is delivered as it is read, so
  *  one in error may already have delivered events, but the error comes
@@ -243,6 +263,9 @@ typedef enum {
     OYLNG_NODE_STRING,
     OYLNG_NODE_SEQUENCE,
     OYLNG_NODE_MAPPING,
+    OYLNG_NODE_SPLICE,     /**< a kept tree's -<<: a sequence's item, standing for
+                                the items of the sequence it names */
+    OYLNG_NODE_MERGE,      /**< a kept tree's <<: line, naming a mapping */
 } oylng_kind;
 
 /** The next document as a tree. On OYLNG_OK, *tree is the document, to be
@@ -292,7 +315,8 @@ OYLNG_API oylng_str oylng_node_text(const oylng_tree *t, oylng_node n);
  *  plain says. */
 OYLNG_API bool oylng_node_plain(const oylng_tree *t, oylng_node n);
 
-/** A sequence's items or a mapping's pairs; 0 for a string. */
+/** A sequence's items or a mapping's pairs, as written in a kept tree,
+ *  where a SPLICE is one item; 0 for any other node. */
 OYLNG_API size_t oylng_node_count(const oylng_tree *t, oylng_node n);
 
 /** A sequence's item @p i, from 0, or OYLNG_NO_NODE. */
@@ -307,6 +331,18 @@ OYLNG_API oylng_node oylng_node_value(const oylng_tree *t, oylng_node map, size_
  *  than 8 pairs has an index, so this takes about the same time however
  *  many it has. */
 OYLNG_API oylng_node oylng_node_get(const oylng_tree *t, oylng_node map, oylng_str key);
+
+/** What a kept tree's SPLICE or MERGE node names, a sequence or a
+ *  mapping of the tree; OYLNG_NO_NODE for any other node. */
+OYLNG_API oylng_node oylng_node_target(const oylng_tree *t, oylng_node n);
+
+/** A kept tree's mapping's <<: lines, in the order written, which come
+ *  before its pairs: how many it has, and MERGE node @p i, from 0, or
+ *  OYLNG_NO_NODE. Its pairs are only those written, and oylng_node_get
+ *  finds only those; a key of the data that isn't written is in the
+ *  mappings these name, the last first (section 9.1). */
+OYLNG_API size_t oylng_node_merges(const oylng_tree *t, oylng_node map);
+OYLNG_API oylng_node oylng_node_merge(const oylng_tree *t, oylng_node map, size_t i);
 
 /** Where node @p n is written in the input, as an event's offset says: a
  *  node of the table where the table holds it. Lines and columns are

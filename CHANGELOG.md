@@ -119,6 +119,25 @@
   `a#b#c` and the like. The suite's six new tests pass, and the emitter has
   9 new checks, 161 in all.
 
+- **References kept** (part 1, sections 10 and 11). With
+  `oylng_parser_set_keep(p, true)`, documents are read as kept trees, under
+  the size limit on held alone, and nothing is spread: a reference is the
+  node it names, shared; a `-<<` is an item of kind `OYLNG_NODE_SPLICE`;
+  and a mapping's `<<:` lines are `OYLNG_NODE_MERGE` nodes before its
+  pairs (`oylng_node_target`, `oylng_node_merges`, `oylng_node_merge`). So
+  a chain doubling 62 times through `-<<`, 2^63 items as data, is a tree of
+  a few hundred nodes. A merged mapping in the table keeps its lines as
+  written, without a copy of its pairs, and a path through it looks in each
+  mapping once. Events, `oylng_emit_tree` of a kept tree and, for now,
+  `oylng_parse_typed` are `OYLNG_ERR_INPUT` with references kept. With
+  `oylng_parser_set_together(p, true)`, for an application that keeps
+  every document, the documents' sizes add up, and with references kept,
+  `...` takes nothing off held. The suite's 7 `keep` and 2 `together`
+  tests pass, and every other test is also read with references kept:
+  spread as section 9 says, each gives the same events and offsets, or the
+  same refusal. 52 new API checks, 196 in all. The fuzzer reads every
+  stream with references kept, and with its documents together.
+
 ## 0.2.0 (2026-11-12)
 
 The tree and the emitter, and faster reading of real files. It is still

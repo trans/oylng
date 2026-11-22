@@ -12,7 +12,13 @@
  * stream must give the same events, or the same error, each key's value
  * must be found, and the trees must be written as the events were. After
  * each tree, the table's tree must find each entry's value by its key, and
- * after an error, give the error. Typed with stamps ignored and no
+ * after an error, give the error. Read with references kept (section 10),
+ * no events are given; the stream must be accepted where the events were,
+ * and its kept trees, spread under a budget, read as the trees did; where
+ * the events were refused for the grammar, it must be refused alike; each
+ * -<< must name a sequence, and each <<: line a mapping. Read with its
+ * documents together, the sizes add up, so it may be accepted only where
+ * the events were, and refused for the grammar only alike. Typed with stamps ignored and no
  * application's schema, the stream must read as the trees did. Typed
  * (part 2), by its stamps, and by the stream's own table as an application's
  * schema rooted at `a` when it compiles as one, the stream must be refused
@@ -86,6 +92,106 @@ static uint64_t tree_hash(uint64_t h, const oylng_tree *t, oylng_node n) {
     }
     if (oylng_node_item(t, n, c) != OYLNG_NO_NODE || oylng_node_key(t, n, c) != OYLNG_NO_NODE) abort();
     return tv_hash(h, map ? OYLNG_EVT_MAP_END : OYLNG_EVT_SEQ_END, none);
+}
+
+/* A kept tree's mapping's pairs, as the data has them (section 9.1): each
+ * <<: line's, then each written one, added at the end, or in place of the
+ * value of a key there, a written key replacing the key too. False past the
+ * budget, which each key compared takes from. */
+typedef struct { oylng_node k, v; } kpair;
+typedef struct { kpair *p; size_t n, cap; } kpairs;
+
+static bool kp_put(const oylng_tree *t, kpairs *ps, oylng_node k, oylng_node v, bool written, size_t *budget) {
+    oylng_str kt = oylng_node_text(t, k);
+    if (!kt.data && kt.len) abort();
+    for (size_t i = 0; i < ps->n; i++) {
+        if (!*budget) return false;
+        --*budget;
+        oylng_str o = oylng_node_text(t, ps->p[i].k);
+        if (o.len == kt.len && (!o.len || memcmp(o.data, kt.data, o.len) == 0)) {
+            if (written) ps->p[i].k = k;
+            ps->p[i].v = v;
+            return true;
+        }
+    }
+    if (ps->n == ps->cap) {
+        size_t nc = ps->cap ? 2 * ps->cap : 8;
+        kpair *np = realloc(ps->p, nc * sizeof *np);
+        if (!np) return false;
+        ps->p = np;
+        ps->cap = nc;
+    }
+    ps->p[ps->n++] = (kpair){ k, v };
+    return true;
+}
+
+static bool kept_pairs(const oylng_tree *t, oylng_node map, kpairs *ps, size_t *budget) {
+    size_t nm = oylng_node_merges(t, map);
+    if (oylng_node_merge(t, map, nm) != OYLNG_NO_NODE) abort();
+    for (size_t i = 0; i < nm; i++) {
+        oylng_node g = oylng_node_merge(t, map, i), src = oylng_node_target(t, g);
+        if (oylng_node_kind(t, g) != OYLNG_NODE_MERGE || oylng_node_kind(t, src) != OYLNG_NODE_MAPPING) abort();
+        kpairs sp = { 0 };
+        bool ok = kept_pairs(t, src, &sp, budget);
+        for (size_t j = 0; ok && j < sp.n; j++) ok = kp_put(t, ps, sp.p[j].k, sp.p[j].v, false, budget);
+        free(sp.p);
+        if (!ok) return false;
+    }
+    for (size_t i = 0; i < oylng_node_count(t, map); i++) {
+        oylng_node k = oylng_node_key(t, map, i), v = oylng_node_value(t, map, i);
+        if (oylng_node_kind(t, k) != OYLNG_NODE_STRING || oylng_node_get(t, map, oylng_node_text(t, k)) != v) abort();
+        if (!kp_put(t, ps, k, v, true, budget)) return false;
+    }
+    return true;
+}
+
+static uint64_t kept_hash(uint64_t h, const oylng_tree *t, oylng_node n, size_t *budget);
+
+/* A kept sequence's items, each -<< spread */
+static uint64_t kept_items(uint64_t h, const oylng_tree *t, oylng_node seq, size_t *budget) {
+    size_t c = oylng_node_count(t, seq);
+    for (size_t i = 0; i < c && *budget; i++) {
+        oylng_node it = oylng_node_item(t, seq, i);
+        if (oylng_node_kind(t, it) != OYLNG_NODE_SPLICE) {
+            h = kept_hash(h, t, it, budget);
+            continue;
+        }
+        oylng_node src = oylng_node_target(t, it);
+        if (oylng_node_kind(t, src) != OYLNG_NODE_SEQUENCE || oylng_node_count(t, it) || oylng_node_text(t, it).data)
+            abort();
+        --*budget;
+        h = kept_items(h, t, src, budget);
+    }
+    if (oylng_node_item(t, seq, c) != OYLNG_NO_NODE) abort();
+    return h;
+}
+
+/* A kept tree's node, spread, hashed as tree_hash hashes a tree's; the
+ * budget 0 if it took more visits than that */
+static uint64_t kept_hash(uint64_t h, const oylng_tree *t, oylng_node n, size_t *budget) {
+    static const oylng_str none = { NULL, 0 };
+    if (!*budget) return h;
+    --*budget;
+    oylng_kind k = oylng_node_kind(t, n);
+    if (oylng_node_target(t, n) != OYLNG_NO_NODE) abort();   /* a -<< or <<: line is never a value */
+    if (k == OYLNG_NODE_STRING) {
+        if (oylng_node_merges(t, n)) abort();
+        return tree_hash(h, t, n);
+    }
+    if (k == OYLNG_NODE_SEQUENCE) {
+        if (oylng_node_merges(t, n)) abort();
+        h = tv_hash(h, OYLNG_EVT_SEQ_START, none);
+        h = kept_items(h, t, n, budget);
+        return tv_hash(h, OYLNG_EVT_SEQ_END, none);
+    }
+    if (k != OYLNG_NODE_MAPPING) abort();
+    kpairs ps = { 0 };
+    bool ok = kept_pairs(t, n, &ps, budget);
+    h = tv_hash(h, OYLNG_EVT_MAP_START, none);
+    for (size_t i = 0; ok && i < ps.n && *budget; i++) h = kept_hash(kept_hash(h, t, ps.p[i].k, budget), t, ps.p[i].v, budget);
+    free(ps.p);
+    if (!ok) *budget = 0;
+    return tv_hash(h, OYLNG_EVT_MAP_END, none);
 }
 
 /* The table's tree: each entry's value found by its key; after an error,
@@ -547,6 +653,69 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     oylng_emitter_free(te);
     oylng_parser_free(tp);
+
+    /* with references kept: no events; accepted where the events were, and
+       spread, the same; refused for the grammar where they were, alike */
+    oylng_parser *kp = parser_for(in, size, opt);
+    if (kp) {
+        oylng_parser_set_keep(kp, true);
+        const oylng_event *ke;
+        if (oylng_parse_next(kp, &ke) != OYLNG_ERR_INPUT || ke) abort();
+        uint64_t h6 = 0xCBF29CE484222325u;
+        size_t budget = 1 << 20;
+        oylng_tree *t;
+        oylng_status st;
+        while ((st = oylng_parse_tree(kp, &t)) == OYLNG_OK && t) {
+            if (budget) {
+                h6 = tv_hash(h6, OYLNG_EVT_DOC_START, oylng_tree_name(t));
+                h6 = kept_hash(h6, t, oylng_tree_root(t), &budget);
+                h6 = tv_hash(h6, OYLNG_EVT_DOC_END, (oylng_str){ NULL, 0 });
+            }
+            oylng_emitter *ke2 = oylng_emitter_new();
+            if (ke2) {
+                oylng_emit_stream_start(ke2);
+                if (oylng_emit_tree(ke2, t) != OYLNG_ERR_INPUT) abort();
+                oylng_emitter_free(ke2);
+            }
+            oylng_tree_free(t);
+            check_table(kp, OYLNG_OK);
+        }
+        check_table(kp, st);
+        if (st == OYLNG_ERR_MEMORY || pst == OYLNG_ERR_MEMORY) {
+        } else if (clean) {
+            if (st != OYLNG_OK || (budget && h6 != h3)) abort();
+        } else if (pst == OYLNG_ERR_PARSE) {
+            const char *x = oylng_parser_error(p), *y = oylng_parser_error(kp);
+            if (st != OYLNG_ERR_PARSE || !x || !y || strcmp(x, y) != 0 ||
+                oylng_parser_error_mark(p).offset != oylng_parser_error_mark(kp).offset)
+                abort();
+        }
+        oylng_parser_free(kp);
+    }
+
+    /* together: the sizes add up, so accepted only where the events were,
+       and refused for the grammar alike, or for size before it */
+    oylng_parser *gp = parser_for(in, size, opt);
+    if (gp) {
+        oylng_parser_set_together(gp, true);
+        uint64_t h7 = 0xCBF29CE484222325u;
+        oylng_status st;
+        const oylng_event *ge;
+        while ((st = oylng_parse_next(gp, &ge)) == OYLNG_OK) {
+            h7 = ev_hash(h7, ge);
+            if (ge->type == OYLNG_EVT_STREAM_END) break;
+        }
+        if (st == OYLNG_ERR_MEMORY || pst == OYLNG_ERR_MEMORY) {
+        } else if (st == OYLNG_OK) {
+            if (!clean || h7 != h1) abort();
+        } else if (pst == OYLNG_ERR_PARSE && st != OYLNG_ERR_LIMIT) {
+            const char *x = oylng_parser_error(p), *y = oylng_parser_error(gp);
+            if (st != OYLNG_ERR_PARSE || !x || !y || strcmp(x, y) != 0 ||
+                oylng_parser_error_mark(p).offset != oylng_parser_error_mark(gp).offset)
+                abort();
+        }
+        oylng_parser_free(gp);
+    }
 
     /* typed with stamps ignored and no schema of the application's: as the
        trees, or the same error */

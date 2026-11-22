@@ -1,10 +1,11 @@
 /*
  * test_api.c — what the suite doesn't check: errors' lines and columns,
- * the offset after a stop, limits, levels, CR LF, the API's edges, and
- * what trees share
+ * the offset after a stop, limits, levels, CR LF, the API's edges, what
+ * trees share, and trees that keep references
  */
 
 #include "oylng/oylng.h"
+#include "oylng/schema.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -665,6 +666,219 @@ static void test_table(void) {
     oylng_parser_free(p);
 }
 
+/* A stream read as kept trees: OYLNG_OK or the error, and the first
+ * document's tree in *first if asked for */
+static oylng_status kept(const char *s, uint64_t limit, bool together, oylng_tree **first) {
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    if (limit) oylng_parser_set_limit(p, limit);
+    oylng_parser_set_together(p, together);
+    oylng_parser_set_keep(p, true);
+    if (first) *first = NULL;
+    oylng_tree *t;
+    oylng_status st;
+    while ((st = oylng_parse_tree(p, &t)) == OYLNG_OK && t) {
+        if (first && !*first) *first = t;
+        else oylng_tree_free(t);
+    }
+    oylng_parser_free(p);
+    return st;
+}
+
+static oylng_status together_events(const char *s, uint64_t limit) {
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    oylng_parser_set_limit(p, limit);
+    oylng_parser_set_together(p, true);
+    oylng_status st = read_all(p, NULL);
+    oylng_parser_free(p);
+    return st;
+}
+
+static bool text_is(const oylng_tree *t, oylng_node n, const char *s) {
+    oylng_str x = oylng_node_text(t, n);
+    return x.data && x.len == strlen(s) && memcmp(x.data, s, x.len) == 0;
+}
+
+static void test_keep(void) {
+    /* set before the first read, or not at all; events then refused, and
+       the parser still reads trees */
+    const char *one = "%YAML 2.0\n---\na: 1\n";
+    oylng_parser *p = oylng_parser_new(one, strlen(one));
+    const oylng_event *e;
+    CHECK(oylng_parse_next(p, &e) == OYLNG_OK, "stream start");
+    oylng_parser_set_keep(p, true);
+    oylng_parser_set_together(p, true);
+    CHECK(read_all(p, NULL) == OYLNG_OK, "set too late, keep changes nothing");
+    oylng_parser_free(p);
+    p = oylng_parser_new(one, strlen(one));
+    oylng_parser_set_keep(p, true);
+    CHECK(oylng_parse_next(p, &e) == OYLNG_ERR_INPUT && !e, "no events with references kept");
+    oylng_tree *t;
+    CHECK(oylng_parse_tree(p, &t) == OYLNG_OK && t && text_is(t, at(t, oylng_tree_root(t), "a"), "1"),
+          "a tree after that");
+    oylng_emitter *em = oylng_emitter_new();
+    oylng_emit_stream_start(em);
+    CHECK(t && oylng_emit_tree(em, t) == OYLNG_ERR_INPUT, "a kept tree isn't written");
+    oylng_emitter_free(em);
+    oylng_tree_free(t);
+    oylng_parser_free(p);
+    p = oylng_parser_new(one, strlen(one));
+    oylng_parser_set_keep(p, true);
+    oylng_typed *y;
+    CHECK(oylng_parse_typed(p, NULL, &y) == OYLNG_ERR_INPUT && !y, "nor typed, yet");
+    oylng_parser_free(p);
+
+    /* a chain doubling 62 times through -<< reads as 2^63 items, and as a
+       tree of 4 nodes a link */
+    char *chain = malloc(8192);
+    strcpy(chain, "%YAML 2.0\n--- &\na0: [x, x]\n");
+    for (int i = 1; i < 63; i++)
+        sprintf(chain + strlen(chain), "a%d:\n  -<< *a%d\n  -<< *a%d\n", i, i - 1, i - 1);
+    strcat(chain, "---\nb: *a62\n");
+    CHECK(kept(chain, 0, false, &t) == OYLNG_OK && t, "the doubling chain, kept");
+    if (t) {
+        oylng_node s = at(t, oylng_tree_root(t), "b"), sp = oylng_node_item(t, s, 0);
+        CHECK(oylng_node_kind(t, s) == OYLNG_NODE_SEQUENCE && oylng_node_count(t, s) == 2 &&
+              oylng_node_kind(t, sp) == OYLNG_NODE_SPLICE && oylng_node_count(t, sp) == 0,
+              "a62 is two splices");
+        oylng_node a61 = oylng_node_target(t, sp);
+        CHECK(oylng_node_kind(t, a61) == OYLNG_NODE_SEQUENCE && oylng_node_target(t, oylng_node_item(t, s, 1)) == a61,
+              "both naming a61, shared");
+        CHECK(oylng_node_mark(t, sp).line == 5 + 3 * 61, "where the -<< is written: line %zu",
+              oylng_node_mark(t, sp).line);
+        CHECK(oylng_tree_nodes(t) < 4 * 64, "a small tree: %zu nodes", oylng_tree_nodes(t));
+        CHECK(oylng_node_target(t, s) == OYLNG_NO_NODE && oylng_node_merges(t, s) == 0 &&
+              oylng_node_text(t, sp).data == NULL, "a sequence names nothing");
+        oylng_tree_free(t);
+    }
+    free(chain);
+
+    /* held alone: section 10's first example is held 29 */
+    const char *ex = "%YAML 2.0\n--- &\na: [x, yy]\nm: {k: v}\n---\nb: *a\nc:\n  -<< *a\n  - z\nd:\n  <<: *m\n";
+    CHECK(kept(ex, 29, false, NULL) == OYLNG_OK, "29 allows it, kept");
+    CHECK(kept(ex, 28, false, NULL) == OYLNG_ERR_LIMIT, "28 refuses it, kept");
+    CHECK(parse(ex, 29, NULL) == OYLNG_ERR_LIMIT, "and 29 refuses it in full");
+
+    /* <<: lines as written, before the pairs; the pairs only those written */
+    const char *mg = "%YAML 2.0\n--- &\nbase: {x: 1, y: 2}\na: {p: 1, q: 2}\nb: {q: 3, r: 4}\n---\n"
+                     "m:\n  <<: *base\n  name: a\n  y: 3\nn:\n  <<: *a\n  <<: *b\n";
+    CHECK(kept(mg, 0, false, &t) == OYLNG_OK && t, "merges, kept");
+    if (t) {
+        oylng_node r = oylng_tree_root(t), m = at(t, r, "m"), n = at(t, r, "n");
+        oylng_node g = oylng_node_merge(t, m, 0), base = oylng_node_target(t, g);
+        CHECK(oylng_node_merges(t, m) == 1 && oylng_node_kind(t, g) == OYLNG_NODE_MERGE &&
+              oylng_node_merge(t, m, 1) == OYLNG_NO_NODE, "m has one <<: line");
+        CHECK(oylng_node_kind(t, base) == OYLNG_NODE_MAPPING && text_is(t, at(t, base, "x"), "1") &&
+              oylng_node_mark(t, base).line == 3, "naming base, where the table has it");
+        CHECK(oylng_node_mark(t, g).line == 8 && oylng_node_mark(t, g).col == 3, "the line where it is written");
+        CHECK(oylng_node_count(t, m) == 2 && text_is(t, oylng_node_key(t, m, 0), "name") &&
+              text_is(t, at(t, m, "y"), "3") && at(t, m, "x") == OYLNG_NO_NODE, "m's written pairs alone");
+        CHECK(oylng_node_merges(t, n) == 2 && oylng_node_count(t, n) == 0 &&
+              text_is(t, at(t, oylng_node_target(t, oylng_node_merge(t, n, 1)), "r"), "4"),
+              "n has two <<: lines, in order, and no pairs");
+        CHECK(oylng_node_merges(t, at(t, base, "x")) == 0 && oylng_node_merge(t, r, 0) == OYLNG_NO_NODE,
+              "nothing else has <<: lines");
+        oylng_tree_free(t);
+    }
+
+    /* a path through kept <<: lines: the written key first, then the last
+       line's mapping first, down to the end; as in full */
+    const char *pt = "%YAML 2.0\n--- &\na: {p: 1}\nb:\n  <<: *a\n  q: 2\nc:\n  <<: *b\ne: {p: 9}\n"
+                     "d: {<<: *a, <<: *e}\nf: {<<: *e, p: 7}\ns: [x]\nu:\n  -<< *s\n  - y\n---\n"
+                     "x: *c:p\ny: *c:q\nz: *u\nv: *d:p\nw: *f:p\n";
+    const char *pv[][2] = { { "x", "1" }, { "y", "2" }, { "v", "9" }, { "w", "7" } };
+    for (int full = 0; full < 2; full++) {
+        if (full) {
+            p = oylng_parser_new(pt, strlen(pt));
+            CHECK(oylng_parse_tree(p, &t) == OYLNG_OK && t, "the paths, in full");
+            oylng_parser_free(p);
+        } else CHECK(kept(pt, 0, false, &t) == OYLNG_OK && t, "the paths, kept");
+        if (!t) continue;
+        oylng_node r = oylng_tree_root(t);
+        for (int i = 0; i < 4; i++)
+            CHECK(text_is(t, at(t, r, pv[i][0]), pv[i][1]), "%s is %s (%s)", pv[i][0], pv[i][1], full ? "full" : "kept");
+        oylng_node z = at(t, r, "z");
+        if (full) CHECK(oylng_node_count(t, z) == 2 && text_is(t, oylng_node_item(t, z, 0), "x"), "z spread");
+        else
+            CHECK(oylng_node_count(t, z) == 2 && oylng_node_kind(t, oylng_node_item(t, z, 0)) == OYLNG_NODE_SPLICE &&
+                  text_is(t, oylng_node_item(t, oylng_node_target(t, oylng_node_item(t, z, 0)), 0), "x") &&
+                  text_is(t, oylng_node_item(t, z, 1), "y"), "z kept");
+        oylng_tree_free(t);
+    }
+    const char *bad[] = {
+        "%YAML 2.0\n--- &\na: {p: 1}\nb: {<<: *a}\n---\nx: *b:nope\n",
+        "%YAML 2.0\n--- &\na: {p: 1}\n---\nm:\n  <<: *a\n  k: 1\n  k: 2\n",
+        "%YAML 2.0\n--- &\na: {p: 1}\nm:\n  <<: *a\n  k: 1\n  k: 2\n",
+        "%YAML 2.0\n--- &\na: {p: 1}\n---\nm:\n  k: 1\n  <<: *a\n",
+    };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        oylng_mark m1, m2 = { 0 };
+        oylng_status s1 = parse(bad[i], 0, &m1);
+        p = oylng_parser_new(bad[i], strlen(bad[i]));
+        oylng_parser_set_keep(p, true);
+        oylng_status s2;
+        while ((s2 = oylng_parse_tree(p, &t)) == OYLNG_OK && t) oylng_tree_free(t);
+        m2 = oylng_parser_error_mark(p);
+        oylng_parser_free(p);
+        CHECK(s1 == OYLNG_ERR_PARSE && s2 == s1 && m1.offset == m2.offset, "refused alike, kept or not: %zu", i);
+    }
+    CHECK(kept("%YAML 2.0\n--- &\na: {p: 1}\n---\nm: {<<: *a, p: 5}\n", 0, false, NULL) == OYLNG_OK,
+          "a written key may still be a merged one");
+
+    /* mappings each merging the last twice: a lookup looks in each once,
+       not 2^30 times */
+    char *dag = malloc(4096);
+    strcpy(dag, "%YAML 2.0\n--- &\nm0: {k: v}\n");
+    for (int i = 1; i <= 30; i++) sprintf(dag + strlen(dag), "m%d: {<<: *m%d, <<: *m%d}\n", i, i - 1, i - 1);
+    strcat(dag, "---\na: *m30:k\n");
+    CHECK(kept(dag, 0, false, &t) == OYLNG_OK && t && text_is(t, at(t, oylng_tree_root(t), "a"), "v"),
+          "found through 30 levels of merges");
+    oylng_tree_free(t);
+    strcat(dag, "b: *m30:nope\n");
+    CHECK(kept(dag, 0, false, NULL) == OYLNG_ERR_PARSE, "and not found, soon");
+    free(dag);
+
+    /* the table, kept: its <<: lines too */
+    p = oylng_parser_new(mg, strlen(mg));
+    oylng_parser_set_keep(p, true);
+    CHECK(oylng_parse_tree(p, &t) == OYLNG_OK && t, "a kept document, for its table");
+    oylng_tree_free(t);
+    oylng_tree *tb;
+    CHECK(oylng_parser_table(p, &tb) == OYLNG_OK && tb && oylng_node_count(tb, oylng_tree_root(tb)) == 3,
+          "its table");
+    oylng_tree_free(tb);
+    oylng_parser_free(p);
+    p = oylng_parser_new(pt, strlen(pt));
+    oylng_parser_set_keep(p, true);
+    CHECK(oylng_parse_tree(p, &t) == OYLNG_OK && t, "another");
+    oylng_tree_free(t);
+    CHECK(oylng_parser_table(p, &tb) == OYLNG_OK && tb, "its table");
+    if (tb) {
+        oylng_node c = at(tb, oylng_tree_root(tb), "c");
+        CHECK(oylng_node_merges(tb, c) == 1 && oylng_node_count(tb, c) == 0 &&
+              oylng_node_merges(tb, oylng_node_target(tb, oylng_node_merge(tb, c, 0))) == 1,
+              "c's <<: line, naming b's");
+    }
+    oylng_tree_free(tb);
+    oylng_parser_free(p);
+
+    /* together, the documents' sizes add up: 5 each */
+    const char *three = "%YAML 2.0\n---\na: 1\n---\nb: 2\n---\nc: 3\n";
+    CHECK(together_events(three, 15) == OYLNG_OK && together_events(three, 14) == OYLNG_ERR_LIMIT,
+          "15 allows three together, 14 doesn't");
+    CHECK(parse(three, 5, NULL) == OYLNG_OK, "one at a time, 5 does");
+    CHECK(kept(three, 15, true, NULL) == OYLNG_OK && kept(three, 14, true, NULL) == OYLNG_ERR_LIMIT,
+          "and as kept trees");
+    /* ... takes the table off, unless references are kept too: the first
+       table is 8, the documents 4 held and 9 and 6 full, the second table 5 */
+    const char *dots = "%YAML 2.0\n--- &\na: [x, yy]\n---\nb: *a\n...\n--- &\nc: [z]\n---\nd: *c\n";
+    CHECK(together_events(dots, 20) == OYLNG_OK && together_events(dots, 19) == OYLNG_ERR_LIMIT,
+          "together, full is 20 at most");
+    CHECK(kept(dots, 21, true, NULL) == OYLNG_OK && kept(dots, 20, true, NULL) == OYLNG_ERR_LIMIT,
+          "together and kept, held is 21");
+    CHECK(kept(dots, 12, false, NULL) == OYLNG_OK && kept(dots, 11, false, NULL) == OYLNG_ERR_LIMIT,
+          "kept alone, 12");
+}
+
 int main(void) {
     test_error_marks();
     test_stop();
@@ -676,6 +890,7 @@ int main(void) {
     test_fast();
     test_tree();
     test_table();
+    test_keep();
     printf("api: %d checks, %d failed\n", checks, failures);
     return failures ? 1 : 0;
 }

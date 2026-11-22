@@ -21,7 +21,8 @@ string. The parser:
   since a key written after them can still replace a merged one;
 - refuses repeated keys, in time linear in the input;
 - applies the size limit of section 10, 64 MiB by default, to both held and
-  full sizes. A larger document needs the limit raised;
+  full sizes, or to held alone with references kept (below). A larger
+  document needs the limit raised;
 - goes to 256 levels, with references followed, or up to 4096 if set;
 - stops at `...` and says where the rest of the input starts;
 - reports errors with a line, a column and a message. A document in error
@@ -82,6 +83,47 @@ than 8 pairs has an index, so `oylng_node_get` takes about the same time
 however many it has. A document in error gives no tree. A tree needs only
 the input to outlive it, not the parser, and `oylng_emit_tree` writes it.
 Documents can be read as trees and as events in turn.
+
+## Keeping references
+
+A short chain of references can read as terabytes: `a1: [*a0, *a0]`,
+`a2: [*a1, *a1]` and so on, and after 40 lines the data has more than a
+trillion nodes. A parser delivering data refuses that, as a program walking
+it would walk all of them. A tool that edits files, or a program that wants the data
+as written, reads it with references kept instead (sections 10 and 11):
+
+```c
+oylng_parser *p = oylng_parser_new(text, len);
+oylng_parser_set_keep(p, true);   /* before the first read */
+oylng_tree *t;
+while (oylng_parse_tree(p, &t) == OYLNG_OK && t) {
+    /* ... */
+    oylng_tree_free(t);
+}
+```
+
+The limit then applies to held alone, the size of what is written, and
+nothing is spread:
+
+- a reference is the node it names, shared, as in any tree;
+- a `-<<` is an item of its own, of kind `OYLNG_NODE_SPLICE`, and
+  `oylng_node_target` gives the sequence it names;
+- a mapping's `<<:` lines are `OYLNG_NODE_MERGE` nodes, apart from its
+  pairs: `oylng_node_merges` and `oylng_node_merge` give them in order, and
+  `oylng_node_target` the mapping each one names. The pairs are only those
+  written, and `oylng_node_get` finds only those. A key that isn't written
+  is in the merged mappings, the last first (section 9.1).
+
+A path through merged mappings, such as `*c:p`, still works, and the parser
+looks in each mapping once. Events would deliver every reference in full, so
+with references kept `oylng_parse_next` is `OYLNG_ERR_INPUT`, and so is
+`oylng_emit_tree` on a kept tree, and for now `oylng_parse_typed`. What walks
+a kept tree in full should check its full size first, as section 10 says.
+
+An application that keeps every document it reads says so with
+`oylng_parser_set_together`. The documents' sizes then add up, rather than
+each document starting again, and with references kept, `...` takes nothing
+off held either, as the documents still name the old table.
 
 ## Typing a document (part 2)
 

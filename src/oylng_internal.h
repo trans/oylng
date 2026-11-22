@@ -176,7 +176,12 @@ static inline uint64_t oylng_hash(const oylng_hash_key *key, const void *data, s
 
 #define OYLNG__EVT_REF 64
 
-enum { OYLNG__T_STR, OYLNG__T_SEQ, OYLNG__T_MAP };
+/* With references kept, a -<< and a <<: line are an event each, naming the
+ * table's node they name (value.len) where they are written (offset) */
+#define OYLNG__EVT_SPLICE 65
+#define OYLNG__EVT_MERGE  66
+
+enum { OYLNG__T_STR, OYLNG__T_SEQ, OYLNG__T_MAP, OYLNG__T_SPLICE, OYLNG__T_MERGE };
 
 typedef struct {
     int         kind;   /* OYLNG__T_ */
@@ -184,9 +189,12 @@ typedef struct {
     size_t      len;
     size_t      pos;    /* where the table holds it */
     bool        plain;  /* a string written plain, or an empty value */
+    uint32_t    link;   /* a -<< or <<: line's: the node it names, references followed */
 } oylng__tnode;
 
 void         oylng__parser_tree_mode(oylng_parser *p, bool on);
+/* Whether the parser keeps references (oylng_parser_set_keep) */
+bool         oylng__parser_keep(const oylng_parser *p);
 void         oylng__parser_input(const oylng_parser *p, const char **in, size_t *len);
 /* Whether the next event is outside a document: STREAM_START, DOC_START,
  * STREAM_END, or an error */
@@ -201,7 +209,10 @@ uint64_t    *oylng__tree_memo(oylng_parser *p, uint32_t *gen);
 void         oylng__table_node(const oylng_parser *p, uint32_t i, oylng__tnode *out);
 /* Calls fn for each child of the table's collection i, references followed:
  * a sequence's items, each -<< spread; a mapping's keys and values,
- * alternating, its merges applied. False if memory runs out. */
+ * alternating, its merges applied. With references kept, as written
+ * instead: a -<< is an item and a <<: line a child of its own, which
+ * oylng__table_node gives as OYLNG__T_SPLICE and OYLNG__T_MERGE, a
+ * mapping's lines first. False if memory runs out. */
 bool         oylng__table_children(const oylng_parser *p, uint32_t i,
                                    void (*fn)(void *, uint32_t), void *ctx);
 

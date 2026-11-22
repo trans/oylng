@@ -15,6 +15,12 @@
  * Nothing recurses: a collection's children are gathered on a stack until
  * it closes, and a node of the table is copied through a list of the
  * collections still to fill.
+ *
+ * A tree that keeps references (oylng_parser_set_keep) is the same, but
+ * nothing in it is spread: a -<< is an item of its own, a SPLICE node, and
+ * a <<: line a MERGE node, each naming the node it names, shared. A
+ * mapping's MERGE nodes go in kids just before its pairs, then how many
+ * there are, so that its pairs start where they always do.
  */
 
 #include "oylng_internal.h"
@@ -25,9 +31,11 @@
 #define F_POOLED 1u      /* a string's text is in the pool */
 #define F_PLAIN  2u      /* a string written plain, or an empty value */
 #define F_TABLE  4u      /* copied from the table, so it may be shared */
+#define F_MERGES 8u      /* a kept tree's mapping with <<: lines, before its pairs */
 
 typedef struct {
-    uint32_t a;          /* STR: where its text starts. SEQ, MAP: where its kids start */
+    uint32_t a;          /* STR: where its text starts. SEQ, MAP: where its kids start.
+                            SPLICE, MERGE: the node it names */
     uint32_t n;          /* STR: its length. SEQ: its items. MAP: its pairs */
     uint32_t pos;        /* where it is written in the input */
     uint8_t  kind;       /* oylng_kind */
@@ -50,6 +58,7 @@ struct oylng_tree {
     uint32_t       name_a, name_n;
     bool           keyed;
     oylng_hash_key key;
+    bool           kept;   /* references kept: SPLICE and MERGE nodes */
 };
 
 /* What is needed only while the tree is read */
@@ -135,6 +144,15 @@ static oylng_node new_str(builder *B, const char *data, size_t len, size_t pos, 
     return id;
 }
 
+/* A kept tree's -<< or <<: line, naming node t */
+static oylng_node link_node(builder *B, bool splice, oylng_node t, size_t pos, uint8_t flags) {
+    oylng_node id = new_node(B, splice ? OYLNG_NODE_SPLICE : OYLNG_NODE_MERGE, pos);
+    if (id == OYLNG_NO_NODE) return id;
+    B->T->nodes[id].a = t;
+    B->T->nodes[id].flags = flags;
+    return id;
+}
+
 static void push_child(builder *B, oylng_node id) {
     if (!ROOM(B, B->stk, B->caps, B->ns + 1)) return;
     B->stk[B->ns++] = id;
@@ -155,10 +173,16 @@ static uint64_t key_hash(const oylng_tree *T, oylng_str k) {
 }
 
 /* Collection id closes with the children on the stack from s0 */
+static void close_merged(builder *B, oylng_node id, size_t s0);
+
 static void close_coll(builder *B, oylng_node id, size_t s0) {
     oylng_tree *T = B->T;
     size_t nkids = B->ns - s0;
     bool map = T->nodes[id].kind == OYLNG_NODE_MAPPING;
+    if (T->kept && map && nkids && T->nodes[B->stk[s0]].kind == OYLNG_NODE_MERGE) {
+        close_merged(B, id, s0);
+        return;
+    }
     size_t pairs = map ? nkids / 2 : nkids;
     size_t room = nkids + (map && pairs > SMALL ? index_cap(pairs) : 0);
     if (room > UINT32_MAX - T->nk) { oops(B, OYLNG_ERR_LIMIT, "a tree of 4G children or more"); return; }
@@ -187,6 +211,24 @@ static void close_coll(builder *B, oylng_node id, size_t s0) {
     }
 }
 
+/* A kept mapping with <<: lines, which come first: they go in kids before
+ * its pairs, then their count, and the pairs are closed as any mapping's */
+static void close_merged(builder *B, oylng_node id, size_t s0) {
+    oylng_tree *T = B->T;
+    size_t nkids = B->ns - s0, nm = 0;
+    while (nm < nkids && T->nodes[B->stk[s0 + nm]].kind == OYLNG_NODE_MERGE) nm++;
+    if (nm + 1 > UINT32_MAX - T->nk) { oops(B, OYLNG_ERR_LIMIT, "a tree of 4G children or more"); return; }
+    if (!ROOM(B, T->kids, T->capk, T->nk + nm + 1)) return;
+    memcpy(T->kids + T->nk, B->stk + s0, nm * sizeof *T->kids);
+    T->kids[T->nk + nm] = (uint32_t)nm;
+    T->nk += nm + 1;
+    /* the pairs, moved down to where the lines were */
+    memmove(B->stk + s0, B->stk + s0 + nm, (nkids - nm) * sizeof *B->stk);
+    B->ns -= nm;
+    close_coll(B, id, s0);   /* its first child now a key, never a line */
+    T->nodes[id].flags |= F_MERGES;
+}
+
 /* The tree's node for node i of the table: made now, if it is new, and a
  * collection put on the list to fill */
 static oylng_node table_node(builder *B, uint32_t i) {
@@ -200,7 +242,11 @@ static oylng_node table_node(builder *B, uint32_t i) {
     oylng__table_node(B->P, i, &tn);
     oylng_node id;
     if (tn.kind == OYLNG__T_STR) id = new_str(B, tn.data, tn.len, tn.pos, F_TABLE | (tn.plain ? F_PLAIN : 0));
-    else {
+    else if (tn.kind == OYLNG__T_SPLICE || tn.kind == OYLNG__T_MERGE) {
+        /* what it names is made now and filled with the rest */
+        oylng_node t = table_node(B, tn.link);
+        id = t == OYLNG_NO_NODE ? t : link_node(B, tn.kind == OYLNG__T_SPLICE, t, tn.pos, F_TABLE);
+    } else {
         id = new_node(B, tn.kind == OYLNG__T_SEQ ? OYLNG_NODE_SEQUENCE : OYLNG_NODE_MAPPING, tn.pos);
         if (id != OYLNG_NO_NODE) B->T->nodes[id].flags = F_TABLE;
         if (id != OYLNG_NO_NODE && ROOM(B, B->todo, B->capt, B->nt + 1))
@@ -244,6 +290,11 @@ static void read_doc(builder *B) {
             break;
         case OYLNG__EVT_REF:
             id = from_table(B, (uint32_t)e->value.len);
+            break;
+        case OYLNG__EVT_SPLICE:
+        case OYLNG__EVT_MERGE:
+            id = from_table(B, (uint32_t)e->value.len);
+            if (id != OYLNG_NO_NODE) id = link_node(B, e->type == OYLNG__EVT_SPLICE, id, e->offset, 0);
             break;
         case OYLNG_EVT_MAP_START:
         case OYLNG_EVT_SEQ_START:
@@ -314,6 +365,7 @@ oylng_status oylng__tree_read(oylng_parser *P, oylng_tree **out,
         B.T->in = in;
         B.T->inlen = len;
         B.T->root = OYLNG_NO_NODE;
+        B.T->kept = oylng__parser_keep(P);
         if (e->value.data) {
             B.T->has_name = true;
             B.T->name_n = (uint32_t)e->value.len;
@@ -356,6 +408,7 @@ oylng_status oylng_parser_table(oylng_parser *P, oylng_tree **out) {
     if (!B.T) return OYLNG_ERR_MEMORY;
     B.T->in = in;
     B.T->inlen = len;
+    B.T->kept = oylng__parser_keep(P);
     /* a mapping of the entries, where the first one's key is */
     uint32_t k, v;
     oylng__tnode kn;
@@ -437,6 +490,21 @@ oylng_node oylng_node_value(const oylng_tree *T, oylng_node map, size_t i) {
     const tnode *nd = get(T, map);
     if (!nd || nd->kind != OYLNG_NODE_MAPPING || i >= nd->n) return OYLNG_NO_NODE;
     return T->kids[nd->a + 2 * i + 1];
+}
+
+oylng_node oylng_node_target(const oylng_tree *T, oylng_node n) {
+    const tnode *nd = get(T, n);
+    return nd && (nd->kind == OYLNG_NODE_SPLICE || nd->kind == OYLNG_NODE_MERGE) ? nd->a : OYLNG_NO_NODE;
+}
+
+size_t oylng_node_merges(const oylng_tree *T, oylng_node map) {
+    const tnode *nd = get(T, map);
+    return nd && nd->kind == OYLNG_NODE_MAPPING && (nd->flags & F_MERGES) ? T->kids[nd->a - 1] : 0;
+}
+
+oylng_node oylng_node_merge(const oylng_tree *T, oylng_node map, size_t i) {
+    size_t nm = oylng_node_merges(T, map);
+    return i < nm ? T->kids[T->nodes[map].a - 1 - nm + i] : OYLNG_NO_NODE;
 }
 
 static bool same(oylng_str a, oylng_str b) {
@@ -536,6 +604,8 @@ bool oylng__tree_set_str(oylng_tree *T, oylng_node n, const char *s, size_t len,
 
 oylng_status oylng_emit_tree(oylng_emitter *E, const oylng_tree *T) {
     if (!E || !T || T->root == OYLNG_NO_NODE) return OYLNG_ERR_INPUT;
+    /* written in full, its references could be any size */
+    if (T->kept) return OYLNG_ERR_INPUT;
     oylng_status st = oylng_emit_doc_start(E, oylng_tree_name(T));
     if (st != OYLNG_OK) return st;
     /* the collections open: each one's node and its next child */

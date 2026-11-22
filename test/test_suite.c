@@ -8,8 +8,13 @@
  * or error, with rest, limit, keep and together where a test has them.
  * Each test's events must match test.event, a test with error must be
  * refused, and the text after a stopping ... must be rest. Tests marked
- * keep or together are for interfaces this parser doesn't offer yet, and
- * are skipped. Each test that passes is then written again by the emitter,
+ * keep is for an interface that keeps references, and only checks that
+ * the stream is accepted or refused, so it is read that way alone; one
+ * marked together is read with oylng_parser_set_together. Every other
+ * test is also read with references kept, and where it was accepted, its
+ * kept trees, spread as section 9 says, must give the same events and
+ * offsets; where it was refused other than for full, it must be refused
+ * the same way. Each test that passes is then written again by the emitter,
  * four ways, and each must read back as the same events; written again
  * from what it wrote, block style must give the same text. Each test is
  * also read as trees, which must give the same events, offsets and
@@ -26,7 +31,8 @@
 #include <string.h>
 #include <sys/stat.h>
 
-static int passed, failed, skipped, verbose, trips, trees;
+static int passed, failed, skipped, verbose, trips, trees, kept;
+static bool together;   /* the test's: every parser here is set so */
 
 static char *slurp(const char *dir, const char *name, size_t *len) {
     char path[4096];
@@ -63,6 +69,7 @@ static void unix_breaks(char *s, size_t *len) {
  * refused */
 static char *events_of(const char *text, size_t len, const char *limit, const char **err) {
     oylng_parser *p = oylng_parser_new(text, len);
+    oylng_parser_set_together(p, together);
     if (limit) oylng_parser_set_limit(p, strtoull(limit, NULL, 10));
     strbuf got = { 0 };
     const oylng_event *e;
@@ -89,6 +96,7 @@ static char *events_of(const char *text, size_t len, const char *limit, const ch
 static char *emitted(const char *text, size_t len, const char *limit, bool flow, unsigned indent,
                      size_t *olen, const char **err) {
     oylng_parser *p = oylng_parser_new(text, len);
+    oylng_parser_set_together(p, together);
     if (limit) oylng_parser_set_limit(p, strtoull(limit, NULL, 10));
     oylng_emitter *em = oylng_emitter_new();
     oylng_emitter_set_flow(em, flow);
@@ -187,6 +195,152 @@ static bool tree_events(const oylng_tree *t, oylng_node n, strbuf *ev, strbuf *o
     return true;
 }
 
+/* A kept tree's mapping's pairs as the data has them (section 9.1): each
+ * <<: line's, then each written one, added at the end, or in place of the
+ * value of a key already there, a written key replacing the key too, as
+ * the parser does */
+typedef struct { oylng_node k, v; } kpair;
+typedef struct { kpair *p; size_t n, cap; } kpairs;
+
+static void kp_put(const oylng_tree *t, kpairs *ps, oylng_node k, oylng_node v, bool written) {
+    oylng_str kt = oylng_node_text(t, k);
+    for (size_t i = 0; i < ps->n; i++) {
+        oylng_str o = oylng_node_text(t, ps->p[i].k);
+        if (o.len == kt.len && (!o.len || memcmp(o.data, kt.data, o.len) == 0)) {
+            if (written) ps->p[i].k = k;
+            ps->p[i].v = v;
+            return;
+        }
+    }
+    if (ps->n == ps->cap) {
+        ps->cap = ps->cap ? 2 * ps->cap : 8;
+        ps->p = realloc(ps->p, ps->cap * sizeof *ps->p);
+    }
+    ps->p[ps->n++] = (kpair){ k, v };
+}
+
+static void kept_pairs(const oylng_tree *t, oylng_node map, kpairs *ps) {
+    for (size_t i = 0; i < oylng_node_merges(t, map); i++) {
+        kpairs src = { 0 };
+        kept_pairs(t, oylng_node_target(t, oylng_node_merge(t, map, i)), &src);
+        for (size_t j = 0; j < src.n; j++) kp_put(t, ps, src.p[j].k, src.p[j].v, false);
+        free(src.p);
+    }
+    for (size_t i = 0; i < oylng_node_count(t, map); i++)
+        kp_put(t, ps, oylng_node_key(t, map, i), oylng_node_value(t, map, i), true);
+}
+
+static bool kept_events(const oylng_tree *t, oylng_node n, strbuf *ev, strbuf *offs);
+
+/* A kept sequence's items, each SPLICE spread */
+static bool kept_items(const oylng_tree *t, oylng_node seq, strbuf *ev, strbuf *offs) {
+    for (size_t i = 0; i < oylng_node_count(t, seq); i++) {
+        oylng_node it = oylng_node_item(t, seq, i);
+        bool ok = oylng_node_kind(t, it) == OYLNG_NODE_SPLICE ? kept_items(t, oylng_node_target(t, it), ev, offs)
+                                                             : kept_events(t, it, ev, offs);
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/* A kept tree's node as events, spread, as tree_events gives a tree's */
+static bool kept_events(const oylng_tree *t, oylng_node n, strbuf *ev, strbuf *offs) {
+    oylng_kind k = oylng_node_kind(t, n);
+    if (k == OYLNG_NODE_SPLICE || k == OYLNG_NODE_MERGE) return false;   /* never a value */
+    oylng_event e = { OYLNG_EVT_SCALAR, oylng_node_text(t, n), oylng_node_mark(t, n).offset,
+                      oylng_node_plain(t, n) };
+    char o[32];
+    snprintf(o, sizeof o, k == OYLNG_NODE_STRING ? "%zu %c\n" : "%zu\n", e.offset, e.plain ? 'p' : 'q');
+    sb_str(offs, o);
+    if (k == OYLNG_NODE_STRING) {
+        ev_line(ev, &e);
+        return true;
+    }
+    bool map = k == OYLNG_NODE_MAPPING, ok = true;
+    e.type = map ? OYLNG_EVT_MAP_START : OYLNG_EVT_SEQ_START;
+    ev_line(ev, &e);
+    if (map) {
+        kpairs ps = { 0 };
+        kept_pairs(t, n, &ps);
+        for (size_t i = 0; i < ps.n && ok; i++)
+            ok = kept_events(t, ps.p[i].k, ev, offs) && kept_events(t, ps.p[i].v, ev, offs);
+        free(ps.p);
+        /* the pairs written are found, and only they */
+        for (size_t i = 0; i < oylng_node_count(t, n) && ok; i++)
+            ok = oylng_node_get(t, n, oylng_node_text(t, oylng_node_key(t, n, i))) == oylng_node_value(t, n, i);
+    } else ok = kept_items(t, n, ev, offs);
+    e.type = map ? OYLNG_EVT_MAP_END : OYLNG_EVT_SEQ_END;
+    ev_line(ev, &e);
+    return ok;
+}
+
+/* Why the stream read with references kept doesn't give, spread, the
+ * events want and offsets offs (want NULL: it was refused with werr at wm,
+ * and must be refused so too, unless for full); NULL if it does. A test
+ * marked keep has want and offs NULL too, and must only be accepted, or
+ * refused if werr isn't NULL. */
+static const char *kept_check(const char *in, size_t len, const char *limit, const char *want,
+                              const char *offs, const char *werr, oylng_mark wm, bool keep_test,
+                              char *detail, size_t dn) {
+    oylng_parser *p = oylng_parser_new(in, len);
+    if (limit) oylng_parser_set_limit(p, strtoull(limit, NULL, 10));
+    oylng_parser_set_together(p, together);
+    oylng_parser_set_keep(p, true);
+    const oylng_event *e;
+    const char *why = NULL;
+    if (oylng_parse_next(p, &e) != OYLNG_ERR_INPUT) why = "events were given with references kept";
+    strbuf ev = { 0 }, of = { 0 };
+    sb_str(&ev, "+STR\n");
+    oylng_tree *t;
+    oylng_status st;
+    oylng_emitter *em = oylng_emitter_new();
+    while (!why && (st = oylng_parse_tree(p, &t)) == OYLNG_OK && t) {
+        oylng_event d = { OYLNG_EVT_DOC_START, oylng_tree_name(t), 0, false };
+        ev_line(&ev, &d);
+        /* spread only where the full size was accepted: refused for it,
+           a kept tree can stand for terabytes */
+        if (want && !kept_events(t, oylng_tree_root(t), &ev, &of)) why = "a kept tree is wrong";
+        d.type = OYLNG_EVT_DOC_END;
+        ev_line(&ev, &d);
+        oylng_emit_stream_start(em);
+        if (!why && oylng_emit_tree(em, t) != OYLNG_ERR_INPUT) why = "a kept tree was written";
+        oylng_tree_free(t);
+    }
+    oylng_emitter_free(em);
+    sb_str(&ev, "-STR\n");
+    const char *err = oylng_parser_error(p);
+    oylng_mark m = oylng_parser_error_mark(p);
+    if (why) ;
+    else if (keep_test) {
+        if (werr && st == OYLNG_OK) why = "not refused with references kept";
+        else if (!werr && st != OYLNG_OK) {
+            snprintf(detail, dn, "%zu:%zu: %s", m.line, m.col, err ? err : "(no message)");
+            why = "refused with references kept";
+        }
+    } else if (!want) {
+        if (!strstr(werr, "with references expanded")) {
+            if (st == OYLNG_OK) why = "not refused with references kept";
+            else if (!err || strcmp(err, werr) != 0 || m.offset != wm.offset) {
+                snprintf(detail, dn, "%zu:%zu: %s", m.line, m.col, err ? err : "(no message)");
+                why = "refused otherwise with references kept";
+            }
+        }
+    } else if (st != OYLNG_OK) {
+        snprintf(detail, dn, "%zu:%zu: %s", m.line, m.col, err ? err : "(no message)");
+        why = "refused with references kept";
+    } else if (strcmp(ev.data, want) != 0) {
+        snprintf(detail, dn, "\n%s", ev.data);
+        why = "kept trees give other events";
+    } else if (strcmp(of.data ? of.data : "", offs) != 0) {
+        why = "kept trees give other offsets";
+    }
+    if (!why) kept++;
+    free(ev.data);
+    free(of.data);
+    oylng_parser_free(p);
+    return why;
+}
+
 /* Why the stream read as trees doesn't give the events want, the offsets
  * offs, the error the events gave (want NULL) and the text the emitter
  * writes from events; NULL if it does */
@@ -194,6 +348,7 @@ static const char *tree_check(const char *in, size_t len, const char *limit, con
                               const char *offs, const char *werr, oylng_mark wm,
                               char *detail, size_t dn) {
     oylng_parser *p = oylng_parser_new(in, len);
+    oylng_parser_set_together(p, together);
     if (limit) oylng_parser_set_limit(p, strtoull(limit, NULL, 10));
     oylng_emitter *em = oylng_emitter_new();
     oylng_emit_stream_start(em);
@@ -255,17 +410,31 @@ static const char *tree_check(const char *in, size_t len, const char *limit, con
 }
 
 static void run(const char *dir) {
-    if (has(dir, "keep") || has(dir, "together")) { skipped++; return; }
     size_t len;
     char *in = slurp(dir, "in.yaml", &len);
     char *name = slurp(dir, "===", NULL);
     if (name) name[strcspn(name, "\n")] = '\0';
     int want_error = has(dir, "error");
-    char *want = want_error ? NULL : slurp(dir, "test.event", NULL);
     char *limit = slurp(dir, "limit", NULL);
+    together = has(dir, "together");
+    if (has(dir, "keep")) {
+        char detail[512] = "";
+        const char *why = kept_check(in, len, limit, NULL, NULL, want_error ? "" : NULL, (oylng_mark){ 0 },
+                                     true, detail, sizeof detail);
+        if (why) {
+            failed++;
+            printf("FAIL %s (%s): %s %s\n", dir, name ? name : "?", why, detail);
+        } else passed++;
+        free(in);
+        free(name);
+        free(limit);
+        return;
+    }
+    char *want = want_error ? NULL : slurp(dir, "test.event", NULL);
 
     oylng_parser *p = oylng_parser_new(in, len);
     if (limit) oylng_parser_set_limit(p, strtoull(limit, NULL, 10));
+    oylng_parser_set_together(p, together);
     strbuf got = { 0 }, offs = { 0 };
     sb_add(&offs, "", 0);
     const char *err = NULL;
@@ -292,6 +461,7 @@ static void run(const char *dir) {
     if (want_error) {
         if (!err) why = "not refused";
         else why = tree_check(in, len, limit, NULL, NULL, err, m, detail, sizeof detail);
+        if (!why) why = kept_check(in, len, limit, NULL, NULL, err, m, false, detail, sizeof detail);
     } else if (err) {
         why = "refused";
         snprintf(detail, sizeof detail, "%zu:%zu: %s", m.line, m.col, err);
@@ -315,6 +485,7 @@ static void run(const char *dir) {
         free(rest);
         if (!why) why = round_trip(in, len, limit, want, detail, sizeof detail);
         if (!why) why = tree_check(in, len, limit, want, offs.data, NULL, m, detail, sizeof detail);
+        if (!why) why = kept_check(in, len, limit, want, offs.data, NULL, m, false, detail, sizeof detail);
     }
 
     if (why) {
@@ -376,8 +547,9 @@ int main(int argc, char **argv) {
     }
     if (!data) { fprintf(stderr, "usage: test_suite DATA [-v]\n"); return 2; }
     walk(data);
-    printf("suite: %d passed, %d failed, %d skipped (keep or together)\n", passed, failed, skipped);
+    printf("suite: %d passed, %d failed, %d skipped\n", passed, failed, skipped);
     printf("emitter: %d streams written again and read back the same\n", trips);
     printf("tree: %d streams read as trees, the same as their events\n", trees);
+    printf("keep: %d streams read with references kept, accepted and refused alike, the same when spread\n", kept);
     return failed ? 1 : 0;
 }

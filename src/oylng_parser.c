@@ -24,6 +24,12 @@
  * the limit. A document in error may have delivered events already, but
  * the error comes before its end (section 2).
  *
+ * With references kept (oylng_parser_set_keep), the limit is on held
+ * alone, and nothing is walked or built for a document: a reference, a
+ * -<< and a <<: line each come as one event naming the table's node, for
+ * the tree. A <<: line in the table stays a node, its mapping's pairs not
+ * copied into a plan, so a path through it looks in the mappings it names.
+ *
  * Errors unwind with longjmp to oylng_parse_next. Everything the parser
  * allocates hangs off the parser, so nothing leaks when they do.
  */
@@ -44,6 +50,7 @@ enum { N_STR, N_SEQ, N_MAP, N_REF, N_SPLICE, N_MERGE };
 enum { S_PLAIN, S_SINGLE, S_DOUBLE, S_LITERAL, S_FOLDED, S_EMPTY };
 
 #define F_MERGED 1u   /* a mapping with <<: lines, read through its plan */
+#define F_KEPT   2u   /* a mapping with <<: lines, kept as written: no plan */
 
 typedef struct {
     uint8_t     kind;
@@ -96,6 +103,10 @@ typedef struct {
     uint64_t full;
     bool     reached;   /* a type has reached it, so it can't be replaced */
 } entry;
+
+/* Looking a key up through kept <<: lines: a mapping, and its next line to
+ * look through */
+typedef struct { uint32_t map, next; } mframe;
 
 /* Reading events off the array */
 enum { W_NODES, W_PLAN };
@@ -169,6 +180,8 @@ struct oylng_parser {
     bool     in_key;     /* reading a key, whose text is kept until its mapping closes */
     bool     defer;      /* reading an entry's key: check the limit after */
     bool     any_doc;    /* a marker has been read */
+    bool     keep;       /* references kept: the limit is on held alone (section 10) */
+    bool     together;   /* every document kept: sizes add up (section 10) */
     unsigned depth;      /* collections open, as written */
 
     /* the last look for a block mapping's key, at look_at: whether one
@@ -203,8 +216,9 @@ struct oylng_parser {
     oylng_hash_key hkey;
     bool           hkey_set;
 
-    /* section 10: the table's sizes, and the document's */
-    uint64_t t_held, t_full, d_held, d_full;
+    /* section 10: the table's sizes, and the document's, and full's limit:
+       limit, or none with references kept */
+    uint64_t t_held, t_full, d_held, d_full, full_limit;
 
     /* the document being delivered, and the walk delivering nodes */
     oylng_str name;
@@ -260,6 +274,13 @@ struct oylng_parser {
     /* for the typed reader: the application's bindings (section 12) */
     oylng__binding *binds;
     uint32_t        nbinds, capbinds;
+
+    /* looking a key up through kept <<: lines: the mappings looked in,
+       marked with seen_gen, and those still to look through */
+    uint32_t *seen;
+    uint32_t  capseen, seen_gen;
+    mframe   *mstack;
+    uint32_t  capmstack;
 
     oylng_status status;
     oylng_mark   errmark;
@@ -326,10 +347,11 @@ static inline uint64_t cur_full(const parser *P) {
     return P->in_table ? P->t_full : P->d_full;
 }
 
-/* Refuses the stream once held or full passes the limit. This interface
- * delivers data with no references left, so the limit applies to both. */
+/* Refuses the stream once held or full passes the limit. An interface
+ * that delivers data with no references left applies it to both; one that
+ * keeps them, to held alone. */
 static void check(parser *P, const char *at) {
-    if (sat(P->t_full, P->d_full) > P->limit)
+    if (sat(P->t_full, P->d_full) > P->full_limit)
         fail_limit(P, at, "past the size limit of %llu, with references expanded",
                    (unsigned long long)P->limit);
     if (sat(P->t_held, P->d_held) > P->limit)
@@ -1050,8 +1072,14 @@ static uint32_t entry_get(parser *P, const char *k, size_t kl) {
     return s ? P->entries[s->val].val : NONE;
 }
 
-/* The value of key k in mapping m of the table, or NONE */
-static uint32_t map_get(parser *P, uint32_t m, const char *k, size_t kl) {
+static inline uint32_t deref(const parser *P, uint32_t v) {
+    while (P->nodes[v].kind == N_REF) v = P->nodes[v].link;
+    return v;
+}
+
+/* The value of key k written in mapping m of the table, or of its plan if
+ * it has one, or NONE */
+static uint32_t map_get1(parser *P, uint32_t m, const char *k, size_t kl) {
     const node *nd = &P->nodes[m];
     bool merged = (nd->sub & F_MERGED) != 0;
     uint32_t cnt = merged ? P->plans[nd->aux].count : nd->aux;
@@ -1065,15 +1093,57 @@ static uint32_t map_get(parser *P, uint32_t m, const char *k, size_t kl) {
     if (merged) {
         for (uint32_t i = 0; i < cnt; i++)
             if (key_is(P, pr[i].key, k, kl)) return pr[i].val;
-    } else
-        for (uint32_t i = m + 1; i < nd->link; i = subtree_end(P, i + 1))
+    } else {
+        uint32_t i = m + 1;
+        if (nd->sub & F_KEPT)   /* its <<: lines come first */
+            while (P->nodes[i].kind == N_MERGE) i++;
+        for (; i < nd->link; i = subtree_end(P, i + 1))
             if (key_is(P, i, k, kl)) return i + 1;
+    }
     return NONE;
 }
 
-static inline uint32_t deref(const parser *P, uint32_t v) {
-    while (P->nodes[v].kind == N_REF) v = P->nodes[v].link;
-    return v;
+/* The value of key k in mapping m of the table, or NONE. With its <<:
+ * lines kept, a key not written in m is in the mappings they name, the last
+ * first (section 9.1), and so on down. Each mapping is looked in once, so a
+ * mapping merged in twice costs nothing more. */
+static uint32_t map_get(parser *P, uint32_t m, const char *k, size_t kl) {
+    uint32_t v = map_get1(P, m, k, kl);
+    if (v != NONE || !(P->nodes[m].sub & F_KEPT)) return v;
+    if (P->capseen < P->n) {
+        uint32_t old = P->capseen;
+        P->seen = grow(P, P->seen, &P->capseen, P->n, sizeof *P->seen);
+        memset(P->seen + old, 0, (size_t)(P->capseen - old) * sizeof *P->seen);
+    }
+    if (++P->seen_gen == 0) {   /* once in 4G lookups */
+        memset(P->seen, 0, (size_t)P->capseen * sizeof *P->seen);
+        P->seen_gen = 1;
+    }
+    /* each frame a mapping and its next <<: line to look through, from the
+       last; a line's node is past the mapping's */
+    uint32_t sp = 0;
+    P->seen[m] = P->seen_gen;
+    P->mstack = grow(P, P->mstack, &P->capmstack, sp + 1, sizeof *P->mstack);
+    uint32_t last = m + 1;
+    while (P->nodes[last].kind == N_MERGE) last++;
+    P->mstack[sp].map = m;
+    P->mstack[sp++].next = last;
+    while (sp) {
+        mframe *f = &P->mstack[sp - 1];
+        if (f->next == f->map + 1) { sp--; continue; }
+        uint32_t src = deref(P, P->nodes[--f->next].link);
+        if (P->seen[src] == P->seen_gen) continue;
+        P->seen[src] = P->seen_gen;
+        v = map_get1(P, src, k, kl);
+        if (v != NONE) return v;
+        if (!(P->nodes[src].sub & F_KEPT)) continue;
+        last = src + 1;
+        while (P->nodes[last].kind == N_MERGE) last++;
+        P->mstack = grow(P, P->mstack, &P->capmstack, sp + 1, sizeof *P->mstack);
+        P->mstack[sp].map = src;
+        P->mstack[sp++].next = last;
+    }
+    return NONE;
 }
 
 /* A reference: the node in the table it names (section 8.3) */
@@ -1188,11 +1258,25 @@ static inline uint32_t pair_hash(parser *P, const mapctx *c, const char *k, size
     return c->tcap ? text_hash(P, k, len) : 0;
 }
 
-/* <<: *src, before any written key. Only a mapping being built has them. */
+/* <<: *src, before any written key. Only a mapping being built has them,
+ * unless references are kept: then the line is kept as written, a node in
+ * the table and an event in a document, and nothing is copied. */
 static void map_merge(parser *P, mapctx *c, uint32_t src, const char *at) {
     if (P->nodes[src].kind != N_MAP) fail(P, at, "<<: names a mapping");
     count(P, at, 1, P->full[src] - 1);
-    if (!P->in_table) levels_check(P, at, P->nodes[src].lev - 1u);   /* its values sit in this mapping */
+    uint32_t vl = P->nodes[src].lev - 1u;   /* its values sit in this mapping */
+    if (!P->in_table) levels_check(P, at, vl);
+    if (P->keep) {
+        if (!P->building) {
+            emit(P, (oylng_event_type)OYLNG__EVT_MERGE, NULL, src, pos(P, at));
+            return;
+        }
+        uint32_t g = new_node(P, N_MERGE, at);
+        P->nodes[g].link = src;
+        P->nodes[c->M].sub |= F_KEPT;
+        if (vl > c->lv) c->lv = vl;
+        return;
+    }
     uint32_t g = new_node(P, N_MERGE, at);
     P->nodes[g].link = src;
     c->merged = true;
@@ -1271,7 +1355,8 @@ static void splice(parser *P, mapctx *c, uint32_t src, const char *at) {
     uint32_t il = P->nodes[src].lev - 1u;   /* its items' levels; a sequence has at least 1 */
     if (!P->in_table) levels_check(P, at, il);
     if (!P->building) {
-        push(P, W_NODES, src + 1, P->nodes[src].link, OYLNG_EVT_NONE);
+        if (P->keep) emit(P, (oylng_event_type)OYLNG__EVT_SPLICE, NULL, src, pos(P, at));
+        else push(P, W_NODES, src + 1, P->nodes[src].link, OYLNG_EVT_NONE);
         return;
     }
     uint32_t s = new_node(P, N_SPLICE, at);
@@ -1461,7 +1546,8 @@ static void open_seq(parser *P, int kind, long m, bool eol_after) {
 
 /* A mapping at P->p: { for a flow one. A mapping with <<: lines is built
  * until it closes, as a key written after them can still replace a merged
- * one (section 9.1); one that isn't is delivered as it is read. */
+ * one (section 9.1); one that isn't is delivered as it is read, and so is
+ * every mapping when references are kept, its <<: lines as written. */
 static void open_map(parser *P, int kind, long m, bool eol_after) {
     const char *at = P->p;
     uint64_t before = cur_full(P);
@@ -1475,7 +1561,7 @@ static void open_map(parser *P, int kind, long m, bool eol_after) {
     f->c.before = before;
     f->c.s0 = P->nscratch;
     f->c.t0 = P->nlix;
-    if (!P->building && starts_merge(P, kind == G_FMAP)) {
+    if (!P->building && !P->keep && starts_merge(P, kind == G_FMAP)) {
         f->build_root = true;
         P->building = true;
         P->b_n = P->n;
@@ -1681,7 +1767,7 @@ static bool flow_fast(parser *P) {
         add = sat(add, 1 + (uint64_t)len);
         st = is_key ? COLON : SEP;
     }
-    if (sat(sat(P->t_full, P->d_full), add) > P->limit || sat(sat(P->t_held, P->d_held), add) > P->limit)
+    if (sat(sat(P->t_full, P->d_full), add) > P->full_limit || sat(sat(P->t_held, P->d_held), add) > P->limit)
         return false;
     P->d_held = sat(P->d_held, add);
     P->d_full = sat(P->d_full, add);
@@ -2161,6 +2247,8 @@ static void tflow_step(parser *P, gframe *f) {
 /* ── Streams (section 4) ─────────────────────────────────── */
 
 static void reset_table(parser *P) {
+    /* documents kept together still name the old table */
+    if (P->together && P->keep) P->d_held = sat(P->d_held, P->t_held);
     P->n = P->table_end = 0;
     P->npairs = P->pairs_table_end = 0;
     P->nplans = P->plans_table_end = 0;
@@ -2177,7 +2265,7 @@ static void discard_doc(parser *P) {
     P->npairs = P->pairs_table_end;
     P->nplans = P->plans_table_end;
     P->nscratch = P->nlix = 0;
-    P->d_held = P->d_full = 0;
+    if (!P->together) P->d_held = P->d_full = 0;   /* kept together, they add up */
     P->name = (oylng_str){ NULL, 0 };
 }
 
@@ -2460,14 +2548,28 @@ oylng_parser *oylng_parser_new(const char *input, size_t len) {
     if (!input) input = empty_text;
     P->in = P->p = input;
     P->end = input + len;
-    P->limit = OYLNG_DEFAULT_LIMIT;
+    P->limit = P->full_limit = OYLNG_DEFAULT_LIMIT;
     P->max_levels = OYLNG_DEFAULT_LEVELS;
     P->state = ST_START;
     return P;
 }
 
 void oylng_parser_set_limit(oylng_parser *P, uint64_t limit) {
-    if (P) P->limit = limit;
+    if (!P) return;
+    P->limit = limit;
+    P->full_limit = P->keep ? UINT64_MAX : limit;
+}
+
+/* Before the first event only: the table is read in one form or the other */
+void oylng_parser_set_keep(oylng_parser *P, bool keep) {
+    if (P && P->state == ST_START && !P->qn) {
+        P->keep = keep;
+        P->full_limit = keep ? UINT64_MAX : P->limit;
+    }
+}
+
+void oylng_parser_set_together(oylng_parser *P, bool together) {
+    if (P && P->state == ST_START && !P->qn) P->together = together;
 }
 
 void oylng_parser_set_levels(oylng_parser *P, unsigned levels) {
@@ -2527,6 +2629,11 @@ oylng_status oylng_parse_next(oylng_parser *P, const oylng_event **evt) {
         return OYLNG_OK;
     }
     *evt = NULL;
+    /* events would deliver each reference in full, which the limit no
+       longer bounds: a parser keeping references delivers trees. Nothing
+       is queued for one outside a tree's read (oylng__parser_tree_mode),
+       so this needn't be asked before */
+    if (P->keep && !P->tree_mode) return OYLNG_ERR_INPUT;
     if (P->state == ST_ERROR) return P->status;
     P->qn = P->qi = 0;
     P->qstop = false;
@@ -2562,6 +2669,8 @@ void oylng_parser_free(oylng_parser *P) {
     free(P->plans);
     free(P->scratch);
     free(P->entries);
+    free(P->seen);
+    free(P->mstack);
     free(P->tix.s);
     free(P->lix);
     free(P->stack);
@@ -2578,7 +2687,15 @@ void oylng_parser_free(oylng_parser *P) {
 
 /* ── For the tree (oylng_internal.h) ─────────────────────── */
 
-void oylng__parser_tree_mode(oylng_parser *P, bool on) { P->tree_mode = on; }
+void oylng__parser_tree_mode(oylng_parser *P, bool on) {
+    P->tree_mode = on;
+    /* a tree's read ends at a document's end, the stream's or an error,
+       with nothing queued; with references kept, none must stay, as events
+       aren't given and these would name the table's nodes */
+    if (!on && P->keep) P->qi = P->qn;
+}
+
+bool oylng__parser_keep(const oylng_parser *P) { return P->keep; }
 
 void oylng__parser_input(const oylng_parser *P, const char **in, size_t *len) {
     *in = P->in;
@@ -2621,11 +2738,16 @@ uint64_t *oylng__tree_memo(oylng_parser *P, uint32_t *gen) {
 
 void oylng__table_node(const oylng_parser *P, uint32_t i, oylng__tnode *out) {
     const node *nd = &P->nodes[i];
-    out->kind = nd->kind == N_STR ? OYLNG__T_STR : nd->kind == N_SEQ ? OYLNG__T_SEQ : OYLNG__T_MAP;
+    out->kind = nd->kind == N_STR      ? OYLNG__T_STR
+              : nd->kind == N_SEQ      ? OYLNG__T_SEQ
+              : nd->kind == N_SPLICE   ? OYLNG__T_SPLICE
+              : nd->kind == N_MERGE    ? OYLNG__T_MERGE
+              :                          OYLNG__T_MAP;
     out->data = nd->kind == N_STR ? nd->data : NULL;
     out->len = nd->kind == N_STR ? nd->len : 0;
     out->pos = nd->pos;
     out->plain = nd->kind == N_STR && (nd->sub == S_PLAIN || nd->sub == S_EMPTY);
+    out->link = nd->kind == N_SPLICE || nd->kind == N_MERGE ? deref(P, nd->link) : UINT32_MAX;
 }
 
 uint32_t oylng__table_entry(oylng_parser *P, const char *k, size_t kl, uint32_t *e) {
@@ -2748,6 +2870,17 @@ oylng_status oylng__parser_fail_at(oylng_parser *P, oylng_status st, size_t offs
 
 bool oylng__table_children(const oylng_parser *P, uint32_t i, void (*fn)(void *, uint32_t), void *ctx) {
     const node *nd = &P->nodes[i];
+    if (P->keep) {   /* as written: a <<: line and a -<< are nodes of their own */
+        for (uint32_t k = i + 1; k < nd->link; k = subtree_end(P, k)) {
+            uint8_t kind = P->nodes[k].kind;
+            fn(ctx, kind == N_MERGE || kind == N_SPLICE ? k : deref(P, k));
+            if (nd->kind == N_MAP && kind != N_MERGE) {
+                k = subtree_end(P, k);
+                fn(ctx, deref(P, k));
+            }
+        }
+        return true;
+    }
     if (nd->kind == N_MAP) {
         if (nd->sub & F_MERGED) {
             const plan *pl = &P->plans[nd->aux];

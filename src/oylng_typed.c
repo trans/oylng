@@ -1240,6 +1240,7 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
     if (!out) return OYLNG_ERR_INPUT;
     *out = NULL;
     if (!P || (app && (app->st != OYLNG_OK || !app->root))) return OYLNG_ERR_INPUT;
+    if (oylng__parser_keep(P)) return OYLNG_ERR_INPUT;   /* typing a kept tree: not yet */
     struct start c = { P, app, NULL, NULL, OYLNG_TYPED_NOT };
     oylng_tree *T;
     oylng_status st = oylng__tree_read(P, &T, at_start, &c);
