@@ -901,7 +901,7 @@ static void expand(sctx *S, xt *t) {
         }
         grow(S, &S->scrpos, &S->capscrpos, no + 1, sizeof *out);
         out = S->scrpos;
-        out[no++] = (xpos){ it.t, it.from };
+        out[no++] = (xpos){ it.t, it.from, t };
     }
     xalts *a = zalloc(S, sizeof *a);
     a->p = alloc(S, (size_t)no * sizeof *a->p);

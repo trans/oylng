@@ -60,7 +60,9 @@ struct oylng_typed {
     size_t         nk, capk;
     unsigned char *bytes;
     size_t         nb, capb;
-    struct { uint32_t off, len; } *names;
+    /* each name a value has: its nearest entry's, and, once bindings are
+       resolved (section 12), the outermost bound one's, if bound */
+    struct { uint32_t off, len, boff, blen; bool bound; } *names;
     size_t         nn, capn;
     char          *pool;
     size_t         np, capp;
@@ -83,6 +85,11 @@ typedef struct {
     bool     seq;
 } frame;
 
+/* A map from pointers: each slot of the current gen is in use, so that it
+ * is emptied by a new gen */
+typedef struct { const void *k; uint32_t v, gen; } pslot;
+typedef struct { pslot *s; size_t n, cap; uint32_t gen; } pmap;
+
 typedef struct {
     oylng_typed      *Y;
     const sctx       *S;
@@ -94,8 +101,17 @@ typedef struct {
     size_t            nf, capf;
     struct memo { uint32_t node, val; const xt *k, *scope; } *memo;   /* shared nodes typed */
     size_t            nmemo, capmemo;
-    struct nm { const centry *e; uint32_t i; } *nms;          /* names copied */
-    size_t            nnms, capnms;
+    pmap              nms;        /* each position's name, by the position */
+    /* resolving names (section 12): each type walked again, at its place
+       in ob; each entry's pick; the entries and literals met in a walk */
+    pmap              ofs, pk, seen;
+    const centry    **ob;         /* each alternative's outermost picked entry, or NULL */
+    size_t            nob, capob;
+    struct witem { const xt *t; const centry *ob; } *ws;
+    size_t            capws;
+    oylng_str        *bn;         /* the names bound: the bindings', or the emitter's */
+    uint32_t          nbn;
+    bool              own_bn;     /* bn made here */
     uint8_t          *ok;
     uint32_t         *req;
     size_t            capok;
@@ -193,51 +209,157 @@ static _Noreturn void refuse_as(typer *R, oylng_status st, uint32_t node, const 
 
 #define refuse(R, node, ...) refuse_as((R), OYLNG_ERR_SCHEMA, (node), __VA_ARGS__)
 
-static uint32_t name_of(typer *R, const centry *e) {
-    if (!e) return NONE;
-    size_t cap = R->capnms;
-    if (cap) {
-        size_t h = ((uintptr_t)e >> 4) * 0x9E3779B97F4A7C15u >> 7;
-        for (size_t i = h & (cap - 1);; i = (i + 1) & (cap - 1)) {
-            if (!R->nms[i].e) break;
-            if (R->nms[i].e == e) return R->nms[i].i;
-        }
+static size_t ptr_hash(const void *k) {
+    return (size_t)(((uintptr_t)k >> 4) * 0x9E3779B97F4A7C15u >> 7);
+}
+
+/* Key k's value in m, made 0 if new (*fresh), until m is next added to */
+static uint32_t *pmap_at(typer *R, pmap *m, const void *k, bool *fresh) {
+    if (!m->gen) m->gen = 1;
+    if (2 * (m->n + 1) > m->cap) {   /* twice the room, rehashed */
+        size_t nc = m->cap ? m->cap * 2 : 32;
+        if (nc > SIZE_MAX / sizeof *m->s) nomem(R);
+        pslot *ns = calloc(nc, sizeof *ns);   /* gen 0: empty */
+        if (!ns) nomem(R);
+        for (size_t i = 0; i < m->cap; i++)
+            if (m->s[i].gen == m->gen) {
+                size_t j = ptr_hash(m->s[i].k) & (nc - 1);
+                while (ns[j].gen) j = (j + 1) & (nc - 1);
+                ns[j] = m->s[i];
+            }
+        free(m->s);
+        m->s = ns;
+        m->cap = nc;
     }
+    size_t j = ptr_hash(k) & (m->cap - 1);
+    for (; m->s[j].gen == m->gen; j = (j + 1) & (m->cap - 1))
+        if (m->s[j].k == k) {
+            *fresh = false;
+            return &m->s[j].v;
+        }
+    m->s[j] = (pslot){ k, 0, m->gen };
+    m->n++;
+    *fresh = true;
+    return &m->s[j].v;
+}
+
+static void pmap_clear(pmap *m) {
+    m->n = 0;
+    if (++m->gen == 0) {   /* once in 4G: every slot emptied */
+        if (m->s) memset(m->s, 0, m->cap * sizeof *m->s);
+        m->gen = 1;
+    }
+}
+
+static void pmap_free(pmap *m) { free(m->s); }
+
+/* Whether entry e is one of the names bound, bn (memoized in pk) */
+static bool picked(typer *R, const centry *e) {
+    const oylng_str *bn = R->bn;
+    uint32_t nbn = R->nbn;
+    bool fresh;
+    uint32_t *at = pmap_at(R, &R->pk, e, &fresh);
+    if (!fresh) return *at != 0;
+    bool y = false;
+    for (uint32_t j = 0; j < nbn && !y; j++)
+        y = bn[j].len == e->name.len && (!bn[j].len || memcmp(bn[j].data, e->name.s, bn[j].len) == 0);
+    *at = y;
+    return y;
+}
+
+/* For each alternative of type x, in ob from base, the outermost entry
+ * it was reached through that is one of bn, or NULL. The schema's expand
+ * gave x's alternatives without them, as for a chain of n names that
+ * would be n^2/2 entries kept; so x is walked again just as expand walked
+ * it: unions and names expanded, each name once, at its first place, and
+ * a literal met again left out. Nothing in the schema is marked, as it
+ * may be shared. */
+static void outer_walk(typer *R, const xt *x, size_t base) {
+    const xalts *a = x->alts;
+    pmap_clear(&R->seen);
+    size_t n = 0, k = 0;
+    ROOM(R, R->ws, R->capws, 1);
+    R->ws[n++] = (struct witem){ x, NULL };
+    while (n) {
+        struct witem it = R->ws[--n];
+        bool fresh;
+        if (it.t->kind == X_ALT) {
+            ROOM(R, R->ws, R->capws, n + it.t->u.alt.n);
+            for (uint32_t i = it.t->u.alt.n; i-- > 0;) R->ws[n++] = (struct witem){ it.t->u.alt.v[i], it.ob };
+            continue;
+        }
+        if (it.t->kind == X_NAME) {
+            const centry *e = it.t->u.name;
+            pmap_at(R, &R->seen, e, &fresh);
+            if (!fresh) continue;
+            const centry *ob = it.ob ? it.ob : picked(R, e) ? e : NULL;
+            ROOM(R, R->ws, R->capws, n + 1);
+            R->ws[n++] = (struct witem){ e->top, ob };
+            continue;
+        }
+        if (it.t->kind == X_LIT) {
+            pmap_at(R, &R->seen, it.t, &fresh);
+            if (!fresh) continue;
+        }
+        if (k >= a->n || a->p[k].t != it.t)   /* never: walked as expand walked it */
+            refuse_as(R, OYLNG_ERR_SCHEMA, oylng_tree_root(R->T), "a type's names walked again differently (a bug)");
+        R->ob[base + k++] = it.ob;
+    }
+    if (k != a->n) refuse_as(R, OYLNG_ERR_SCHEMA, oylng_tree_root(R->T), "a type's names walked again differently (a bug)");
+}
+
+/* The bound entry of a value typed with position p (section 12): of the
+ * entries it was reached through, the outermost that is one of bn, or
+ * NULL. Each type is walked once a document. */
+static const centry *bound_of(typer *R, const xpos *p) {
+    const xt *of = p->of;
+    bool fresh;
+    uint32_t *at = pmap_at(R, &R->ofs, of, &fresh);
+    size_t base;
+    if (fresh) {
+        base = R->nob;
+        if (base > NONE - of->alts->n) nomem(R);
+        *at = (uint32_t)base;
+        ROOM(R, R->ob, R->capob, base + of->alts->n);
+        R->nob += of->alts->n;
+        outer_walk(R, of, base);
+    } else base = *at;
+    return R->ob[base + (size_t)(p - of->alts->p)];
+}
+
+/* The name of a value typed with position p, from its nearest entry, and
+ * with names bound, its bound one */
+static uint32_t name_of(typer *R, const xpos *p) {
+    if (!p || !p->from) return NONE;
+    bool fresh;
+    uint32_t *at = pmap_at(R, &R->nms, p, &fresh);
+    if (!fresh) return *at;
     oylng_typed *Y = R->Y;
+    const centry *e = p->from;
     ROOM(R, Y->names, Y->capn, Y->nn + 1);
     ROOM(R, Y->pool, Y->capp, Y->np + e->name.len + 1);
     memcpy(Y->pool + Y->np, e->name.s, e->name.len);
     Y->names[Y->nn].off = (uint32_t)Y->np;
     Y->names[Y->nn].len = e->name.len;
+    Y->names[Y->nn].bound = false;
     Y->np += e->name.len;
-    uint32_t idx = (uint32_t)Y->nn++;
-    if (2 * (R->nnms + 1) > R->capnms) {   /* twice the room, rehashed */
-        size_t nc = R->capnms ? R->capnms * 2 : 32;
-        struct nm *nn = calloc(nc, sizeof *nn);
-        if (!nn) nomem(R);
-        for (size_t i = 0; i < R->capnms; i++)
-            if (R->nms[i].e) {
-                size_t h = ((uintptr_t)R->nms[i].e >> 4) * 0x9E3779B97F4A7C15u >> 7;
-                size_t j = h & (nc - 1);
-                while (nn[j].e) j = (j + 1) & (nc - 1);
-                nn[j] = R->nms[i];
-            }
-        free(R->nms);
-        R->nms = nn;
-        R->capnms = nc;
+    *at = (uint32_t)Y->nn;
+    const centry *b = R->nbn ? bound_of(R, p) : NULL;
+    if (b) {
+        ROOM(R, Y->pool, Y->capp, Y->np + b->name.len + 1);
+        memcpy(Y->pool + Y->np, b->name.s, b->name.len);
+        Y->names[Y->nn].boff = (uint32_t)Y->np;
+        Y->names[Y->nn].blen = b->name.len;
+        Y->names[Y->nn].bound = true;
+        Y->np += b->name.len;
     }
-    size_t h = ((uintptr_t)e >> 4) * 0x9E3779B97F4A7C15u >> 7;
-    size_t j = h & (R->capnms - 1);
-    while (R->nms[j].e) j = (j + 1) & (R->capnms - 1);
-    R->nms[j] = (struct nm){ e, idx };
-    R->nnms++;
-    return idx;
+    return (uint32_t)Y->nn++;
 }
 
-static uint32_t new_val(typer *R, oylng_type type, uint32_t node, const centry *from) {
+static uint32_t new_val(typer *R, oylng_type type, uint32_t node, const xpos *p) {
     oylng_typed *Y = R->Y;
     if (Y->nv >= NONE - 1) refuse_as(R, OYLNG_ERR_LIMIT, node, "a typed document of 4G values or more");
-    uint32_t name = name_of(R, from);
+    uint32_t name = name_of(R, p);
     ROOM(R, Y->v, Y->capv, Y->nv + 1);
     Y->v[Y->nv] = (tval){ (uint8_t)type, 0, 0, node, name, 0, { 0 } };
     return (uint32_t)Y->nv++;
@@ -522,8 +644,8 @@ static bool key_fits(typer *R, const xt *kt, uint32_t node, oylng_str k) {
     return match_alts(R, kt->alts, node, k.data, k.len, true, &sc) != NONE;
 }
 
-static uint32_t scalar_val(typer *R, uint32_t node, const scalar *sc, const centry *from) {
-    uint32_t v = new_val(R, sc->type, node, from);
+static uint32_t scalar_val(typer *R, uint32_t node, const scalar *sc, const xpos *p) {
+    uint32_t v = new_val(R, sc->type, node, p);
     tval *t = &R->Y->v[v];
     t->neg = sc->neg;
     if (sc->type == OYLNG_T_FLOAT) t->x.f = sc->f;
@@ -559,8 +681,8 @@ static uint32_t scalar_val(typer *R, uint32_t node, const scalar *sc, const cent
 /* ── Collections (sections 6, 7, 9 and 10) ───────────────── */
 
 static uint32_t open_coll(typer *R, oylng_type type, uint32_t node, const xt *x, const xt *scope,
-                          const centry *from) {
-    uint32_t v = new_val(R, type, node, from);
+                          const xpos *p) {
+    uint32_t v = new_val(R, type, node, p);
     oylng_typed *Y = R->Y;
     size_t n = oylng_node_count(R->T, node);
     if (n > NONE - Y->nk) refuse_as(R, OYLNG_ERR_LIMIT, node, "a typed document of 4G values or more");
@@ -591,14 +713,14 @@ static uint32_t open_map(typer *R, const xpos *p, uint32_t node, const xt *scope
                     refuse(R, node, "missing %.*s", SHOW(f->name.len), f->name.s);
             }
     }
-    return open_coll(R, OYLNG_T_MAPPING, node, m, m->u.map.deep ? m->u.map.deep : scope, p->from);
+    return open_coll(R, OYLNG_T_MAPPING, node, m, m->u.map.deep ? m->u.map.deep : scope, p);
 }
 
 static uint32_t open_seq(typer *R, const xpos *p, uint32_t node, const xt *scope) {
     const xt *q = p->t;
     size_t n = oylng_node_count(R->T, node);
     if (n < q->u.seq.n || (!q->u.seq.rest && n != q->u.seq.n)) refuse(R, node, "wrong length: %zu", n);
-    return open_coll(R, OYLNG_T_SEQUENCE, node, q, scope, p->from);
+    return open_coll(R, OYLNG_T_SEQUENCE, node, q, scope, p);
 }
 
 /* Which of a union's mappings fits the mapping at node, by its own keys
@@ -661,7 +783,7 @@ static uint32_t one(typer *R, const xpos *p, uint32_t node, const xt *scope) {
         if (k != OYLNG_NODE_STRING || s.len != x->u.lit.len || (s.len && memcmp(s.data, x->u.lit.s, s.len)))
             refuse(R, node, "expected '%.*s'", SHOW(x->u.lit.len), x->u.lit.s);
         scalar sc = { .type = OYLNG_T_STR };
-        return scalar_val(R, node, &sc, p->from);
+        return scalar_val(R, node, &sc, p);
     }
     case X_MAP:   /* with a `!**` too: a mapping only (section 10) */
         if (k != OYLNG_NODE_MAPPING) refuse(R, node, "expected a mapping");
@@ -672,13 +794,13 @@ static uint32_t one(typer *R, const xpos *p, uint32_t node, const xt *scope) {
     default:
         break;
     }
-    if (x->std == STD_ANY) return new_val(R, OYLNG_T_ANY, node, p->from);
+    if (x->std == STD_ANY) return new_val(R, OYLNG_T_ANY, node, p);
     if (k != OYLNG_NODE_STRING) refuse(R, node, "expected !%s", oylng__std_names[x->std]);
     oylng_str s = oylng_node_text(R->T, node);
     scalar sc;
     int r = match_std(R, x, s.data, s.len, oylng_node_plain(R->T, node), &sc);
     if (r != MATCH) refuse(R, node, "%s", sc.why);
-    return scalar_val(R, node, &sc, p->from);
+    return scalar_val(R, node, &sc, p);
 }
 
 static uint32_t convert(typer *R, const xt *t, uint32_t node, const xt *scope) {
@@ -689,20 +811,20 @@ static uint32_t convert(typer *R, const xt *t, uint32_t node, const xt *scope) {
         uint32_t count;
         uint32_t fit = a->nmaps ? choose(R, a, node, scope, &count) : (count = 0, NONE);
         if (fit != NONE) return open_map(R, &a->p[fit], node, scope);
-        if (!count && a->any != NONE) return new_val(R, OYLNG_T_ANY, node, a->p[a->any].from);
+        if (!count && a->any != NONE) return new_val(R, OYLNG_T_ANY, node, &a->p[a->any]);
         refuse(R, node, "%u of %u mapping alternatives fit", count, a->nmaps);
     }
     if (k == OYLNG_NODE_SEQUENCE) {
         if (a->seq != NONE) return open_seq(R, &a->p[a->seq], node, scope);
-        if (a->any != NONE) return new_val(R, OYLNG_T_ANY, node, a->p[a->any].from);
+        if (a->any != NONE) return new_val(R, OYLNG_T_ANY, node, &a->p[a->any]);
         refuse(R, node, "a sequence is not allowed here");
     }
     oylng_str s = oylng_node_text(R->T, node);
     scalar sc;
     uint32_t i = match_alts(R, a, node, s.data, s.len, oylng_node_plain(R->T, node), &sc);
     if (i == NONE) refuse(R, node, "'%.*s' is not allowed here", SHOW(s.len), s.data);
-    if (sc.type == OYLNG_T_ANY) return new_val(R, OYLNG_T_ANY, node, a->p[i].from);
-    return scalar_val(R, node, &sc, a->p[i].from);
+    if (sc.type == OYLNG_T_ANY) return new_val(R, OYLNG_T_ANY, node, &a->p[i]);
+    return scalar_val(R, node, &sc, &a->p[i]);
 }
 
 /* A node's own size, as held counts it (section 11) */
@@ -962,11 +1084,12 @@ static void call(typer *R, uint32_t v) {
     Y->objat[v] = (uint32_t)Y->nobj++;
 }
 
-/* The bindings, once the document is typed: each value with a bound name
- * gets its object, once for each place it is used, innermost first, in
- * the order written. A value reached twice is one value; one with a bound
- * value at or below it is copied for each place after the first, so each
- * place has its own, and the rest stays shared. */
+/* The bindings, once the document is typed: each value whose names
+ * include a bound one gets an object from the outermost one's code, once
+ * for each place it is used, innermost first, in the order written. A
+ * value reached twice is one value; one with a bound value at or below it
+ * is copied for each place after the first, so each place has its own,
+ * and the rest stays shared. */
 static bool bind_doc(typer *R, const oylng__binding *bs, uint32_t nb) {
     if (setjmp(R->jb)) return false;
     oylng_typed *Y = R->Y;
@@ -974,8 +1097,9 @@ static bool bind_doc(typer *R, const oylng__binding *bs, uint32_t nb) {
     ROOM(R, R->bt, R->capbt, Y->nn);
     for (size_t i = 0; i < Y->nn; i++) {
         R->bt[i] = (struct bnd){ 0 };
-        const char *s = Y->pool + Y->names[i].off;
-        size_t n = Y->names[i].len;
+        if (!Y->names[i].bound) continue;
+        const char *s = Y->pool + Y->names[i].boff;
+        size_t n = Y->names[i].blen;
         for (uint32_t j = 0; j < nb; j++)
             if (bs[j].len == n && (!n || memcmp(bs[j].name, s, n) == 0)) {
                 R->bt[i] = (struct bnd){ bs[j].fn, bs[j].drop, bs[j].ctx };
@@ -1236,6 +1360,24 @@ static oylng_status at_start(void *ctx, oylng_str name) {
     return OYLNG_OK;
 }
 
+static void typer_free(typer *R) {
+    free(R->f);
+    free(R->bt);
+    free(R->bfl);
+    free(R->memo);
+    pmap_free(&R->nms);
+    pmap_free(&R->ofs);
+    pmap_free(&R->pk);
+    pmap_free(&R->seen);
+    free(R->ob);
+    free(R->ws);
+    if (R->own_bn) free(R->bn);
+    free(R->ok);
+    free(R->req);
+    free(R->canon);
+    oylng__rxscr_free(&R->rxs);
+}
+
 oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_typed **out) {
     if (!out) return OYLNG_ERR_INPUT;
     *out = NULL;
@@ -1258,20 +1400,26 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
         ok = !setjmp(R.jb);
         if (ok) Y->root = new_val(&R, OYLNG_T_ANY, oylng_tree_root(T), NULL);
     } else {
-        ok = type_tree(&R, c.root);
+        /* the names bound, so that each value's bound one is known as it
+           is typed */
         uint32_t nb;
         const oylng__binding *bs = oylng__parser_bindings(P, &nb);
+        ok = true;
+        if (nb) {
+            R.bn = calloc(nb, sizeof *R.bn);
+            R.own_bn = true;
+            if (!R.bn) {
+                R.st = oylng__parser_fail(P, OYLNG_ERR_MEMORY, "out of memory");
+                ok = false;
+            } else {
+                for (uint32_t j = 0; j < nb; j++) R.bn[j] = (oylng_str){ bs[j].name, bs[j].len };
+                R.nbn = nb;
+            }
+        }
+        if (ok) ok = type_tree(&R, c.root);
         if (ok && nb) ok = bind_doc(&R, bs, nb);
     }
-    free(R.f);
-    free(R.bt);
-    free(R.bfl);
-    free(R.memo);
-    free(R.nms);
-    free(R.ok);
-    free(R.req);
-    free(R.canon);
-    oylng__rxscr_free(&R.rxs);
+    typer_free(&R);
     if (!ok) {
         oylng_typed_free(Y);
         return R.st;
@@ -1282,8 +1430,8 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
 
 /* ── Typing for the emitter (section 13) ─────────────────── */
 
-oylng_status oylng__type_emit(const oylng_schema *sc, oylng_tree *T, const oylng__speller *sp, oylng_typed **out,
-                              char *msg, size_t msglen) {
+oylng_status oylng__type_emit(const oylng_schema *sc, oylng_tree *T, const oylng__speller *sp,
+                              const oylng_str *bound, uint32_t nbound, oylng_typed **out, char *msg, size_t msglen) {
     *out = NULL;
     oylng_typed *Y = calloc(1, sizeof *Y);
     if (!Y) {
@@ -1294,14 +1442,10 @@ oylng_status oylng__type_emit(const oylng_schema *sc, oylng_tree *T, const oylng
     Y->T = T;
     Y->how = OYLNG_TYPED_APP;
     typer R = { .Y = Y, .S = sc->ctx, .T = T, .limit = UINT64_MAX, .E = sp, .msg = msg, .msglen = msglen };
+    R.bn = (oylng_str *)bound;
+    R.nbn = nbound;
     bool ok = type_tree(&R, sc->root);
-    free(R.f);
-    free(R.memo);
-    free(R.nms);
-    free(R.ok);
-    free(R.req);
-    free(R.canon);
-    oylng__rxscr_free(&R.rxs);
+    typer_free(&R);
     if (!ok) {
         oylng_typed_free(Y);
         return R.st;
@@ -1367,6 +1511,12 @@ oylng_str oylng_value_name(const oylng_typed *Y, oylng_value v) {
     const tval *t = val(Y, v);
     if (!t || t->name == NONE) return (oylng_str){ NULL, 0 };
     return (oylng_str){ Y->pool + Y->names[t->name].off, Y->names[t->name].len };
+}
+
+oylng_str oylng_value_bound(const oylng_typed *Y, oylng_value v) {
+    const tval *t = val(Y, v);
+    if (!t || t->name == NONE || !Y->names[t->name].bound) return (oylng_str){ NULL, 0 };
+    return (oylng_str){ Y->pool + Y->names[t->name].boff, Y->names[t->name].blen };
 }
 
 bool oylng_value_int(const oylng_typed *Y, oylng_value v, int64_t *out) {

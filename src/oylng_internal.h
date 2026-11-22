@@ -319,10 +319,13 @@ typedef struct {
 /* Types tree t, which it takes, with schema s, as a parser would type it
  * with s for its application's schema, each string given the first of its
  * spellings that reads back as given (oylng_typed.c). On OYLNG_OK, *out
- * holds it, the tree with its strings spelled so; else msg says why. */
+ * holds it, the tree with its strings spelled so; else msg says why. Each
+ * value's bound name (oylng_value_bound) is the outermost of its names in
+ * bound, the emitter's bindings. */
 struct oylng_schema;
 oylng_status oylng__type_emit(const struct oylng_schema *s, oylng_tree *t, const oylng__speller *sp,
-                              struct oylng_typed **out, char *msg, size_t msglen);
+                              const oylng_str *bound, uint32_t nbound, struct oylng_typed **out, char *msg,
+                              size_t msglen);
 /* How many values a typed document has */
 size_t       oylng__typed_count(const struct oylng_typed *t);
 

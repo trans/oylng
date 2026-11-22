@@ -803,8 +803,12 @@ static const char *fits(void *ctx, uint32_t node, const oylng_typed *Y, uint32_t
         }
     }
     if (r->name != SIZE_MAX) {
-        oylng_str nm = oylng_value_name(Y, v);
-        if (!str_is(nm, E->tb + r->name, r->nlen)) {
+        /* its object comes from the outermost bound name's code; if none
+           is bound, its nearest name says what it reads as */
+        oylng_str nm = oylng_value_bound(Y, v);
+        bool ok = str_is(nm, E->tb + r->name, r->nlen);
+        if (!nm.data) nm = oylng_value_name(Y, v);
+        if (!ok) {
             int a = (int)(r->nlen > 40 ? 40 : r->nlen), b = (int)(nm.len > 40 ? 40 : nm.len);
             if (nm.data)
                 snprintf(why, sizeof E->why, "written as a %.*s object, it reads as a %.*s", a, E->tb + r->name, b, nm.data);
@@ -882,7 +886,17 @@ static oylng_status held_end(oylng_emitter *E) {
     oylng__speller sp = { E, next_spelling, fits, describe };
     oylng_typed *Y;
     char msg[400];
-    st = oylng__type_emit(E->held, T, &sp, &Y, msg, sizeof msg);
+    /* the names bound here, as a parser reading it back would bind them:
+       a value's code is the outermost bound name's (section 12) */
+    oylng_str *bn = E->nbinds ? malloc(E->nbinds * sizeof *bn) : NULL;
+    if (E->nbinds && !bn) {
+        oylng_tree_free(T);
+        E->len = E->mark;
+        return fail(E, OYLNG_ERR_MEMORY, "out of memory");
+    }
+    for (size_t i = 0; i < E->nbinds; i++) bn[i] = (oylng_str){ E->binds[i].name, E->binds[i].len };
+    st = oylng__type_emit(E->held, T, &sp, bn, (uint32_t)E->nbinds, &Y, msg, sizeof msg);
+    free(bn);
     if (st != OYLNG_OK) {
         E->len = E->mark;
         if (E->oom) return done(E);   /* a spelling had no room */

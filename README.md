@@ -202,8 +202,12 @@ code turns each value of the type into one of the application's objects,
 or refuses the document. Only a bound name makes anything, so a file can
 never choose what code runs. The code runs once the document is typed, so
 never on trial, innermost first, and once for each place a value is used:
-`*p` named twice makes two objects. The document holds the objects until
-the application takes them, and lets go the rest when it is freed.
+`*p` named twice makes two objects. A value typed through several names,
+as a `!spot` is through `spot` and then `point` with `spot: !point`, gets
+the code of the outermost one bound, and no other's; a union's name counts
+the same way (`oylng_value_bound` says which). The document holds the
+objects until the application takes them, and lets go the rest when it is
+freed.
 
 ```c
 static const char *make_point(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
@@ -286,8 +290,9 @@ oylng_emit_doc_end(em);                             /* written now, or refused *
 `oylng_emit_value` writes a typed document again. `oylng_emitter_bind`
 and `oylng_emit_object` give a bound type its way back: the application's
 code writes its object as the value its entry takes, and the emitter
-checks that it reads back as of that name, so that a parser's binding of
-the name gets it.
+checks that it reads back with that bound name, the names bound to the
+emitter taken as bound, so that a parser with the same bindings gets it
+from that name's code.
 
 The `oylng` tool prints a stream's events, the stream as JSON, or the
 stream written again, with its references and merges resolved:

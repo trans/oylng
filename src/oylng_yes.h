@@ -123,10 +123,14 @@ typedef struct {
 } xrow;
 
 /* An alternative with names expanded: a literal, a standard type, a
- * sequence or a mapping, and the nearest entry it was reached through */
+ * sequence or a mapping; the nearest entry it was reached through; and
+ * the type whose alternatives it is one of. The other entries it was
+ * reached through aren't kept, as for a chain of n names that would be
+ * n^2/2 of them: oylng__outer_picked walks them again (section 12). */
 typedef struct {
-    xt     *t;
-    centry *from;
+    xt       *t;
+    centry   *from;
+    const xt *of;
 } xpos;
 
 typedef struct {

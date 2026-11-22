@@ -174,9 +174,16 @@ OYLNG_API oylng_node oylng_value_node(const oylng_typed *t, oylng_value v);
 OYLNG_API oylng_str oylng_value_text(const oylng_typed *t, oylng_value v);
 
 /** The named type the value took, the nearest entry of the schema a type
- *  went through to reach it, for an application's bindings (section 12);
- *  data NULL if none */
+ *  went through to reach it; data NULL if none */
 OYLNG_API oylng_str oylng_value_name(const oylng_typed *t, oylng_value v);
+
+/** The bound name whose code made the value's object (section 12): of the
+ *  entries the value was typed through, the outermost that a binding
+ *  names. With `spot: !point`, a `!spot` value goes through spot, then
+ *  point: it is spot's if spot is bound, and point's if only point is.
+ *  Data NULL if none of them is bound, or if nothing was bound when the
+ *  document was typed. */
+OYLNG_API oylng_str oylng_value_bound(const oylng_typed *t, oylng_value v);
 
 /** OYLNG_T_INT: true if it fits in *out */
 OYLNG_API bool oylng_value_int(const oylng_typed *t, oylng_value v, int64_t *out);
@@ -216,8 +223,10 @@ typedef const char *(*oylng_bind_fn)(void *ctx, oylng_typed *t, oylng_value v, v
 /** Lets go an object that oylng_typed_free finds untaken */
 typedef void (*oylng_drop_fn)(void *ctx, void *object);
 
-/** Binds @p fn to the name @p name: each value whose name it is
- *  (oylng_value_name) gets an object @p fn makes, from the next document
+/** Binds @p fn to the name @p name: each value whose bound name it is
+ *  (oylng_value_bound), the outermost bound one of the names it was typed
+ *  through, gets an object @p fn makes, and the code of no other name it
+ *  was typed through runs for it, from the next document
  *  typed on, whichever schema types it: the stream's own, the
  *  application's or a published one. A name nobody bound makes nothing, so
  *  the bindings are all that a stream can get made (section 12). @p fn runs
@@ -298,9 +307,10 @@ typedef const char *(*oylng_unbind_fn)(void *ctx, oylng_emitter *e, const void *
 OYLNG_API oylng_status oylng_emitter_bind(oylng_emitter *e, oylng_str name, oylng_unbind_fn fn, void *ctx);
 
 /** Writes @p object with the code bound to @p name, which must write one
- *  value, where a node goes. With a schema, it must read back as of that
- *  name (oylng_value_name), so that a parser's binding of the name gets
- *  it, or the document is refused. OYLNG_ERR_INPUT if nothing is bound to
+ *  value, where a node goes. With a schema, it must read back with that
+ *  bound name (oylng_value_bound), the names bound to this emitter taken
+ *  as bound, so that a parser with the same bindings gets it from that
+ *  name's code, or the document is refused. OYLNG_ERR_INPUT if nothing is bound to
  *  the name, and the emitter is as it was. */
 OYLNG_API oylng_status oylng_emit_object(oylng_emitter *e, oylng_str name, const void *object);
 

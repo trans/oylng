@@ -92,7 +92,7 @@
   block and in flow style, and reads back the same; the fuzzer writes each
   document the application's schema typed again, which must be accepted
   in block style and read back the same.
-- Tested: 241 API checks and the draft's 70 examples (`make test`); part 2's
+- Tested: 254 API checks and the draft's 70 examples (`make test`); part 2's
   suite (yaml2 `c5203b6`), 801 of its 850 tests passed and none failed, 26
   of them with a store of published files, the rest skipped for times held
   otherwise (25) and `keep` (24) (`make test-yes`); all 863 of the streams
@@ -118,6 +118,20 @@
   `a` and a comment. The emitter writes such names, and refuses `a#`,
   `a#b#c` and the like. The suite's six new tests pass, and the emitter has
   9 new checks, 161 in all.
+
+- **The outermost bound name's code runs** for a value typed through
+  several (part 2, section 12, trans/yaml2 `6a116a6`). With `spot: !point`,
+  a `!spot` value goes through `spot` and then `point`: it gets spot's
+  code if spot is bound, whether point is or not, and point's if only
+  point is. A union's name counts the same way, so code bound to `shape`
+  takes the place of its alternatives'. `oylng_value_bound` gives the name
+  whose code made a value's object; `oylng_value_name` is still the
+  nearest. The emitter checks an object reads back with its bound name,
+  the names bound to it taken as bound. The other names a value went
+  through aren't kept when a schema compiles, as for a chain of n names
+  that would be n²/2 of them: typing with bindings walks each type used
+  again, once a document. 13 new API checks, 254 in all, and the fuzzer
+  checks that each call is the bound name's.
 
 - **A name in the table can't start with `!`**, plain or quoted, as part
   1, section 8.1, now says (trans/yaml2 `c5203b6`): `--- !spot` stamps a

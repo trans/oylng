@@ -12,6 +12,7 @@
  * number, true, false and null are plain and a string is quoted.
  */
 
+#include <ctype.h>
 #include "oylng/schema.h"
 #include <math.h>
 #include <stdarg.h>
@@ -848,6 +849,60 @@ static void drop_obj(void *ctx, void *o) {
     free(o);
 }
 
+/* A binding that notes 's' or 'h' and makes an int */
+static const char *bind_tag(binder *b, char c, void **obj) {
+    note(b, c);
+    int *o = malloc(sizeof *o);
+    *o = ++b->made;
+    *obj = o;
+    return NULL;
+}
+static const char *bind_spot(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
+    (void)t, (void)v;
+    return bind_tag(ctx, 's', obj);
+}
+static const char *bind_shape(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
+    (void)t, (void)v;
+    return bind_tag(ctx, 'h', obj);
+}
+
+static oylng_typed *typed_next(oylng_parser *p, const oylng_schema *app, char *err, size_t errlen);
+
+/* The calls the document of s makes with names bound to code, a
+ * space-separated list of name=letter (p point, s spot, h shape, n
+ * nothing), and each value's bound name at the paths given, or '-' */
+static void chain_calls(const char *s, const char *binds, const char *const *paths, size_t np, char *out, size_t cap) {
+    binder b = { 0 };
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    char bs[200];
+    snprintf(bs, sizeof bs, "%s", binds);
+    for (char *w = strtok(bs, " "); w; w = strtok(NULL, " ")) {
+        char *eqs = strchr(w, '=');
+        *eqs = 0;
+        oylng_bind_fn fn = eqs[1] == 'p' ? bind_point : eqs[1] == 's' ? bind_spot : eqs[1] == 'h' ? bind_shape : bind_nothing;
+        oylng_parser_bind(p, (oylng_str){ w, strlen(w) }, fn, eqs[1] == 'n' ? NULL : drop_obj, &b);
+    }
+    char err[300];
+    oylng_typed *y = typed_next(p, NULL, err, sizeof err);
+    if (!y) {
+        snprintf(out, cap, "refused: %.200s", err);
+        oylng_parser_free(p);
+        return;
+    }
+    size_t o = (size_t)snprintf(out, cap, "%s", b.order);
+    for (size_t i = 0; i < np; i++) {
+        oylng_value v = oylng_typed_root(y);
+        char pa[100];
+        snprintf(pa, sizeof pa, "%s", paths[i]);
+        for (char *w = strtok(pa, "/"); w; w = strtok(NULL, "/"))
+            v = isdigit((unsigned char)*w) ? oylng_value_item(y, v, (size_t)atoi(w)) : oylng_value_get(y, v, (oylng_str){ w, strlen(w) });
+        oylng_str bn = oylng_value_bound(y, v);
+        o += (size_t)snprintf(out + o, cap - o, " %.*s", bn.data ? (int)bn.len : 1, bn.data ? bn.data : "-");
+    }
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+}
+
 static void drop_line(void *ctx, void *o) {
     line *l = o;
     ((binder *)ctx)->dropped += 3;
@@ -1002,8 +1057,67 @@ static void bindings(void) {
     oylng_parser_free(p);
 
     CHECK(oylng_parser_bind(NULL, S("x"), bind_point, NULL, NULL) == OYLNG_ERR_INPUT &&
-          !oylng_value_object(NULL, 0) && !oylng_value_take(NULL, 0), "NULLs");
+          !oylng_value_object(NULL, 0) && !oylng_value_take(NULL, 0) && !oylng_value_bound(NULL, 0).data, "NULLs");
     oylng_schema_free(app);
+
+    /* names in a chain (yaml2 6a116a6): the outermost bound one's code
+       runs, and no other's. a goes through spot, then point; b through
+       point alone */
+    char got[300];
+    const char *const ab[] = { "a", "b" };
+    const char *chain = "%YAML 2.0\n--- &\npoint: {x: !int, y: !int}\nspot: !point\npair: {a: !spot, b: !point}\n"
+                        "--- !pair\na: {x: 1, y: 2}\nb: {x: 3, y: 4}\n";
+    chain_calls(chain, "point=p spot=s", ab, 2, got, sizeof got);
+    CHECK(!strcmp(got, "sp spot point"), "both bound, spot's runs for a: %s", got);
+    chain_calls(chain, "point=p", ab, 2, got, sizeof got);
+    CHECK(!strcmp(got, "pp point point"), "point alone bound: %s", got);
+    chain_calls(chain, "spot=s", ab, 2, got, sizeof got);
+    CHECK(!strcmp(got, "s spot -"), "spot alone bound: %s", got);
+    chain_calls(chain, "", ab, 2, got, sizeof got);
+    CHECK(!strcmp(got, " - -"), "nothing bound: %s", got);
+    {
+        oylng_parser *cp = oylng_parser_new(chain, strlen(chain));
+        oylng_typed *cy = typed_next(cp, NULL, err, sizeof err);
+        oylng_value a = oylng_value_get(cy, oylng_typed_root(cy), S("a"));
+        CHECK(cy && eq(oylng_value_name(cy, a), "point", 5) && !oylng_value_bound(cy, a).data,
+              "its name is still the nearest, point, and with nothing bound none is bound: %s", err);
+        oylng_typed_free(cy);
+        oylng_parser_free(cp);
+    }
+
+    /* a union's name counts the same way: shape's code takes the place of
+       point's and sweep's, and gets what the alternative delivers */
+    const char *const sh3[] = { "0", "1", "2" };
+    const char *un = "%YAML 2.0\n--- &\npoint: {x: !int, y: !int}\nsweep: {target: !int}\nshape: {!|: [!point, !sweep]}\n"
+                     "r: [!shape, ...]\n--- !r\n- {x: 1, y: 2}\n- {target: 3}\n- {x: 4, y: 5}\n";
+    chain_calls(un, "point=p sweep=n", sh3, 3, got, sizeof got);
+    CHECK(!strcmp(got, "pnp point sweep point"), "the alternatives bound: %s", got);
+    chain_calls(un, "point=p sweep=n shape=h", sh3, 3, got, sizeof got);
+    CHECK(!strcmp(got, "hhh shape shape shape"), "the union's name bound too: %s", got);
+
+    /* each name counts once in a union, at its first place: p is reached
+       through a, not through b, so b's code never runs for it */
+    const char *const top[] = { "" };
+    const char *twice = "%YAML 2.0\n--- &\np: {x: !int, y: !int}\na: !p\nb: !p\nu: {!|: [!a, !b]}\n--- !u\nx: 1\ny: 2\n";
+    chain_calls(twice, "b=s p=p", top, 1, got, sizeof got);
+    CHECK(!strcmp(got, "p p"), "through a, then p: %s", got);
+    chain_calls(twice, "b=s a=h p=p", top, 1, got, sizeof got);
+    CHECK(!strcmp(got, "h a"), "a bound: %s", got);
+    chain_calls(twice, "u=s a=h", top, 1, got, sizeof got);
+    CHECK(!strcmp(got, "s u"), "u, the outermost: %s", got);
+
+    /* a chain of 200 names: n0 goes through all of them */
+    {
+        char *big2 = malloc(8000);
+        size_t m = (size_t)snprintf(big2, 8000, "%%YAML 2.0\n--- &\npoint: {x: !int, y: !int}\n");
+        for (int i = 0; i < 199; i++) m += (size_t)snprintf(big2 + m, 8000 - m, "n%d: !n%d\n", i, i + 1);
+        m += (size_t)snprintf(big2 + m, 8000 - m, "n199: !point\nall: {a: !n0, b: !n150, c: !n199}\n"
+                                                  "--- !all\na: {x: 1, y: 2}\nb: {x: 1, y: 2}\nc: {x: 1, y: 2}\n");
+        const char *const abc[] = { "a", "b", "c" };
+        chain_calls(big2, "n100=s point=p n180=h", abc, 3, got, sizeof got);
+        CHECK(!strcmp(got, "shp n100 n180 point"), "200 names: %s", got);
+        free(big2);
+    }
 }
 
 /* ── Emitting typed data (section 13) ───────────────────── */
@@ -1284,6 +1398,12 @@ static void emitting(void) {
     REFUSES(sh, "w", "{ s:a [ o:point ] }", false, "/a: it reads as untyped, and a point object is in it");
     WRITES(sh, "w", "{ s:a i:1 s:b o:point }", false, "a: 1\nb:\n  x: 1", "{a:A1,b:{x:i1,y:i2}@point}@w");
     REFUSES(sh, "q", "o:point", false, "/: written as a point object, it reads as a q");
+    /* names in a chain: with sweep: !point, both bound here, a value where
+       a !sweep goes is sweep's, so a point written there reads back as a
+       sweep (section 12, yaml2 6a116a6) */
+    const char *ch = "point: {x: !int, y: !int}\nsweep: !point\nr: [!sweep, ...]\n";
+    WRITES(ch, "r", "[ o:sweep ]", false, "- x: 1\n  y: 2\n", "[{x:i1,y:i2}@point]@r");
+    REFUSES(ch, "r", "[ o:point ]", false, "/0: written as a point object, it reads as a sweep");
     REFUSES(sh, "shapes", "[ o!point ]", false, "a point object: it has no x");
     REFUSES(sh, "shapes", "[ o2point ]", false, "the code bound to point wrote more than one value");
     {

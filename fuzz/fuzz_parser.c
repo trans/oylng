@@ -315,6 +315,12 @@ static void find_names(const char *in, size_t size) {
 
 typedef struct { const oylng_typed *t; oylng_value v; } fobj;
 typedef struct { size_t made, dropped; } fbinder;
+typedef struct { fbinder *b; size_t i; } fname;   /* each name's: its binder, and which */
+static fname fnames[NBOUND];
+
+static bool same_name(oylng_str a, oylng_str b) {
+    return a.data && b.data && a.len == b.len && (!a.len || !memcmp(a.data, b.data, a.len));
+}
 
 static bool is_bound(oylng_str n) {
     for (size_t i = 0; n.data && i < nbound; i++)
@@ -322,14 +328,17 @@ static bool is_bound(oylng_str n) {
     return false;
 }
 
+/* The code of the value's bound name runs, the outermost bound one of
+   the names it was typed through, and no other's */
 static const char *fuzz_bind(void *ctx, oylng_typed *t, oylng_value v, void **obj) {
-    fbinder *b = ctx;
-    if (!is_bound(oylng_value_name(t, v)) || oylng_value_object(t, v)) abort();
+    fname *f = ctx;
+    fbinder *b = f->b;
+    if (!same_name(oylng_value_bound(t, v), bound_names[f->i]) || oylng_value_object(t, v)) abort();
     oylng_type ty = oylng_value_type(t, v);
     if (ty == OYLNG_T_SEQUENCE || ty == OYLNG_T_MAPPING)
         for (size_t i = 0; i < oylng_value_count(t, v); i++) {
             oylng_value c = ty == OYLNG_T_SEQUENCE ? oylng_value_item(t, v, i) : oylng_value_at(t, v, i);
-            if (is_bound(oylng_value_name(t, c)) && !oylng_value_object(t, c)) abort();   /* innermost first */
+            if (oylng_value_bound(t, c).data && !oylng_value_object(t, c)) abort();   /* innermost first */
         }
     if (oylng_node_mark(oylng_typed_tree(t), oylng_value_node(t, v)).offset % 8 == 5) return "refused by the binding";
     fobj *o = malloc(sizeof *o);
@@ -341,7 +350,7 @@ static const char *fuzz_bind(void *ctx, oylng_typed *t, oylng_value v, void **ob
 }
 
 static void fuzz_drop(void *ctx, void *o) {
-    ((fbinder *)ctx)->dropped++;
+    ((fname *)ctx)->b->dropped++;
     free(o);
 }
 
@@ -349,7 +358,12 @@ static void fuzz_drop(void *ctx, void *o) {
 static void check_objects(const oylng_typed *t, oylng_value v, uint8_t **seen, size_t *cap, size_t *budget) {
     if (!*budget) return;
     --*budget;
-    if (is_bound(oylng_value_name(t, v))) {
+    oylng_str bn = oylng_value_bound(t, v);
+    /* the nearest name is one of those typed through: bound, it leaves
+       the value a bound name */
+    if (is_bound(oylng_value_name(t, v)) && !bn.data) abort();
+    if (bn.data && !is_bound(bn)) abort();
+    if (bn.data) {
         const fobj *o = oylng_value_object(t, v);
         if (!o || o->t != t || o->v != v) abort();
         if (v >= *cap) {
@@ -758,8 +772,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (yp) {
         oylng_parser_set_cut(yp, (opt & 0x40) != 0);
         find_names(in, size);
-        for (size_t i = 0; i < nbound; i++)
-            if (oylng_parser_bind(yp, bound_names[i], fuzz_bind, fuzz_drop, &fb) != OYLNG_OK) abort();
+        for (size_t i = 0; i < nbound; i++) {
+            fnames[i] = (fname){ &fb, i };
+            if (oylng_parser_bind(yp, bound_names[i], fuzz_bind, fuzz_drop, &fnames[i]) != OYLNG_OK) abort();
+        }
         oylng_typed *y;
         oylng_status st;
         size_t budget = 1 << 16;
@@ -786,6 +802,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (!clean && pst != OYLNG_ERR_MEMORY) abort();
         } else {
             if (!oylng_parser_error(yp)) abort();
+            /* a type's names walked again differently: the whole message, as
+               a refusal may quote the input */
+            if (!strcmp(oylng_parser_error(yp), "/: a type's names walked again differently (a bug)")) abort();
             if (st != OYLNG_ERR_SCHEMA && st != OYLNG_ERR_LIMIT && st != OYLNG_ERR_MEMORY &&
                 pst != OYLNG_ERR_MEMORY) {
                 /* not for a schema: the events' error */
