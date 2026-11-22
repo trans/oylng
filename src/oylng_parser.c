@@ -2157,9 +2157,13 @@ static void fmap_step(parser *P, gframe *f) {
 /* ── The table (section 8.1) ─────────────────────────────── */
 
 /* A key of the table's own mapping has been read: a key an earlier --- &
- * defined is replaced, and its size comes off full now (section 10). */
+ * defined is replaced, and its size comes off full now (section 10). One
+ * that starts with !, plain or quoted, is refused: --- !a stamps with the
+ * entry a, so no stamp would reach an entry !a (section 8.1). */
 static uint32_t entry_key(parser *P, uint32_t k) {
     const node *kn = &P->nodes[k];
+    if (kn->len && kn->data[0] == '!')
+        fail(P, P->in + kn->pos, "a name in the table can't start with !");
     slot *s = ix_find(P, &P->tix, ROOT, kn->data, kn->len, key_hash(P, ROOT, kn->data, kn->len));
     if (!s) return NONE;
     entry *e = &P->entries[s->val];

@@ -93,11 +93,11 @@
   document the application's schema typed again, which must be accepted
   in block style and read back the same.
 - Tested: 241 API checks and the draft's 70 examples (`make test`); part 2's
-  suite (yaml2 `25bfb66`), 797 of its 846 tests passed and none failed, 23
+  suite (yaml2 `c5203b6`), 801 of its 850 tests passed and none failed, 26
   of them with a store of published files, the rest skipped for times held
-  otherwise (25) and `keep` (24) (`make test-yes`); all 859 of the streams
+  otherwise (25) and `keep` (24) (`make test-yes`); all 863 of the streams
   the draft's schema checker (yaml2's `schemacheck.py`) types in its
-  examples and edge cases that the engine can run, 23 with a store, each
+  examples and edge cases that the engine can run, 26 with a store, each
   refused by both or accepted with the same values (`make
   test-schema-diff`, with `--every-entry`, as the checker checks a stream
   with no document, `--schema-limit` and `--store`); 50,000
@@ -118,6 +118,13 @@
   `a` and a comment. The emitter writes such names, and refuses `a#`,
   `a#b#c` and the like. The suite's six new tests pass, and the emitter has
   9 new checks, 161 in all.
+
+- **A name in the table can't start with `!`**, plain or quoted, as part
+  1, section 8.1, now says (trans/yaml2 `c5203b6`): `--- !spot` stamps a
+  document with the entry `spot`, so an entry named `!spot` was one no
+  stamp could reach. `!` inside a name, and at the start of a key below an
+  entry, is still an ordinary character. The suite's three new tests pass
+  (`QVU4`, `JDM9`, `3GJP`), all 365 of its tests in all.
 
 - **References kept** (part 1, sections 10 and 11). With
   `oylng_parser_set_keep(p, true)`, documents are read as kept trees, under
