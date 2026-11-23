@@ -28,7 +28,7 @@
  * alone, and nothing is walked or built for a document: a reference, a
  * -<< and a <<: line each come as one event naming the table's node, for
  * the tree. A <<: line in the table stays a node, its mapping's pairs not
- * copied into a plan, so a path through it looks in the mappings it names.
+ * copied into a plan; a path through it gathers its keys (map_get).
  *
  * Errors unwind with longjmp to oylng_parse_next. Everything the parser
  * allocates hangs off the parser, so nothing leaks when they do.
@@ -281,6 +281,19 @@ struct oylng_parser {
     uint32_t  capseen, seen_gen;
     mframe   *mstack;
     uint32_t  capmstack;
+    /* and, gathered for paths, such a mapping's keys through its lines, for
+       the table's life: as a plan has them, kpl[m] its place in kpairs and
+       kix by mapping and key, or, walked for m alone, in kwx (kpl[m].start
+       NONE until either, KWALKED if walked, below kpl_hi); the steps each
+       took, and whether each ran out. Else a path looks through the
+       lines, kwork the steps that took in the stream. */
+    pair     *kpairs;
+    uint32_t  nkpairs, capkpairs;
+    plan     *kpl;
+    uint32_t  capkpl, kpl_hi;
+    keyindex  kix, kwx;
+    uint64_t  kplans, kwalks, kwork;
+    bool      kplans_out, kwalks_out;
 
     oylng_status status;
     oylng_mark   errmark;
@@ -1079,6 +1092,13 @@ static inline uint32_t deref(const parser *P, uint32_t v) {
 
 /* The value of key k written in mapping m of the table, or of its plan if
  * it has one, or NONE */
+/* Past a kept mapping's <<: lines, which come first */
+static uint32_t lines_end(const parser *P, uint32_t m) {
+    uint32_t i = m + 1, end = P->nodes[m].link;
+    while (i < end && P->nodes[i].kind == N_MERGE) i++;
+    return i;
+}
+
 static uint32_t map_get1(parser *P, uint32_t m, const char *k, size_t kl) {
     const node *nd = &P->nodes[m];
     bool merged = (nd->sub & F_MERGED) != 0;
@@ -1094,56 +1114,207 @@ static uint32_t map_get1(parser *P, uint32_t m, const char *k, size_t kl) {
         for (uint32_t i = 0; i < cnt; i++)
             if (key_is(P, pr[i].key, k, kl)) return pr[i].val;
     } else {
-        uint32_t i = m + 1;
-        if (nd->sub & F_KEPT)   /* its <<: lines come first */
-            while (P->nodes[i].kind == N_MERGE) i++;
+        uint32_t i = (nd->sub & F_KEPT) ? lines_end(P, m) : m + 1;   /* its <<: lines come first */
         for (; i < nd->link; i = subtree_end(P, i + 1))
             if (key_is(P, i, k, kl)) return i + 1;
     }
     return NONE;
 }
 
-/* The value of key k in mapping m of the table, or NONE. With its <<:
- * lines kept, a key not written in m is in the mappings they name, the last
- * first (section 9.1), and so on down. Each mapping is looked in once, so a
- * mapping merged in twice costs nothing more. */
-static uint32_t map_get(parser *P, uint32_t m, const char *k, size_t kl) {
-    uint32_t v = map_get1(P, m, k, kl);
-    if (v != NONE || !(P->nodes[m].sub & F_KEPT)) return v;
-    if (P->capseen < P->n) {
+/* The table's nodes so far, which paths and <<: lines name */
+static uint32_t table_nodes(const parser *P) {
+    return P->in_table ? P->n : P->table_end;
+}
+
+/* Starts a walk through kept <<: lines from mapping m: none looked in yet
+ * but m, and m's frame on the stack */
+static void walk_start(parser *P, uint32_t m) {
+    uint32_t tn = table_nodes(P);
+    if (P->capseen < tn) {
         uint32_t old = P->capseen;
-        P->seen = grow(P, P->seen, &P->capseen, P->n, sizeof *P->seen);
+        P->seen = grow(P, P->seen, &P->capseen, tn, sizeof *P->seen);
         memset(P->seen + old, 0, (size_t)(P->capseen - old) * sizeof *P->seen);
     }
-    if (++P->seen_gen == 0) {   /* once in 4G lookups */
+    if (++P->seen_gen == 0) {   /* once in 4G walks */
         memset(P->seen, 0, (size_t)P->capseen * sizeof *P->seen);
         P->seen_gen = 1;
     }
-    /* each frame a mapping and its next <<: line to look through, from the
-       last; a line's node is past the mapping's */
-    uint32_t sp = 0;
     P->seen[m] = P->seen_gen;
-    P->mstack = grow(P, P->mstack, &P->capmstack, sp + 1, sizeof *P->mstack);
-    uint32_t last = m + 1;
-    while (P->nodes[last].kind == N_MERGE) last++;
-    P->mstack[sp].map = m;
-    P->mstack[sp++].next = last;
-    while (sp) {
-        mframe *f = &P->mstack[sp - 1];
-        if (f->next == f->map + 1) { sp--; continue; }
+    P->mstack = grow(P, P->mstack, &P->capmstack, 1, sizeof *P->mstack);
+    P->mstack[0] = (mframe){ m, lines_end(P, m) };
+}
+
+/* The walk's next mapping, or NONE at its end: through each frame's <<:
+ * lines from the last, each mapping once, depth first, so in the order a
+ * key is found in (section 9.1). *sp is the stack's height. Each line is a
+ * step on *steps, and NONE too once past cap. */
+static uint32_t walk_next(parser *P, uint32_t *sp, uint64_t *steps, uint64_t cap) {
+    while (*sp) {
+        mframe *f = &P->mstack[*sp - 1];
+        if (f->next == f->map + 1) { --*sp; continue; }
+        if (++*steps > cap) return NONE;
         uint32_t src = deref(P, P->nodes[--f->next].link);
         if (P->seen[src] == P->seen_gen) continue;
         P->seen[src] = P->seen_gen;
-        v = map_get1(P, src, k, kl);
-        if (v != NONE) return v;
-        if (!(P->nodes[src].sub & F_KEPT)) continue;
-        last = src + 1;
-        while (P->nodes[last].kind == N_MERGE) last++;
-        P->mstack = grow(P, P->mstack, &P->capmstack, sp + 1, sizeof *P->mstack);
-        P->mstack[sp].map = src;
-        P->mstack[sp++].next = last;
+        if (P->nodes[src].sub & F_KEPT) {
+            P->mstack = grow(P, P->mstack, &P->capmstack, *sp + 1, sizeof *P->mstack);
+            P->mstack[(*sp)++] = (mframe){ src, lines_end(P, src) };
+        }
+        return src;
     }
     return NONE;
+}
+
+/* kpl[m].start for a mapping walked: kpairs never reaches it, as kix has
+ * fewer than 2^31 keys */
+#define KWALKED (NONE - 1)
+
+static bool gathered(const parser *P, uint32_t m) {
+    return m < P->kpl_hi && P->kpl[m].start < KWALKED;
+}
+
+static bool walked(const parser *P, uint32_t m) {
+    return m < P->kpl_hi && P->kpl[m].start == KWALKED;
+}
+
+/* Key node k with value v into m's gathered keys, if none is there */
+static void kput(parser *P, uint32_t m, uint32_t k, uint32_t v) {
+    const node *kn = &P->nodes[k];
+    uint32_t h = key_hash(P, m, kn->data, kn->len);
+    if (ix_find(P, &P->kix, m, kn->data, kn->len, h)) return;
+    ix_insert(P, &P->kix, m, k, v, h);
+    P->kpairs = grow(P, P->kpairs, &P->capkpairs, P->nkpairs + 1, sizeof *P->kpairs);
+    P->kpairs[P->nkpairs++] = (pair){ k, v };
+}
+
+/* The steps gathering kept mapping m takes, the mappings its lines name
+ * gathered: one for each pair and line of its own, and for each key a
+ * line's mapping has, as building its plan would */
+static uint64_t gather_cost(parser *P, uint32_t m) {
+    uint64_t c = P->nodes[m].aux;
+    for (uint32_t i = m + 1, end = lines_end(P, m); i < end; i++) {
+        uint32_t src = deref(P, P->nodes[i].link);
+        c += 1 + (gathered(P, src) ? P->kpl[src].count : P->nodes[src].aux);
+    }
+    return c;
+}
+
+/* m's keys: its own, then those of the mappings its lines name, the last
+ * line first, each where none is yet, so the value each is found with
+ * (section 9.1) */
+static void gather_one(parser *P, uint32_t m) {
+    uint32_t start = P->nkpairs, end = lines_end(P, m);
+    for (uint32_t i = end; i < P->nodes[m].link; i = subtree_end(P, i + 1)) kput(P, m, i, i + 1);
+    for (uint32_t l = end; l-- > m + 1;) {
+        uint32_t src = deref(P, P->nodes[l].link);
+        if (gathered(P, src)) {
+            plan sp = P->kpl[src];
+            for (uint32_t j = 0; j < sp.count; j++) {
+                pair e = P->kpairs[sp.start + j];
+                kput(P, m, e.key, e.val);
+            }
+        } else
+            for (uint32_t j = src + 1; j < P->nodes[src].link; j = subtree_end(P, j + 1)) kput(P, m, j, j + 1);
+    }
+    P->kpl[m] = (plan){ start, P->nkpairs - start };
+}
+
+/* Gathers kept mapping m's keys as plans, those of the kept mappings its
+ * lines name first, and theirs, each once. While full is within the limit,
+ * that is what the normal read's plans cost and hold; past it, the table's
+ * gathering may take as many steps as held. False if the next would take
+ * more, with what is gathered kept, and the table's plans then done. */
+static bool gather(parser *P, uint32_t m, bool within, uint64_t held) {
+    if (!within && P->kplans_out) return false;
+    uint32_t sp = 0;
+    P->mstack = grow(P, P->mstack, &P->capmstack, 1, sizeof *P->mstack);
+    P->mstack[sp++] = (mframe){ m, m + 1 };
+    while (sp) {
+        mframe *f = &P->mstack[sp - 1];
+        uint32_t x = f->map;
+        if (f->next < P->nodes[x].link && P->nodes[f->next].kind == N_MERGE) {
+            uint32_t src = deref(P, P->nodes[f->next++].link);
+            if ((P->nodes[src].sub & F_KEPT) && !gathered(P, src)) {
+                P->mstack = grow(P, P->mstack, &P->capmstack, sp + 1, sizeof *P->mstack);
+                P->mstack[sp++] = (mframe){ src, src + 1 };
+            }
+            continue;
+        }
+        uint64_t c = gather_cost(P, x);
+        if (!within && sat(P->kplans, c) > held) {
+            P->kplans_out = true;
+            return false;
+        }
+        P->kplans = sat(P->kplans, c);
+        gather_one(P, x);
+        sp--;
+    }
+    return true;
+}
+
+/* Past the limit, m's keys alone, walking its lines once, a step for each
+ * line and key, while the table's walks are within held too: a chain's
+ * last mapping costs the chain, not its plans. False past held, with the
+ * table's walks then done. */
+static bool walk_gather(parser *P, uint32_t m, uint64_t held) {
+    if (P->kwalks_out) return false;
+    uint64_t steps = P->kwalks;
+    walk_start(P, m);
+    uint32_t sp = 1;
+    for (uint32_t src = m; src != NONE; src = walk_next(P, &sp, &steps, held))
+        for (uint32_t i = lines_end(P, src); i < P->nodes[src].link; i = subtree_end(P, i + 1)) {
+            if (++steps > held) break;
+            const node *kn = &P->nodes[i];
+            uint32_t h = key_hash(P, m, kn->data, kn->len);
+            if (!ix_find(P, &P->kwx, m, kn->data, kn->len, h)) ix_insert(P, &P->kwx, m, i, i + 1, h);
+        }
+    P->kwalks = steps;   /* what it put in kwx, whole or not */
+    if (steps > held) {
+        P->kwalks_out = true;
+        return false;
+    }
+    P->kpl[m] = (plan){ KWALKED, 0 };
+    return true;
+}
+
+/* The value of key k in mapping m of the table, or NONE. With its <<:
+ * lines kept, a key not written in m is in the mappings they name, the last
+ * first (section 9.1), and so on down: found in m's keys, gathered once
+ * (walk_gather, gather), or past what gathering may take, by looking
+ * through the lines. That is only past the limit, where the normal read
+ * has refused, and the stream may take as many steps as the limit. */
+static uint32_t map_get(parser *P, uint32_t m, const char *k, size_t kl) {
+    uint32_t v = map_get1(P, m, k, kl);
+    if (v != NONE || !(P->nodes[m].sub & F_KEPT)) return v;
+    uint32_t tn = table_nodes(P);
+    if (P->capkpl < tn) P->kpl = grow(P, P->kpl, &P->capkpl, tn, sizeof *P->kpl);
+    if (P->kpl_hi < tn) {
+        memset(P->kpl + P->kpl_hi, 0xFF, (size_t)(tn - P->kpl_hi) * sizeof *P->kpl);
+        P->kpl_hi = tn;
+    }
+    /* past the limit, a walk first: one mapping's never takes more steps
+       than the table holds, where its plans may */
+    bool within = sat(P->t_full, P->d_full) <= P->limit;
+    uint64_t held = sat(P->t_held, P->d_held);
+    keyindex *ix = NULL;
+    if (walked(P, m)) ix = &P->kwx;
+    else if (gathered(P, m)) ix = &P->kix;
+    else if (!within && walk_gather(P, m, held)) ix = &P->kwx;
+    else if (gather(P, m, within, held)) ix = &P->kix;
+    if (ix) {
+        slot *s = ix_find(P, ix, m, k, kl, key_hash(P, m, k, kl));
+        return s ? s->val : NONE;
+    }
+    walk_start(P, m);
+    uint32_t sp = 1;
+    for (;;) {
+        uint32_t src = walk_next(P, &sp, &P->kwork, P->limit);
+        if (P->kwork > P->limit)
+            fail_limit(P, P->p, "looking through <<: lines past the size limit of %llu", (unsigned long long)P->limit);
+        if (src == NONE) return NONE;
+        v = map_get1(P, src, k, kl);
+        if (v != NONE) return v;
+    }
 }
 
 /* A reference: the node in the table it names (section 8.3) */
@@ -2258,6 +2429,11 @@ static void reset_table(parser *P) {
     P->nplans = P->plans_table_end = 0;
     P->nentries = 0;
     ix_clear(&P->tix);
+    ix_clear(&P->kix);
+    ix_clear(&P->kwx);
+    P->nkpairs = P->kpl_hi = 0;   /* kpl filled again from 0 as gathered */
+    P->kplans = P->kwalks = 0;
+    P->kplans_out = P->kwalks_out = false;
     P->t_held = P->t_full = 0;
     oylng_arena_reset(P->strings);
     if (P->sctx) P->sctx_free(P->sctx);
@@ -2675,6 +2851,10 @@ void oylng_parser_free(oylng_parser *P) {
     free(P->entries);
     free(P->seen);
     free(P->mstack);
+    free(P->kix.s);
+    free(P->kwx.s);
+    free(P->kpairs);
+    free(P->kpl);
     free(P->tix.s);
     free(P->lix);
     free(P->stack);

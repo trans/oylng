@@ -114,11 +114,15 @@ nothing is spread:
   written, and `oylng_node_get` finds only those. A key that isn't written
   is in the merged mappings, the last first (section 9.1).
 
-A path through merged mappings, such as `*c:p`, still works, and the parser
-looks in each mapping once. Events would deliver every reference in full, so
-with references kept `oylng_parse_next` is `OYLNG_ERR_INPUT`, and so is
-`oylng_emit_tree` on a kept tree, and for now `oylng_parse_typed`. What walks
-a kept tree in full should check its full size first, as section 10 says.
+A path through merged mappings, such as `*c:p`, still works. The parser
+gathers a merged mapping's keys the first time a path looks into it. While
+full is within the limit, that costs no more than the normal read's copies
+of merged pairs. Past it, gathering may take as many steps as held, and
+then a path looks through the `<<:` lines, as many steps in the stream as
+the limit. Events would deliver every reference in full, so with references
+kept `oylng_parse_next` is `OYLNG_ERR_INPUT`, and so is `oylng_emit_tree` on
+a kept tree, and for now `oylng_parse_typed`. What walks a kept tree in full
+should check its full size first, as section 10 says.
 
 An application that keeps every document it reads says so with
 `oylng_parser_set_together`. The documents' sizes then add up, rather than

@@ -148,16 +148,30 @@
   pairs (`oylng_node_target`, `oylng_node_merges`, `oylng_node_merge`). So
   a chain doubling 62 times through `-<<`, 2^63 items as data, is a tree of
   a few hundred nodes. A merged mapping in the table keeps its lines as
-  written, without a copy of its pairs, and a path through it looks in each
-  mapping once. Events, `oylng_emit_tree` of a kept tree and, for now,
-  `oylng_parse_typed` are `OYLNG_ERR_INPUT` with references kept. With
+  written, without a copy of its pairs, and the first path into it
+  gathers its keys. While full is within the limit, they are gathered as
+  the normal read's plans are, for the mappings it names too, so no more
+  is spent or held than the normal read would. Past the limit, its lines
+  are walked for it alone, or else plans tried, each while its steps for
+  the table are within held; past both, a path looks through the lines,
+  and the stream may take as many steps as the limit, past which it is
+  `OYLNG_ERR_LIMIT`. So a million paths into the end of a chain of 100,000
+  merged mappings are read, a lookup each, where the normal read refuses
+  them for full size, and a chain of 1,000 mappings, each with 1,000
+  lines naming `{}`, reads in about the normal read's time. Events,
+  `oylng_emit_tree` of a kept tree and, for now, `oylng_parse_typed` are
+  `OYLNG_ERR_INPUT` with references kept. With
   `oylng_parser_set_together(p, true)`, for an application that keeps
   every document, the documents' sizes add up, and with references kept,
   `...` takes nothing off held. The suite's 7 `keep` and 2 `together`
   tests pass, and every other test is also read with references kept:
   spread as section 9 says, each gives the same events and offsets, or the
-  same refusal. 52 new API checks, 196 in all. The fuzzer reads every
-  stream with references kept, and with its documents together.
+  same refusal. 67 new API checks, 211 in all. The fuzzer reads every
+  stream with references kept, and with its documents together (a stream
+  of more than one). Its default limit is now 1 MiB, not the library's
+  64 MiB: two inputs of 2.6 KB that expand to 5 million events took 9 s
+  of its checks under the sanitizers, against a timeout of 10 s, and now
+  take 0.8 s.
 
 ## 0.2.0 (2026-11-12)
 

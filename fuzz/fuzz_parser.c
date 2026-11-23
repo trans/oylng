@@ -544,8 +544,11 @@ static void published(const char *in, size_t size, unsigned opt);
 static oylng_parser *parser_for(const char *in, size_t size, unsigned opt) {
     oylng_parser *p = oylng_parser_new(in, size);
     if (!p) return NULL;
-    static const uint64_t limits[8] = { 0, 4, 16, 64, 256, 4096, 1 << 16, 0 };
-    if (limits[opt & 7]) oylng_parser_set_limit(p, limits[opt & 7]);
+    /* the default, 64 MiB, would let 4 KiB expand into tens of millions of
+       events, each checked several ways here, for many seconds under the
+       sanitizers; the limit works the same at any size, so 1 MiB */
+    static const uint64_t limits[8] = { 1 << 20, 4, 16, 64, 256, 4096, 1 << 16, 1 << 20 };
+    oylng_parser_set_limit(p, limits[opt & 7]);
     if (opt & 0x80) oylng_parser_set_levels(p, 300);
     return p;
 }
@@ -574,6 +577,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     static unsigned char ismap[OYLNG_MAX_LEVELS + 8];
     static size_t nodes[OYLNG_MAX_LEVELS + 8];
     int depth = 0, in_doc = 0, started = 0;
+    unsigned ndocs = 0;   /* delivered, for the together pass */
     const oylng_event *e;
     oylng_status pst;
     for (;;) {
@@ -595,6 +599,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         case OYLNG_EVT_DOC_START:
             if (in_doc || depth) abort();
             in_doc = 1;
+            ndocs++;
             break;
         case OYLNG_EVT_DOC_END:
             if (!in_doc || depth) abort();
@@ -708,8 +713,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
 
     /* together: the sizes add up, so accepted only where the events were,
-       and refused for the grammar alike, or for size before it */
-    oylng_parser *gp = parser_for(in, size, opt);
+       and refused for the grammar alike, or for size before it. With one
+       document delivered, it is the events' read again, so not run. */
+    oylng_parser *gp = ndocs > 1 ? parser_for(in, size, opt) : NULL;
     if (gp) {
         oylng_parser_set_together(gp, true);
         uint64_t h7 = 0xCBF29CE484222325u;
