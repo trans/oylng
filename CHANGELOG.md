@@ -1,6 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-24)
+
+Part 2 of YAML 2.0, the Easy Schema, and references kept for part 1.
+Tested against the suite in [trans/yaml2](https://github.com/trans/yaml2)
+at its `v0.1.0` (`def062b`): all 373 of part 1's tests pass, and 801 of
+part 2's 850, with none failing. Part 2's other 49 are skipped: 24 type
+documents read with references kept, which isn't built yet, and 25 are
+for a parser that holds times otherwise (fewer fraction digits, or no
+second 60 or year 0000). The draft is a draft, and anything here may
+change with it.
 
 - **Part 2, the Easy Schema, begun**, a work in progress as the draft is
   (trans/yaml2 `57407f1`). `include/oylng/schema.h`: `oylng_parse_typed`
@@ -93,7 +102,7 @@
   document the application's schema typed again, which must be accepted
   in block style and read back the same.
 - Tested: 254 API checks and the draft's 71 examples (`make test`); part 2's
-  suite (yaml2 `635b24d`), 801 of its 850 tests passed and none failed, 26
+  suite (yaml2 `v0.1.0`, `def062b`), 801 of its 850 tests passed and none failed, 26
   of them with a store of published files, the rest skipped for times held
   otherwise (25) and `keep` (24) (`make test-yes`); all 863 of the streams
   the draft's schema checker (yaml2's `schemacheck.py`) types in its

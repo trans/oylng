@@ -5,10 +5,11 @@ on:
   pull_request:
   workflow_dispatch:
 
-# The YAML 2.0 suite the tests pass against: trans/yaml2 at this commit.
+# The YAML 2.0 suite the tests pass against: trans/yaml2 at this commit,
+# a tagged one for a release (here yaml2's v0.1.0).
 # Move it forward when the suite changes and the parser has caught up.
 env:
-  YAML2_REF: 635b24d3df3642202dbd9a2950f7201c93b84bf3
+  YAML2_REF: def062b43dc10b2a64e072f37b8c79ef72764379
 
 jobs:
   test:
