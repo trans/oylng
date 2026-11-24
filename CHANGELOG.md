@@ -92,8 +92,8 @@
   block and in flow style, and reads back the same; the fuzzer writes each
   document the application's schema typed again, which must be accepted
   in block style and read back the same.
-- Tested: 254 API checks and the draft's 70 examples (`make test`); part 2's
-  suite (yaml2 `c5203b6`), 801 of its 850 tests passed and none failed, 26
+- Tested: 254 API checks and the draft's 71 examples (`make test`); part 2's
+  suite (yaml2 `635b24d`), 801 of its 850 tests passed and none failed, 26
   of them with a store of published files, the rest skipped for times held
   otherwise (25) and `keep` (24) (`make test-yes`); all 863 of the streams
   the draft's schema checker (yaml2's `schemacheck.py`) types in its
@@ -149,16 +149,22 @@
   a chain doubling 62 times through `-<<`, 2^63 items as data, is a tree of
   a few hundred nodes. A merged mapping in the table keeps its lines as
   written, without a copy of its pairs, and the first path into it
-  gathers its keys. While full is within the limit, they are gathered as
-  the normal read's plans are, for the mappings it names too, so no more
-  is spent or held than the normal read would. Past the limit, its lines
-  are walked for it alone, or else plans tried, each while its steps for
-  the table are within held; past both, a path looks through the lines,
-  and the stream may take as many steps as the limit, past which it is
-  `OYLNG_ERR_LIMIT`. So a million paths into the end of a chain of 100,000
-  merged mappings are read, a lookup each, where the normal read refuses
-  them for full size, and a chain of 1,000 mappings, each with 1,000
-  lines naming `{}`, reads in about the normal read's time. Events,
+  gathers its keys. While full, as it stands when the path is read, is
+  within the limit, they are gathered as the normal read's plans are, for
+  the mappings it names too, at about the normal read's cost (a chain of
+  1,000 with 1,000 paths into its end: 30 MB kept, 29 MB normal), and
+  nothing is counted. Past it, each lookup counts the `<<:`
+  lines a walk that saves nothing would follow, to the key or, for a key
+  that isn't there, through every line, and the stream's lookups together
+  may follow as many as the limit, past which it is `OYLNG_ERR_LIMIT`
+  (section 10 at yaml2 `635b24d`). The count is the same however the
+  parser finds the key: through the mapping's lines walked for it alone,
+  or through plans, each while its steps for the table are within held, or
+  else by looking through the lines. So at the default limit, 671 paths
+  into the end of a chain of 100,000 merged mappings are read, 99,999
+  lines each, and the 672nd is refused, as is the whole document in the
+  normal read; and a chain of 1,000 mappings, each with 1,000 lines naming
+  `{}`, reads in about the normal read's time. Events,
   `oylng_emit_tree` of a kept tree and, for now, `oylng_parse_typed` are
   `OYLNG_ERR_INPUT` with references kept. With
   `oylng_parser_set_together(p, true)`, for an application that keeps
@@ -166,7 +172,7 @@
   `...` takes nothing off held. The suite's 7 `keep` and 2 `together`
   tests pass, and every other test is also read with references kept:
   spread as section 9 says, each gives the same events and offsets, or the
-  same refusal. 67 new API checks, 211 in all. The fuzzer reads every
+  same refusal. 73 new API checks, 217 in all. The fuzzer reads every
   stream with references kept, and with its documents together (a stream
   of more than one). Its default limit is now 1 MiB, not the library's
   64 MiB: two inputs of 2.6 KB that expand to 5 million events took 9 s

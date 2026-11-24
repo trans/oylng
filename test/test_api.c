@@ -684,6 +684,21 @@ static oylng_status kept(const char *s, uint64_t limit, bool together, oylng_tre
     return st;
 }
 
+/* Read kept, refused for the lines its lookups follow past full (part 1,
+ * section 10) */
+static bool kept_refused(const char *s, uint64_t limit) {
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    if (limit) oylng_parser_set_limit(p, limit);
+    oylng_parser_set_keep(p, true);
+    oylng_tree *t;
+    oylng_status st;
+    while ((st = oylng_parse_tree(p, &t)) == OYLNG_OK && t) oylng_tree_free(t);
+    const char *e = oylng_parser_error(p);
+    bool r = st == OYLNG_ERR_LIMIT && e && strstr(e, "looking through <<: lines past the size limit");
+    oylng_parser_free(p);
+    return r;
+}
+
 static oylng_status together_events(const char *s, uint64_t limit) {
     oylng_parser *p = oylng_parser_new(s, strlen(s));
     oylng_parser_set_limit(p, limit);
@@ -833,8 +848,12 @@ static void test_keep(void) {
     CHECK(kept(dag, 0, false, &t) == OYLNG_OK && t && text_is(t, at(t, oylng_tree_root(t), "a"), "v"),
           "found through 30 levels of merges");
     oylng_tree_free(t);
+    /* not found: past full, a walk that saves nothing would follow 2^31 - 2
+       lines, past the limit; within it, the path is refused as not found */
     strcat(dag, "b: *m30:nope\n");
-    CHECK(kept(dag, 0, false, NULL) == OYLNG_ERR_PARSE, "and not found, soon");
+    CHECK(kept_refused(dag, 0), "and not found, for the lines a walk that saves nothing follows");
+    CHECK(kept("%YAML 2.0\n--- &\nm0: {k: v}\nm1: {<<: *m0, <<: *m0}\nm2: {<<: *m1, <<: *m1}\n---\nb: *m2:nope\n",
+               0, false, NULL) == OYLNG_ERR_PARSE, "and within full, not found");
 
     /* past the limit, paths find what they find within it: with the
        mappings' keys gathered within held, and, a's full past held too,
@@ -859,23 +878,60 @@ static void test_keep(void) {
         free(pd);
     }
 
-    /* past the limit, the doubling mappings' keys are gathered within
-       held, for as many paths as are written */
+    /* past full, each path follows 30 lines to k, in m0, however the
+       engine finds it, and the stream's paths together as many as the
+       limit: 33 at 1,000, not 34 */
     char *pl = malloc(1 << 16);
-    strcpy(pl, dag);
-    *strstr(pl, "---\n") = 0;
-    strcat(pl, "---\n");
-    for (int i = 0; i < 100; i++) sprintf(pl + strlen(pl), "a%d: *m30:k\n", i);
-    CHECK(kept(pl, 1000, false, NULL) == OYLNG_OK, "100 paths through 31 doubling mappings, gathered, not 3,100 steps looked through");
-    /* 100 mappings each naming a, of 200 keys, on 19 lines, and b on the
-       first: plans and walks for them take more steps than the table
-       holds, so after some 17 are walked, paths look through their lines,
-       20 steps for p, in b; the stream may take as many steps as the
-       limit: 300 paths, not 1000 */
-    for (int n = 300; n <= 1000; n += 700) {
-        strcpy(pl, "%YAML 2.0\n--- &\na: {");
-        for (int i = 0; i < 200; i++) sprintf(pl + strlen(pl), "%sk%d: 1", i ? ", " : "", i);
-        strcat(pl, "}\nb: {p: 2}\n");
+    for (int n = 33; n <= 34; n++) {
+        strcpy(pl, dag);
+        *strstr(pl, "---\n") = 0;
+        strcat(pl, "---\n");
+        for (int i = 0; i < n; i++) sprintf(pl + strlen(pl), "a%d: *m30:k\n", i);
+        if (n == 33) CHECK(kept(pl, 1000, false, NULL) == OYLNG_OK, "33 paths through 31 doubling mappings");
+        else CHECK(kept_refused(pl, 1000), "34 paths, 1,020 lines past the limit of 1,000");
+    }
+    /* a chain of 100,000, at the default limit: 99,999 lines a path to k0,
+       so 671 paths, not 672 */
+    {
+        size_t cap = 100000 * 40 + 672 * 24 + 64;
+        char *ch = malloc(cap);
+        size_t o = (size_t)sprintf(ch, "%%YAML 2.0\n--- &\nm0: {k0: v}\n");
+        for (int i = 1; i < 100000; i++) o += (size_t)sprintf(ch + o, "m%d: {<<: *m%d, k%d: v}\n", i, i - 1, i);
+        o += (size_t)sprintf(ch + o, "---\n");
+        size_t at671 = 0;
+        for (int i = 0; i < 672; i++) {
+            if (i == 671) at671 = o;
+            o += (size_t)sprintf(ch + o, "- *m99999:k0\n");
+        }
+        CHECK(kept_refused(ch, 0), "672 paths into the end of a chain of 100,000");
+        ch[at671] = 0;
+        CHECK(kept(ch, 0, false, NULL) == OYLNG_OK, "671 of them");
+        free(ch);
+    }
+    /* read within full, a path counts nothing, and the keys gathered for
+       it count once full has passed the limit: t's k2 is 2,147 lines on,
+       past m10's 2,046, the lines to m10 and x99, and x99's 99 down to x0,
+       so 9 such paths after, not 10 */
+    for (int n = 9; n <= 10; n++) {
+        strcpy(pl, "%YAML 2.0\n--- &\nm0: {k: v}\n");
+        for (int i = 1; i <= 10; i++) sprintf(pl + strlen(pl), "m%d: {<<: *m%d, <<: *m%d}\n", i, i - 1, i - 1);
+        strcat(pl, "x0: {k2: 1}\n");
+        for (int i = 1; i < 100; i++) sprintf(pl + strlen(pl), "x%d: {<<: *x%d}\n", i, i - 1);
+        strcat(pl, "t: {<<: *x99, <<: *m10}\n---\na: *t:k2\nb: [*m10, *m10, *m10]\nc:\n");
+        for (int i = 0; i < n; i++) strcat(pl, "- *t:k2\n");
+        if (n == 9) CHECK(kept(pl, 21000, false, NULL) == OYLNG_OK, "a path within full, and 9 past it");
+        else CHECK(kept_refused(pl, 21000), "and 10 past it, 21,470 lines");
+    }
+    /* 100 mappings each naming a, of 200 keys and a line to a0, on 19
+       lines, and b on the first. Plans and walks for them take more steps
+       than the table holds, so after some are walked, paths look through
+       their lines. Whichever way, p, in b, is 39 lines on: 19 to a, each
+       with a's line to a0, which a walk that saves nothing follows each
+       time, and b's. So 256 paths at 10,000, not 257 */
+    for (int n = 256; n <= 257; n++) {
+        strcpy(pl, "%YAML 2.0\n--- &\na0: {z: 0}\na:\n  <<: *a0\n");
+        for (int i = 0; i < 200; i++) sprintf(pl + strlen(pl), "  k%d: 1\n", i);
+        strcat(pl, "b: {p: 2}\n");
         for (int j = 0; j < 100; j++) {
             sprintf(pl + strlen(pl), "t%d:\n  <<: *b\n", j);
             for (int i = 0; i < 19; i++) strcat(pl, "  <<: *a\n");
@@ -892,14 +948,14 @@ static void test_keep(void) {
             else oylng_tree_free(t);
         }
         const char *le = oylng_parser_error(lp);
-        if (n == 300) {
-            CHECK(ls == OYLNG_OK, "300 paths looked through: %s", le ? le : "");
+        if (n == 256) {
+            CHECK(ls == OYLNG_OK, "256 paths: %s", le ? le : "");
             bool all = first != NULL;
-            for (uint32_t i = 0; all && i < 300; i++) all = text_is(first, oylng_node_item(first, oylng_tree_root(first), i), "2");
+            for (uint32_t i = 0; all && i < 256; i++) all = text_is(first, oylng_node_item(first, oylng_tree_root(first), i), "2");
             CHECK(all, "each p from b");
         } else
             CHECK(ls == OYLNG_ERR_LIMIT && le && strstr(le, "looking through <<: lines past the size limit of 10000"),
-                  "1000 paths: %s", le ? le : "");
+                  "257 paths: %s", le ? le : "");
         if (first) oylng_tree_free(first);
         oylng_parser_free(lp);
     }

@@ -116,13 +116,16 @@ nothing is spread:
 
 A path through merged mappings, such as `*c:p`, still works. The parser
 gathers a merged mapping's keys the first time a path looks into it. While
-full is within the limit, that costs no more than the normal read's copies
-of merged pairs. Past it, gathering may take as many steps as held, and
-then a path looks through the `<<:` lines, as many steps in the stream as
-the limit. Events would deliver every reference in full, so with references
-kept `oylng_parse_next` is `OYLNG_ERR_INPUT`, and so is `oylng_emit_tree` on
-a kept tree, and for now `oylng_parse_typed`. What walks a kept tree in full
-should check its full size first, as section 10 says.
+full, as it stands when the path is read, is within the limit, that costs no
+more than the normal read's copies of merged pairs, and nothing is counted.
+Past it, each lookup counts the `<<:` lines a walk that saves nothing would
+follow, however the parser finds the key, and a stream's lookups together
+may follow as many as the limit (section 10). So a path to the far end of a
+chain of n merged mappings counts n - 1 lines. Events would deliver every
+reference in full, so with references kept `oylng_parse_next` is
+`OYLNG_ERR_INPUT`, and so is `oylng_emit_tree` on a kept tree, and for now
+`oylng_parse_typed`. What walks a kept tree in full should check its full
+size first, as section 10 says.
 
 An application that keeps every document it reads says so with
 `oylng_parser_set_together`. The documents' sizes then add up, rather than
