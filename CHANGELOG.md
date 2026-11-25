@@ -11,6 +11,11 @@
   `OYLNG_ERR_INPUT`, as the draft doesn't yet say how typing counts and
   delivers them. Under `!any`, where nothing is typed, they are delivered
   as kept. Part 2's 24 `keep` tests now run, and pass.
+- **A type key takes a scalar type** (part 2, section 7, yaml2 `bd5f8ed`):
+  since a key is always a scalar, a schema is refused as it is read
+  (`OYLNG_ERR_SCHEMA`) where a type key's type, or one of its union's
+  alternatives, is a mapping or a sequence, among a mapping's own type keys
+  or a `!**`'s. Before, such a key took nothing.
 
 ## 0.3.0 (2026-11-24)
 

@@ -1570,6 +1570,47 @@ static void emitting_more(void) {
     oylng_schema_free(rs);
 }
 
+/* ── Type keys take a scalar type (section 7) ────────────── */
+
+static void scalar_type_keys(void) {
+    oylng_parser *p;
+    const char *err;
+    oylng_typed *y;
+    /* refused as the schema is read: through a name, in a union nested in
+       a union, among a !**'s rules, and in an application's schema */
+    static const char *const refused[] = {
+        "%YAML 2.0\n--- &\npoint: {x: !int}\np2: !point\nm: {!p2: !int}\n--- !m\na: 1\n",
+        "%YAML 2.0\n--- &\nl: [!int, ...]\nu: {!|: [!str(/x/), {!|: [!int, !l]}]}\nm: {!u: !int}\n--- !m\nx: 1\n",
+        "%YAML 2.0\n--- &\nl: [!int, ...]\nm: {a: !int, !**: {!l: !int}}\n--- !m\na: 1\n",
+    };
+    for (size_t i = 0; i < sizeof refused / sizeof *refused; i++) {
+        p = oylng_parser_new(refused[i], strlen(refused[i]));
+        y = NULL;
+        oylng_status st = oylng_parse_typed(p, NULL, &y);
+        err = st == OYLNG_OK ? NULL : oylng_parser_error(p);
+        CHECK(!y && st == OYLNG_ERR_SCHEMA && err &&
+                  strstr(err, "a type key takes a scalar type, since a key is a scalar"),
+              "type key %zu refused: %s", i, err ? err : "accepted");
+        oylng_parser_free(p);
+    }
+    const char *as = "%YAML 2.0\n--- &\npoint: {x: !int}\nr: {!point: !int}\n";
+    oylng_schema *app = oylng_schema_new(as, strlen(as), S("r"), 0);
+    CHECK(oylng_schema_status(app) == OYLNG_ERR_SCHEMA &&
+              strstr(oylng_schema_error(app), "a type key takes a scalar type"),
+          "an application's schema: %s", oylng_schema_error(app));
+    oylng_schema_free(app);
+    /* !any, and a union with it, fit a scalar */
+    y = typed(&p, "%YAML 2.0\n--- &\nm: {!any: !int}\n--- !m\na: 1\n", NULL, &err);
+    CHECK(y && oylng_value_type(y, oylng_value_get(y, oylng_typed_root(y), S("a"))) == OYLNG_T_INT, "!any as a key: %s",
+          err ? err : "");
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    y = typed(&p, "%YAML 2.0\n--- &\nk: {!|: [!int, !any]}\nm: {!k: !bool}\n--- !m\n7: true\nab: false\n", NULL, &err);
+    CHECK(y && oylng_value_count(y, oylng_typed_root(y)) == 2, "a union with !any as a key: %s", err ? err : "");
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+}
+
 /* ── Typing with references kept (section 11) ───────────── */
 
 /* The stream's first document read with references kept and typed, under
@@ -2049,6 +2090,7 @@ static void api(void) {
     emitting();
     emitting_more();
     kept_typing();
+    scalar_type_keys();
 }
 
 int main(int argc, char **argv) {

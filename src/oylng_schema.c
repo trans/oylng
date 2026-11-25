@@ -970,10 +970,23 @@ static uint64_t key_count(const xt *m) {
     return n;
 }
 
+/* Section 7: a key is a scalar (part 1, section 7.4), so a type key's type
+ * must be one a scalar can fit: none of its alternatives a mapping or a
+ * sequence */
+static void scalar_keys(sctx *S, const xt *m) {
+    for (uint32_t i = 0; i < m->u.map.nrows; i++) {
+        const xt *kt = m->u.map.rows[i].key;
+        for (uint32_t j = 0; j < kt->alts->n; j++)
+            if (kt->alts->p[j].t->kind == X_SEQ || kt->alts->p[j].t->kind == X_MAP)
+                bad(S, kt->pos, "a type key takes a scalar type, since a key is a scalar");
+    }
+}
+
 static void key_ceilings(sctx *S, xt *t) {
     const xalts *a = t->alts;
     uint64_t all = 0;
     for (uint32_t i = 0; i < a->nmaps; i++) {
+        scalar_keys(S, a->p[a->maps[i]].t);
         uint64_t k = key_count(a->p[a->maps[i]].t);
         if (k > CEILING)
             bad(S, a->p[a->maps[i]].t->pos, "type keys of %llu positions, past the ceiling of %d",
@@ -994,6 +1007,7 @@ static void check_deep(sctx *S, const xt *d) {
         for (uint32_t i = 0; i < o->alts->n; i++)
             if (o->alts->p[i].t->kind == X_SEQ || o->alts->p[i].t->kind == X_MAP)
                 bad(S, o->pos, "a `!**` takes a scalar type, or a mapping of rules");
+    scalar_keys(S, d);
     uint64_t k = key_count(d);
     if (k > CEILING)
         bad(S, d->pos, "the type keys of a `!**` have %llu positions, past the ceiling of %d", (unsigned long long)k,
