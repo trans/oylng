@@ -134,8 +134,9 @@ times. Each place still gets its own value where bound code makes one
 (section 12). For now, typing a mapping whose `<<:` lines are kept, a
 sequence whose `-<<` items are, or a type of the stream's own schema
 written with either, is `OYLNG_ERR_INPUT`. The draft doesn't yet say how
-those are counted and delivered, so the engine doesn't guess. Read in full,
-they type as section 9.1 says.
+those are counted and delivered, so the engine doesn't guess. Under `!any`,
+where nothing is typed, they are delivered as kept, as in an untyped
+document. Read in full, they type as section 9.1 says.
 
 An application that keeps every document it reads says so with
 `oylng_parser_set_together`. The documents' sizes then add up, rather than

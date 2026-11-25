@@ -1669,8 +1669,9 @@ static void kept_typing(void) {
           "a type's -<< kept: %s", err);
     oylng_parser_free(p);
     /* a type is compiled only where a document reaches it, so an entry
-       with <<: no type names leaves typing be; under !any a <<: is refused
-       too, as a !** around it would type what it names */
+       with <<: no type names leaves typing be; under !any nothing is
+       typed, so a <<: there is delivered as kept, as in an untyped
+       document; a union trying !any last needs the merged keys first */
     const char *nr = "%YAML 2.0\n--- &\na: {k: v}\nb: {<<: *a}\nm: {k: !str}\n--- !m\nk: x\n";
     y = kept_typed(&p, nr, 0, &st, err, sizeof err);
     CHECK(st == OYLNG_OK && y, "an entry with <<: not reached: %s", err);
@@ -1678,7 +1679,15 @@ static void kept_typing(void) {
     oylng_parser_free(p);
     const char *ua = "%YAML 2.0\n--- &\na: {k: v}\nm: {k: !any}\n--- !m\nk: {<<: *a}\n";
     y = kept_typed(&p, ua, 0, &st, err, sizeof err);
-    CHECK(st == OYLNG_ERR_INPUT && !y && !strncmp(err, "/k: typing a mapping", 20), "<<: under !any: %s", err);
+    oylng_value kv = y ? oylng_value_get(y, oylng_typed_root(y), S("k")) : OYLNG_NO_VALUE;
+    CHECK(st == OYLNG_OK && y && oylng_value_type(y, kv) == OYLNG_T_ANY &&
+              oylng_node_merges(oylng_typed_tree(y), oylng_value_node(y, kv)) == 1,
+          "<<: under !any, as kept: %s", err);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    const char *uu = "%YAML 2.0\n--- &\na: {k: v}\nm: {k: {!|: [{j: !int}, !any]}}\n--- !m\nk: {<<: *a}\n";
+    y = kept_typed(&p, uu, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_INPUT && !y && !strncmp(err, "/k: typing a mapping", 20), "<<: under a union with !any: %s", err);
     oylng_parser_free(p);
     const char *un = "%YAML 2.0\n--- &\na: {k: v}\n---\n<<: *a\nj: 1\n";
     y = kept_typed(&p, un, 0, &st, err, sizeof err);

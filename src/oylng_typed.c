@@ -857,9 +857,10 @@ static uint32_t walk(typer *R, uint32_t node, const xt *scope) {
     return open_coll(R, k == OYLNG_NODE_MAPPING ? OYLNG_T_MAPPING : OYLNG_T_SEQUENCE, node, NULL, scope, NULL);
 }
 
-/* In a kept tree, a mapping with <<: lines or a sequence with -<< items:
- * what typing them counts and delivers, the draft doesn't say yet, so for
- * now they are refused, rather than typed without what they name */
+/* In a kept tree, a mapping with <<: lines or a sequence with -<< items,
+ * typed or walked by a `!**`: what typing them counts and delivers, the
+ * draft doesn't say yet, so for now they are refused, rather than typed
+ * without what they name */
 static void kept_spread(typer *R, uint32_t node) {
     oylng_kind k = oylng_node_kind(R->T, node);
     if (k == OYLNG_NODE_MAPPING && oylng_node_merges(R->T, node))
@@ -884,7 +885,10 @@ static uint32_t conv(typer *R, const xt *t, uint32_t node, const xt *scope) {
             if (R->memo[i].node == node && R->memo[i].k == k && R->memo[i].scope == scope) return R->memo[i].val;
         }
     }
-    if (R->kept) kept_spread(R, node);
+    /* under !any nothing is typed (section 10), so the value is the node as
+       kept, as an untyped document's is; a union with !any among its
+       alternatives tries the others first, which need the merged keys */
+    if (R->kept && !(k->kind == X_STD && k->std == STD_ANY)) kept_spread(R, node);
     R->typed += own_size(R->T, node);
     if (R->typed > R->limit)
         refuse_as(R, OYLNG_ERR_LIMIT, node, "typed passes the size limit of %llu", (unsigned long long)R->limit);

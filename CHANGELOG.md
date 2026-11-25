@@ -9,7 +9,8 @@
   A kept mapping's `<<:` lines and a kept sequence's `-<<` items, in the
   data or in a type of the stream's own schema, are refused for now with
   `OYLNG_ERR_INPUT`, as the draft doesn't yet say how typing counts and
-  delivers them. Part 2's 24 `keep` tests now run, and pass.
+  delivers them. Under `!any`, where nothing is typed, they are delivered
+  as kept. Part 2's 24 `keep` tests now run, and pass.
 
 ## 0.3.0 (2026-11-24)
 
