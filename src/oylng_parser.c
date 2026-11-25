@@ -3022,6 +3022,8 @@ void oylng__table_entry_nodes(const oylng_parser *P, uint32_t e, uint32_t *key, 
     *val = deref(P, P->entries[e].val);
 }
 
+uint64_t oylng__table_entry_full(const oylng_parser *P, uint32_t e) { return P->entries[e].full; }
+
 oylng_status oylng__parser_status(const oylng_parser *P) { return P->state == ST_ERROR ? P->status : OYLNG_OK; }
 
 uint64_t oylng__parser_limit(const oylng_parser *P) { return P->limit; }
@@ -3117,6 +3119,8 @@ oylng_status oylng__parser_fail_at(oylng_parser *P, oylng_status st, size_t offs
     return r;
 }
 
+static bool seq_items(const parser *P, uint32_t i, void (*fn)(void *, uint32_t), void *ctx);
+
 bool oylng__table_children(const oylng_parser *P, uint32_t i, void (*fn)(void *, uint32_t), void *ctx) {
     const node *nd = &P->nodes[i];
     if (P->keep) {   /* as written: a <<: line and a -<< are nodes of their own */
@@ -3145,8 +3149,13 @@ bool oylng__table_children(const oylng_parser *P, uint32_t i, void (*fn)(void *,
             }
         return true;
     }
-    /* a sequence's items, each -<< spread where it is: a splice's source
-       may hold splices too, so the sources being read are a stack */
+    return seq_items(P, i, fn, ctx);
+}
+
+/* Sequence i's items, each -<< spread where it is: a splice's source may
+ * hold splices too, so the sources being read are a stack */
+static bool seq_items(const parser *P, uint32_t i, void (*fn)(void *, uint32_t), void *ctx) {
+    const node *nd = &P->nodes[i];
     uint32_t local[64][2], (*st)[2] = local, cap = 64, n = 0;
     st[n][0] = i + 1;
     st[n++][1] = nd->link;
@@ -3172,6 +3181,152 @@ bool oylng__table_children(const oylng_parser *P, uint32_t i, void (*fn)(void *,
     }
     if (st != local) free(st);
     return ok;
+}
+
+/* Kept mapping m's pairs as a full read builds them (section 9.1, and
+ * map_key), in time linear in the mappings its lines reach:
+ * - their order: each line's, the first first, the mapping it names built
+ *   the same way, then m's own, each added where it isn't yet: a walk
+ *   forward that adds a mapping's keys once its lines are done;
+ * - a key's node: m's own, else the first line's to have the key, the same
+ *   way down: the first found walking forward, own keys before lines;
+ * - a value: m's own, else the last line's to have it: the first found
+ *   walking own keys first, then the lines from the last, as a lookup does.
+ * Each walk visits a mapping once, as a second visit finds no key not
+ * already there. */
+static bool kept_pairs(const parser *P, uint32_t m, void (*fn)(void *, uint32_t), void *ctx) {
+    parser *Q = (parser *)P;   /* for the hash key, made once */
+    struct kf { uint32_t map, next; } *fs = NULL;
+    struct kslot { uint32_t key, val; } *sl = NULL;
+    uint32_t *ix = NULL, *order = NULL, *seen = NULL;   /* ix: a slot's number plus 1; seen: a mapping's plus 1 */
+    size_t nf = 0, capf = 0, ns = 0, capsl = 0, cap = 0, no = 0, capo = 0, nseen = 0, capseen = 0;
+    bool ok = true;
+#define KP_GROW(p, c, need)                                                       \
+    do {                                                                          \
+        if ((need) > (c)) {                                                       \
+            size_t nc_ = (c) ? (c) * 2 : 16;                                      \
+            while (nc_ < (need)) nc_ *= 2;                                        \
+            void *np_ = realloc((p), nc_ * sizeof *(p));                          \
+            if (!np_) { ok = false; goto done; }                                  \
+            (p) = np_;                                                            \
+            (c) = nc_;                                                            \
+        }                                                                         \
+    } while (0)
+    for (int pass = 0; pass < 2; pass++) {
+        /* pass 0 walks forward, giving the order and the key nodes; pass 1
+           walks the lines from the last, giving the values */
+        if (seen) memset(seen, 0, capseen * sizeof *seen);
+        nseen = 0;
+        nf = 0;
+        KP_GROW(fs, capf, 1);
+        fs[nf++] = (struct kf){ m, NONE };
+        while (nf) {
+            struct kf *f = &fs[nf - 1];
+            uint32_t x = f->map, le = lines_end(P, x);
+            if (f->next == NONE) {   /* come to x: marked seen, its own keys looked at */
+                if (2 * (nseen + 1) > capseen) {
+                    size_t nc = capseen ? capseen * 2 : 16;
+                    uint32_t *nw = calloc(nc, sizeof *nw);
+                    if (!nw) { ok = false; goto done; }
+                    for (size_t j = 0; j < capseen; j++)
+                        if (seen[j]) {
+                            size_t h = ((seen[j] - 1) * 0x9E3779B1u) & (nc - 1);
+                            while (nw[h]) h = (h + 1) & (nc - 1);
+                            nw[h] = seen[j];
+                        }
+                    free(seen);
+                    seen = nw;
+                    capseen = nc;
+                }
+                size_t sh = (x * 0x9E3779B1u) & (capseen - 1);
+                while (seen[sh]) sh = (sh + 1) & (capseen - 1);
+                seen[sh] = x + 1;
+                nseen++;
+                for (uint32_t k = le; k < P->nodes[x].link; k = subtree_end(P, k + 1)) {
+                    const node *kn = &P->nodes[k];
+                    if (2 * (ns + 1) > cap) {   /* a bigger index, the slots hashed again */
+                        size_t nc = cap ? cap * 2 : 16;
+                        uint32_t *ni = calloc(nc, sizeof *ni);
+                        if (!ni) { ok = false; goto done; }
+                        for (size_t j = 0; j < ns; j++) {
+                            const node *jn = &P->nodes[sl[j].key];
+                            size_t h = text_hash(Q, jn->data, jn->len) & (nc - 1);
+                            while (ni[h]) h = (h + 1) & (nc - 1);
+                            ni[h] = (uint32_t)j + 1;
+                        }
+                        free(ix);
+                        ix = ni;
+                        cap = nc;
+                    }
+                    size_t h = text_hash(Q, kn->data, kn->len) & (cap - 1);
+                    for (; ix[h]; h = (h + 1) & (cap - 1)) {
+                        const node *jn = &P->nodes[sl[ix[h] - 1].key];
+                        if (same(jn->data, jn->len, kn->data, kn->len)) break;
+                    }
+                    if (pass == 0 && !ix[h]) {
+                        KP_GROW(sl, capsl, ns + 1);
+                        sl[ns] = (struct kslot){ k, NONE };
+                        ix[h] = (uint32_t)++ns;
+                    } else if (pass == 1 && ix[h] && sl[ix[h] - 1].val == NONE)
+                        sl[ix[h] - 1].val = k + 1;
+                }
+                f->next = pass == 0 ? x + 1 : le;
+            }
+            bool more = pass == 0 ? f->next < le : f->next > x + 1;
+            if (more) {
+                uint32_t line = pass == 0 ? f->next++ : --f->next;
+                uint32_t src = deref(P, P->nodes[line].link);
+                size_t sh = (src * 0x9E3779B1u) & (capseen - 1);
+                while (seen[sh] && seen[sh] != src + 1) sh = (sh + 1) & (capseen - 1);
+                if (seen[sh]) continue;
+                KP_GROW(fs, capf, nf + 1);
+                fs[nf++] = (struct kf){ src, NONE };
+                continue;
+            }
+            nf--;
+            if (pass == 0)   /* x's lines done: its keys not yet placed, at the end */
+                for (uint32_t k = le; k < P->nodes[x].link; k = subtree_end(P, k + 1)) {
+                    const node *kn = &P->nodes[k];
+                    size_t h = text_hash(Q, kn->data, kn->len) & (cap - 1);
+                    for (; ix[h]; h = (h + 1) & (cap - 1)) {
+                        const node *jn = &P->nodes[sl[ix[h] - 1].key];
+                        if (same(jn->data, jn->len, kn->data, kn->len)) break;
+                    }
+                    struct kslot *e = &sl[ix[h] - 1];
+                    if (e->val == NONE) {   /* not yet placed: val marks it till pass 1 */
+                        KP_GROW(order, capo, no + 1);
+                        order[no++] = ix[h] - 1;
+                        e->val = 0;
+                    }
+                }
+        }
+        if (pass == 0)
+            for (size_t j = 0; j < ns; j++) sl[j].val = NONE;
+    }
+    for (size_t j = 0; j < no; j++) {
+        fn(ctx, deref(P, sl[order[j]].key));
+        fn(ctx, deref(P, sl[order[j]].val));
+    }
+done:
+#undef KP_GROW
+    free(fs);
+    free(sl);
+    free(ix);
+    free(order);
+    free(seen);
+    return ok;
+}
+
+bool oylng__table_spread(const oylng_parser *P, uint32_t i, void (*fn)(void *, uint32_t), void *ctx) {
+    if (!P->keep) return oylng__table_children(P, i, fn, ctx);
+    const node *nd = &P->nodes[i];
+    if (nd->kind == N_SEQ) return seq_items(P, i, fn, ctx);
+    if (nd->sub & F_KEPT) return kept_pairs(P, i, fn, ctx);
+    for (uint32_t k = i + 1; k < nd->link; k = subtree_end(P, k + 1)) {
+        fn(ctx, deref(P, k));
+        fn(ctx, deref(P, k + 1));
+    }
+    return true;
 }
 
 const char *oylng_event_type_str(oylng_event_type t) {

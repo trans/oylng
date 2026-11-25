@@ -215,6 +215,10 @@ void         oylng__table_node(const oylng_parser *p, uint32_t i, oylng__tnode *
  * mapping's lines first. False if memory runs out. */
 bool         oylng__table_children(const oylng_parser *p, uint32_t i,
                                    void (*fn)(void *, uint32_t), void *ctx);
+/* The same, but spread as a full read gives them, with references kept
+ * too: a kept mapping's pairs as section 9.1 builds them, and a -<< spread */
+bool         oylng__table_spread(const oylng_parser *p, uint32_t i,
+                                 void (*fn)(void *, uint32_t), void *ctx);
 
 /* ── Between the parser and the typed reader (part 2) ────────
  * A schema is read from the table's nodes. A type that reaches an entry
@@ -232,6 +236,8 @@ uint32_t     oylng__table_count(const oylng_parser *p);
 void         oylng__table_entry_at(const oylng_parser *p, uint32_t e, const char **k, size_t *kl);
 /* Entry e's key node, and its value's, references followed */
 void         oylng__table_entry_nodes(const oylng_parser *p, uint32_t e, uint32_t *key, uint32_t *val);
+/* Entry e's full size: its key's and its value's (part 1, section 10) */
+uint64_t     oylng__table_entry_full(const oylng_parser *p, uint32_t e);
 /* OYLNG_OK, or the error the parser has stopped with */
 oylng_status oylng__parser_status(const oylng_parser *p);
 /* Whether a stamp types its document: oylng_parser_set_stamps */
@@ -286,6 +292,14 @@ oylng_status oylng__tree_read(oylng_parser *p, oylng_tree **out,
 bool         oylng__node_shared(const oylng_tree *t, oylng_node n);
 /* The number of the pair whose key is key in mapping map, or UINT32_MAX */
 uint32_t     oylng__node_find(const oylng_tree *t, oylng_node map, oylng_str key);
+/* With references kept: node n's own <<: lines, or its own -<< items */
+size_t       oylng__node_lines(const oylng_tree *t, oylng_node n);
+/* With references kept, node n, a mapping with <<: lines or a sequence
+ * with -<< items, spread as a full read gives it (part 1, section 9), as a
+ * new node of the tree in *out, which shares n's children. Each line
+ * followed and each pair or item placed takes a step from budget, which
+ * part 2's typed count is never less than; past it, OYLNG_ERR_LIMIT. */
+oylng_status oylng__tree_spread(oylng_tree *t, oylng_node n, uint64_t budget, oylng_node *out);
 
 /* A node of a tree the emitter builds, in document order: a string's text,
  * at off in the text given, and whether it is plain; a collection's

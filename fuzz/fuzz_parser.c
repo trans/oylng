@@ -129,6 +129,8 @@ static bool kept_pairs(const oylng_tree *t, oylng_node map, kpairs *ps, size_t *
     size_t nm = oylng_node_merges(t, map);
     if (oylng_node_merge(t, map, nm) != OYLNG_NO_NODE) abort();
     for (size_t i = 0; i < nm; i++) {
+        if (!*budget) return false;   /* a line followed is a visit: {} named 2^62 times takes no keys */
+        --*budget;
         oylng_node g = oylng_node_merge(t, map, i), src = oylng_node_target(t, g);
         if (oylng_node_kind(t, g) != OYLNG_NODE_MERGE || oylng_node_kind(t, src) != OYLNG_NODE_MAPPING) abort();
         kpairs sp = { 0 };
@@ -782,9 +784,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
     oylng_parser *yp = parser_for(in, size, opt);
     /* and alongside, typed with references kept (section 11): each
-       document the typed read accepts is within full, so held and typed
-       are too, and it must be accepted alike, with the same values, unless
-       typing meets a <<: line or a -<< item, which is refused for now */
+       document the typed read accepts is within full, so held is too, and
+       the entries its schema reaches, and it must be accepted alike, with
+       the same values. Typed can pass full, as it counts each <<: and -<<
+       line, which full doesn't, so a refusal for typed stops the check. */
     oylng_parser *kyp = parser_for(in, size, opt);
     bool kdone = !kyp;
     if (kyp) {
@@ -828,7 +831,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
                     check_value(ky, oylng_typed_root(ky), &cb);
                     oylng_typed_free(ky);
                 } else if (ks == OYLNG_ERR_MEMORY ||
-                           (ks == OYLNG_ERR_INPUT && strstr(oylng_parser_error(kyp), "isn't supported yet")))
+                           (ks == OYLNG_ERR_LIMIT && strstr(oylng_parser_error(kyp), "typed passes the size limit")))
                     kdone = true;
                 else
                     abort();

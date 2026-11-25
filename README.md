@@ -131,12 +131,22 @@ and to typed, which counts a shared node once for each type it is typed as
 and each nearest `!**` (part 2, section 11). So `[*s, *s, ...]` under
 `[!str, ...]` counts `s` once, while three types for it count it three
 times. Each place still gets its own value where bound code makes one
-(section 12). For now, typing a mapping whose `<<:` lines are kept, a
-sequence whose `-<<` items are, or a type of the stream's own schema
-written with either, is `OYLNG_ERR_INPUT`. The draft doesn't yet say how
-those are counted and delivered, so the engine doesn't guess. Under `!any`,
-where nothing is typed, they are delivered as kept, as in an untyped
-document. Read in full, they type as section 9.1 says.
+(section 12).
+
+Typing spreads a kept mapping's `<<:` lines and a kept sequence's `-<<`
+items, and the typed value is what a full read gives (part 1, section 9).
+Typed counts what spreading builds, before it builds it: each line, and all
+that its target gives, with nothing taken off for a key given twice. So a
+chain of n mappings, each merging the one before it twice, counts some
+2^(n+1) lines, though it gives no key at all. The spread is a new node of
+the document's tree, made once for each node and shared, and spreading a
+mapping visits each mapping its lines reach once, however many lines name
+it. Under `!any`
+alone, where nothing is typed, nothing is spread, and the value is
+delivered as kept, as in an untyped document; a union with `!any` spreads.
+A type of the stream's own schema written with `<<:` or `-<<` is compiled
+from its merged form, and the entries a document's type reaches are first
+held to the limit together, for their full size.
 
 An application that keeps every document it reads says so with
 `oylng_parser_set_together`. The documents' sizes then add up, rather than

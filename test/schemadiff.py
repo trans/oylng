@@ -12,11 +12,14 @@ types and each schema it compiles on its own, then gives each to the engine
 (`oylng --typed`) and compares: both refuse, or both accept with the same
 values. The checker is asked again for each, as the engine is: holding what
 the engine holds of a date (9 fraction digits, a second of 60, the year
-0000). A stream with a limit is run twice: with the limit the stream's too
+0000). Each stream is run twice. Without a limit: read in full, and with
+references kept (`--keep`). With a limit: with the limit the stream's too
 (part 1, section 10), applied to held and full as the engine's tree applies
 it, which the checker's typed leaves out; and with it for part 2's counts
-alone (`--typed-limit`), typed counted as an interface that keeps
-references counts it. In both, an application's schema is read under the
+alone (`--typed-limit`), read with references kept (`--keep`), as the
+checker counts it then: typed counts what spreading `<<:` and `-<<` builds,
+and the entries a schema reaches are held to full (section 11). In both, an
+application's schema is read under the
 limit as a stream of its own, and held to it for its full size (section 3,
 `--schema-limit`).
 
@@ -34,6 +37,7 @@ import base64, contextlib, io, json, math, os, subprocess, sys, tempfile, textwr
 from decimal import Decimal
 
 ENGINE_HOLD = (9, True, True)
+BIG = 64 << 20   # the most of the engine's output compared
 
 def load(path, spec):
     """The checker's names, with typed and Schema logged, and its main run."""
@@ -56,11 +60,11 @@ def load(path, spec):
         if not depth[0]: texts[id(r.table)] = (t, r)
         return r
 
-    def Schema(table, root, cut=False, limit=ns['LIMIT'], kept=False):
+    def Schema(table, root, cut=False, limit=ns['LIMIT'], kept=False, types=None):
         if not depth[0] and id(table) in texts:
             schemas.append(dict(text=texts[id(table)][0], root=root, limit=limit))
         depth[0] += 1
-        try: return Schema0(table, root, cut, limit, kept)
+        try: return Schema0(table, root, cut, limit, kept, types)
         finally: depth[0] -= 1
 
     ns['typed'], ns['Schema'], ns['read'] = typed, Schema, read
@@ -103,7 +107,8 @@ def checker_schema(ns, c):
     except ns['REFUSED'] as e:
         return 'no', str(e)
 
-def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=None, schema_limit=None, store=None):
+def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=None, schema_limit=None, store=None,
+           keep=False):
     sf = os.path.join(tmp, 'stream.yaml')
     with open(sf, 'w', encoding='utf-8', newline='') as f: f.write(framed(stream))
     cmd = [tool, '--typed', '--every-entry']   # typed() checks every entry of a stream with no document
@@ -120,17 +125,28 @@ def engine(tool, tmp, framed, stream, app=None, limit=None, cut=False, counts=No
             with open(os.path.join(d, h), 'wb') as f: f.write(b if isinstance(b, bytes) else b.encode('utf-8'))
         cmd += ['--store', d]
     if cut: cmd.append('--cut')
+    if keep: cmd.append('--keep')
     if limit is not None: cmd += ['--limit', str(limit)]
     if counts is not None: cmd += ['--typed-limit', str(counts)]
     if schema_limit is not None: cmd += ['--schema-limit', str(schema_limit)]
-    r = subprocess.run(cmd + [sf], capture_output=True, timeout=120)
-    err = r.stderr.decode('utf-8', 'replace').strip()
-    if r.returncode == 0:
-        return 'ok', [json.loads(l, object_pairs_hook=Pairs) for l in r.stdout.decode('utf-8').splitlines()]
-    if r.returncode == 1:
+    # Kept, a value can be far bigger written than held: 1,000 references to 1 MB is a GB of JSON.
+    # Past BIG, only the verdict is compared.
+    with open(os.path.join(tmp, 'stderr'), 'w+b') as ef:
+        p = subprocess.Popen(cmd + [sf], stdout=subprocess.PIPE, stderr=ef)
+        out, size = [], 0
+        while chunk := p.stdout.read(1 << 20):
+            if size < BIG: out.append(chunk)
+            size += len(chunk)
+        rc = p.wait(timeout=120)
+        ef.seek(0)
+        err = ef.read().decode('utf-8', 'replace').strip()
+    if rc == 0:
+        if size > BIG: return 'big', size
+        return 'ok', [json.loads(l, object_pairs_hook=Pairs) for l in b''.join(out).decode('utf-8').splitlines()]
+    if rc == 1:
         # FILE:LINE:COL: message
         return 'no', err.split(': ', 1)[1] if ': ' in err else err
-    return 'crash', f'exit {r.returncode}: {err}'
+    return 'crash', f'exit {rc}: {err}'
 
 class Pairs(list):
     """A JSON object, its pairs in order"""
@@ -199,10 +215,11 @@ def main():
             with open(os.path.join(seeds, 'schema-' + hashlib.sha1(b).hexdigest()[:16]), 'wb') as f: f.write(b)
     tail = said.strip().splitlines()[-2:]
     print('checker:', '; '.join(tail))
-    seen, n, agree, stored, differ, paths, zero = set(), 0, 0, 0, [], [], 0
+    seen, n, agree, stored, differ, paths, zero, big = set(), 0, 0, 0, [], [], 0, 0
 
     def compare(c, want, got):
-        nonlocal agree
+        nonlocal agree, big
+        if got[0] == 'big' and want[0] == 'ok': agree += 1; big += 1; return
         if got[0] == 'crash' or want[0] != got[0]: differ.append((c, want, got)); return
         if want[0] == 'no':
             agree += 1
@@ -229,7 +246,11 @@ def main():
                 # an application's schema is a stream of its own, read under the limit (section 3)
                 compare(dict(c, how="part 2's counts alone"), checker(ns, c, False),
                         engine(tool, tmp, framed, c['stream'], c['app'], None, c['cut'], c['limit'],
-                               c['limit'] if c['app'] else None, st))
+                               c['limit'] if c['app'] else None, st, keep=True))
+            else:
+                n += 1
+                compare(dict(c, how='references kept'), checker(ns, c, False),
+                        engine(tool, tmp, framed, c['stream'], c['app'], None, c['cut'], store=st, keep=True))
         for c in schemas:
             key = ('schema', c['text'], c['root'], c['limit'])
             if key in seen: continue
@@ -247,11 +268,12 @@ def main():
         if c.get('store') is not None: print('  store', short(c['store'], 300))
         if c['limit'] != ns['LIMIT'] or c['cut']: print('  limit', c['limit'], 'cut', c['cut'], 'as', c['how'])
         print('  checker:', short(want[1] if want[0] == 'no' else want[1], 300), '(refuses)' if want[0] == 'no' else '')
-        print('  engine: ', short(got[1], 300), '(refuses)' if got[0] != 'ok' else '')
+        print('  engine: ', short(str(got[1]), 300), '(refuses)' if got[0] not in ('ok', 'big') else '')
     for c, want, got in paths[:20] if verbose else []:
         print('PATH:', short(c['stream'], 120), '| checker', want[1][:80], '| engine', got[1][:80])
     print(f'{n} cases: {agree} agree, {len(differ)} differ, {stored} streams with a store among them; '
-          f'{zero} with a limit of 0 not run; {len(paths)} refused at different paths')
+          f'{zero} with a limit of 0 not run; {len(paths)} refused at different paths; '
+          f'{big} accepted with more than {BIG >> 20} MB written, the values not compared')
     sys.exit(1 if differ else 0)
 
 if __name__ == '__main__':

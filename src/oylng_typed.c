@@ -97,6 +97,14 @@ typedef struct {
     oylng_parser     *P;
     bool              cut;
     bool              kept;       /* the tree keeps references (section 11) */
+    /* kept: what a line naming each node adds when spread, or UNKNOWN, and
+       each node's spread copy, or NONE, for the tree's first nkept nodes,
+       those read; the copies come after them */
+    uint64_t         *gv;
+    uint32_t         *spread;
+    size_t            nkept;
+    struct gframe { uint32_t node, next; uint64_t acc; } *gf;
+    size_t            capgf;
     uint64_t          limit, typed;
     frame            *f;
     size_t            nf, capf;
@@ -828,15 +836,103 @@ static uint32_t convert(typer *R, const xt *t, uint32_t node, const xt *scope) {
     return scalar_val(R, node, &sc, &a->p[i]);
 }
 
-/* A node's own size, as held counts it (section 11) */
+/* A node's own size, as held counts it (section 11): 1, with a scalar's
+ * bytes or a mapping's keys, and 1 for each <<: or -<< line in it */
 static uint64_t own_size(const oylng_tree *T, uint32_t node) {
     oylng_kind k = oylng_node_kind(T, node);
     if (k == OYLNG_NODE_STRING) return 1 + (uint64_t)oylng_node_text(T, node).len;
-    if (k == OYLNG_NODE_SEQUENCE) return 1;
-    uint64_t n = 1;
+    uint64_t n = 1 + (uint64_t)oylng__node_lines(T, node);
+    if (k == OYLNG_NODE_SEQUENCE) return n;
     size_t c = oylng_node_count(T, node);
     for (size_t i = 0; i < c; i++) n += 1 + (uint64_t)oylng_node_text(T, oylng_node_key(T, node, i)).len;
     return n;
+}
+
+#define UNKNOWN UINT64_MAX
+
+/* Adding, stopping just short of UNKNOWN, so a sum is never taken for one */
+static inline uint64_t gsat(uint64_t a, uint64_t b) {
+    uint64_t s = a + b;
+    return s < a || s == UNKNOWN ? UNKNOWN - 1 : s;
+}
+
+/* Line i of kept node n, from *next on: the node it names, or NONE, and
+ * *next past it */
+static uint32_t next_line(const oylng_tree *T, uint32_t n, uint32_t *next) {
+    if (oylng_node_kind(T, n) == OYLNG_NODE_MAPPING)
+        return *next < oylng_node_merges(T, n) ? oylng_node_target(T, oylng_node_merge(T, n, (*next)++)) : NONE;
+    if (!oylng__node_lines(T, n)) return NONE;
+    for (size_t c = oylng_node_count(T, n); *next < c;) {
+        uint32_t it = oylng_node_item(T, n, (*next)++);
+        if (oylng_node_kind(T, it) == OYLNG_NODE_SPLICE) return oylng_node_target(T, it);
+    }
+    return NONE;
+}
+
+/* What node n gives where it is written: its own keys, as a written key
+ * counts, or its items that aren't lines */
+static uint64_t gives_own(const oylng_tree *T, uint32_t n) {
+    if (oylng_node_kind(T, n) == OYLNG_NODE_SEQUENCE)
+        return oylng_node_count(T, n) - oylng__node_lines(T, n);
+    uint64_t g = 0;
+    for (size_t i = 0, c = oylng_node_count(T, n); i < c; i++)
+        g += 1 + (uint64_t)oylng_node_text(T, oylng_node_key(T, n, i)).len;
+    return g;
+}
+
+/* Section 11: what a line naming node n adds when it is spread, by
+ * addition, with nothing deduplicated: what n gives, and for each line in
+ * it, 1 and what the node it names adds, and so on down. Each node's is
+ * found once; a line names a node read before it, so there's no cycle. */
+static uint64_t gives(typer *R, uint32_t n) {
+    if (R->gv[n] != UNKNOWN) return R->gv[n];
+    size_t nf = 0;
+    ROOM(R, R->gf, R->capgf, 1);
+    R->gf[nf++] = (struct gframe){ n, 0, gives_own(R->T, n) };
+    while (nf) {
+        struct gframe *f = &R->gf[nf - 1];
+        uint32_t t = next_line(R->T, f->node, &f->next);
+        if (t != NONE && R->gv[t] != UNKNOWN) {
+            f->acc = gsat(f->acc, gsat(1, R->gv[t]));
+            continue;
+        }
+        if (t != NONE) {
+            ROOM(R, R->gf, R->capgf, nf + 1);
+            R->gf[nf++] = (struct gframe){ t, 0, gives_own(R->T, t) };
+            continue;
+        }
+        R->gv[f->node] = f->acc;
+        if (--nf) R->gf[nf - 1].acc = gsat(R->gf[nf - 1].acc, gsat(1, f->acc));
+    }
+    return R->gv[n];
+}
+
+/* What spreading kept node n's own lines builds (section 11) */
+static uint64_t spread_size(typer *R, uint32_t n) {
+    if (!R->gv) {
+        R->gv = malloc(R->nkept * sizeof *R->gv);
+        R->spread = malloc(R->nkept * sizeof *R->spread);
+        if (!R->gv || !R->spread) nomem(R);
+        memset(R->gv, 0xFF, R->nkept * sizeof *R->gv);
+        memset(R->spread, 0xFF, R->nkept * sizeof *R->spread);
+    }
+    uint64_t s = 0;
+    uint32_t next = 0;
+    for (uint32_t t; (t = next_line(R->T, n, &next)) != NONE;) s = gsat(s, gives(R, t));
+    return s;
+}
+
+/* Kept node n spread, as a full read gives it: made once, then shared. It
+ * takes no more steps than typed counts for it, its own size and what its
+ * lines give. */
+static uint32_t spread_of(typer *R, uint32_t n) {
+    if (R->spread[n] != NONE) return R->spread[n];
+    oylng_node c;
+    oylng_status st = oylng__tree_spread(R->Y->T, n, gsat(own_size(R->T, n), spread_size(R, n)), &c);
+    if (st == OYLNG_ERR_MEMORY) nomem(R);
+    if (st == OYLNG_ERR_LIMIT) refuse_as(R, st, n, "spreading takes more than typed counts");
+    if (st != OYLNG_OK) refuse_as(R, st, n, "a tree of 4G nodes or children or more");
+    return R->spread[n] = c;
 }
 
 static size_t memo_slot(const typer *R, uint32_t node, const xt *k, const xt *scope) {
@@ -857,20 +953,6 @@ static uint32_t walk(typer *R, uint32_t node, const xt *scope) {
     return open_coll(R, k == OYLNG_NODE_MAPPING ? OYLNG_T_MAPPING : OYLNG_T_SEQUENCE, node, NULL, scope, NULL);
 }
 
-/* In a kept tree, a mapping with <<: lines or a sequence with -<< items,
- * typed or walked by a `!**`: what typing them counts and delivers, the
- * draft doesn't say yet, so for now they are refused, rather than typed
- * without what they name */
-static void kept_spread(typer *R, uint32_t node) {
-    oylng_kind k = oylng_node_kind(R->T, node);
-    if (k == OYLNG_NODE_MAPPING && oylng_node_merges(R->T, node))
-        refuse_as(R, OYLNG_ERR_INPUT, node, "typing a mapping with its <<: lines kept isn't supported yet");
-    if (k == OYLNG_NODE_SEQUENCE)
-        for (size_t i = 0, n = oylng_node_count(R->T, node); i < n; i++)
-            if (oylng_node_kind(R->T, oylng_node_item(R->T, node, i)) == OYLNG_NODE_SPLICE)
-                refuse_as(R, OYLNG_ERR_INPUT, node, "typing a sequence with its -<< items kept isn't supported yet");
-}
-
 /* The value at node typed with t, or walked if t is NULL: once for each
  * type and nearest `!**`, if node is shared */
 static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope, bool opt);
@@ -885,14 +967,17 @@ static uint32_t conv(typer *R, const xt *t, uint32_t node, const xt *scope) {
             if (R->memo[i].node == node && R->memo[i].k == k && R->memo[i].scope == scope) return R->memo[i].val;
         }
     }
-    /* under !any nothing is typed (section 10), so the value is the node as
-       kept, as an untyped document's is; a union with !any among its
-       alternatives tries the others first, which need the merged keys */
-    if (R->kept && !(k->kind == X_STD && k->std == STD_ANY)) kept_spread(R, node);
-    R->typed += own_size(R->T, node);
+    /* kept, a type spreads the node's <<: and -<< lines, counting what that
+       builds before building it (section 11). !any alone types nothing, so
+       it spreads nothing, and the value is the node as kept; a union with
+       !any among its alternatives spreads, as it tries the others first. */
+    bool spreads = R->kept && node < R->nkept && !(k->kind == X_STD && k->std == STD_ANY) &&
+                   oylng__node_lines(R->T, node);
+    R->typed = gsat(R->typed, gsat(own_size(R->T, node), spreads ? spread_size(R, node) : 0));
     if (R->typed > R->limit)
         refuse_as(R, OYLNG_ERR_LIMIT, node, "typed passes the size limit of %llu", (unsigned long long)R->limit);
-    uint32_t v = t ? convert(R, t, node, scope) : walk(R, node, scope);
+    uint32_t tn = spreads ? spread_of(R, node) : node;
+    uint32_t v = t ? convert(R, t, tn, scope) : walk(R, tn, scope);
     if (R->E) {   /* a collection the emitter was given: its name, if it was an object's */
         const char *why = R->E->fits(R->E->ctx, node, R->Y, v);
         if (why) refuse_as(R, OYLNG_ERR_EMIT, node, "%s", why);
@@ -1384,6 +1469,9 @@ static void typer_free(typer *R) {
     free(R->bt);
     free(R->bfl);
     free(R->memo);
+    free(R->gv);
+    free(R->spread);
+    free(R->gf);
     pmap_free(&R->nms);
     pmap_free(&R->ofs);
     pmap_free(&R->pk);
@@ -1415,7 +1503,7 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
     /* with references kept, the limit is on held, which the parser keeps,
        and on typed (section 11) */
     typer R = { .Y = Y, .S = c.S, .T = T, .P = P, .cut = oylng__parser_cut(P), .kept = oylng__parser_keep(P),
-                .limit = oylng__parser_counts_limit(P) };
+                .nkept = oylng__parser_keep(P) ? oylng_tree_nodes(T) : 0, .limit = oylng__parser_counts_limit(P) };
     bool ok;
     if (!c.root) {
         ok = !setjmp(R.jb);

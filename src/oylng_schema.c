@@ -425,27 +425,13 @@ static void kid(void *ctx, uint32_t i) {
 }
 
 /* The children of the table's collection node, references followed and
- * merges applied, into k: its v the caller frees. With references kept,
- * the table gives a <<: line or a -<< as written; compiling such a type
- * would expand it, which the draft says checks full first (part 1,
- * section 10), and how isn't settled, so for now it is refused, rather
- * than compiled without what the line names. */
+ * merges applied, into k: its v the caller frees. With references kept
+ * too, a type is compiled from its merged form, as a full read gives it
+ * (part 2, section 11): hold_entries has held what it reaches to full. */
 static void children(sctx *S, uint32_t node, kids *k) {
     *k = (kids){ S, NULL, 0, 0, false };
-    bool ok = oylng__table_children(S->P, node, kid, k);
+    bool ok = oylng__table_spread(S->P, node, kid, k);
     if (!ok || k->oom) { free(k->v); nomem(S); }
-    for (uint32_t j = 0; j < k->n; j++) {
-        oylng__tnode tn;
-        oylng__table_node(S->P, k->v[j], &tn);
-        if (tn.kind == OYLNG__T_MERGE || tn.kind == OYLNG__T_SPLICE) {
-            free(k->v);
-            snprintf(S->msg, sizeof S->msg, "compiling a type with its %s kept isn't supported yet",
-                     tn.kind == OYLNG__T_MERGE ? "<<: lines" : "-<< items");
-            S->st = OYLNG_ERR_INPUT;
-            S->errpos = tn.pos;
-            longjmp(S->jb, 1);
-        }
-    }
 }
 
 /* The same, in the arena */
@@ -1016,6 +1002,58 @@ static void check_deep(sctx *S, const xt *d) {
 
 /* ── Roots ───────────────────────────────────────────────── */
 
+/* Section 11: with references kept, the entries a schema reaches are held
+ * to their full size together, each entry's key and value once, before
+ * each is compiled from its merged form, which then builds no more than
+ * that. The walk goes where go_through will, filling what it meets. */
+static void hold_entries(sctx *S, xt *root) {
+    uint32_t gen = ++S->gen;
+    uint64_t total = 0;
+    S->nstk = 0;
+    push(S, root);
+    while (S->nstk) {
+        xt *t = S->stk[--S->nstk];
+        if (t->mark == gen) continue;
+        t->mark = gen;
+        switch (t->kind) {
+        case X_NAME: {
+            centry *e = t->u.name;
+            if (e->mark != gen) {
+                e->mark = gen;
+                total = sat(total, oylng__table_entry_full(S->P, e->pentry));
+                if (total > S->limit)
+                    bad(S, t->pos, "the entries this schema reaches come to %llu in full, past the size limit of %llu",
+                        (unsigned long long)total, (unsigned long long)S->limit);
+            }
+            if (!e->top) e->top = compile_node(S, e->node);
+            push(S, e->top);
+            break;
+        }
+        case X_ALT:
+            fill(S, t);
+            for (uint32_t i = 0; i < t->u.alt.n; i++) push(S, t->u.alt.v[i]);
+            break;
+        case X_SEQ:
+            fill(S, t);
+            for (uint32_t i = 0; i < t->u.seq.n; i++) push(S, t->u.seq.items[i]);
+            if (t->u.seq.rest) push(S, t->u.seq.rest);
+            break;
+        case X_MAP:
+            fill(S, t);
+            for (uint32_t i = 0; i < t->u.map.nf; i++) push(S, t->u.map.f[i].type);
+            for (uint32_t i = 0; i < t->u.map.nrows; i++) {
+                push(S, t->u.map.rows[i].key);
+                push(S, t->u.map.rows[i].val);
+            }
+            if (t->u.map.other) push(S, t->u.map.other);
+            if (t->u.map.deep) push(S, t->u.map.deep);
+            break;
+        default:
+            break;
+        }
+    }
+}
+
 static void compile_root(sctx *S, centry *e) {
     if (!e->root) {
         e->root = new_xt(S, X_NAME, 0);
@@ -1030,6 +1068,7 @@ static void compile_root(sctx *S, centry *e) {
         root->flags |= XF_TYPES;
         fresh_add(S, &S->fresh_types, &S->nfresh_types, &S->capfresh_types, root);
     }
+    if (oylng__parser_keep(S->P)) hold_entries(S, root);
     go_through(S, root);
     for (uint32_t i = 0; i < S->nfresh_entries; i++) check_names(S, S->fresh_entries[i]);
     for (uint32_t i = 0; i < S->nfresh; i++) S->full_all = sat(S->full_all, full_of(S->fresh[i]));

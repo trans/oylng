@@ -6,11 +6,16 @@
   now types a document read with `oylng_parser_set_keep`, where it was
   `OYLNG_ERR_INPUT`. The limit applies to held, and to typed, which counts
   a shared node once for each type and nearest `!**` it is typed under.
-  A kept mapping's `<<:` lines and a kept sequence's `-<<` items, in the
-  data or in a type of the stream's own schema, are refused for now with
-  `OYLNG_ERR_INPUT`, as the draft doesn't yet say how typing counts and
-  delivers them. Under `!any`, where nothing is typed, they are delivered
-  as kept. Part 2's 24 `keep` tests now run, and pass.
+  Typing spreads a kept mapping's `<<:` lines and a kept sequence's `-<<`
+  items (yaml2 `a2c46f4`): the typed value is what a full read gives, and
+  typed counts what spreading builds before building it, with nothing
+  taken off for a key given twice. Under `!any` alone nothing spreads, and
+  the value is delivered as kept. A type of the stream's own schema written
+  with `<<:` or `-<<` is compiled from its merged form, the entries a
+  document's type reaches held to the limit together for their full size
+  first. Against the suite at yaml2's `v0.2.0` (`a2c46f4`), part 2's 43
+  tests read with references kept now run, and pass. `oylng --typed
+  --keep`, for tests, types with references kept.
 - **A type key takes a scalar type** (part 2, section 7, yaml2 `bd5f8ed`):
   since a key is always a scalar, a schema is refused as it is read
   (`OYLNG_ERR_SCHEMA`) where a type key's type, or one of its union's

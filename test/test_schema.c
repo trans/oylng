@@ -1671,48 +1671,166 @@ static void kept_typing(void) {
     free(t3);
     free(big);
 
-    /* a mapping with its <<: lines kept, or a sequence with its -<< items,
-       is refused for now, rather than typed without what they name; read
-       in full, each is typed as section 9.1 has it */
-    const char *mg = "%YAML 2.0\n--- &\na: {k: v}\nm: {k: !str, j: !int}\n--- !m\n<<: *a\nj: 1\n";
-    y = kept_typed(&p, mg, 0, &st, err, sizeof err);
-    CHECK(st == OYLNG_ERR_INPUT && !y && strstr(err, "typing a mapping with its <<: lines kept isn't supported yet"),
-          "<<: kept, typed: %s", err);
-    oylng_parser_free(p);
-    const char *e2 = NULL;
-    y = typed(&p, mg, NULL, &e2);
-    CHECK(y && oylng_value_text(y, oylng_value_get(y, oylng_typed_root(y), S("k"))).len == 1, "in full: k is v");
+    /* typing spreads a kept mapping's <<: lines and a sequence's -<< items,
+       and the typed value is what a full read gives (section 11), whether
+       the lines are in the data, behind a reference, or in a type */
+    static const char *const alike[] = {
+        "%YAML 2.0\n--- &\na: {k: v}\nm: {k: !str, j: !int}\n--- !m\n<<: *a\nj: 1\n",
+        "%YAML 2.0\n--- &\ns: [x]\nl: [!str, ...]\n--- !l\n-<< *s\n- y\n",
+        "%YAML 2.0\n--- &\na: {k: v}\nb: {<<: *a}\nm: {k: !str}\n--- !m\n*b\n",
+        "%YAML 2.0\n--- &\nbase: {x: !int}\njob: {<<: *base, y: !int}\n--- !job\nx: 1\ny: 2\n",
+        "%YAML 2.0\n--- &\nhead: [!int]\nrow: [-<< *head, !str]\n--- !row\n[1, a]\n",
+        /* the order section 9.1 builds: x and y from the first line; the
+           second's y in y's place and z at the end; then p at the end, and
+           x in x's place: {x: 6, y: 3, z: 4, p: 5} */
+        "%YAML 2.0\n--- &\na: {x: 1, y: 2}\nb: {y: 3, z: 4}\nc: {<<: *a, <<: *b, p: 5, x: 6}\nm: {!*: !int}\n--- !m\n*c\n",
+        "%YAML 2.0\n--- &\ne: []\nf: [-<< *e, 1, -<< *e]\ng: [-<< *f, -<< *f, 2]\nm: [!int, ...]\n--- !m\n*g\n",
+        "%YAML 2.0\n--- &\na: {k: v}\nm: {k: {!|: [{j: !int}, !any]}}\n--- !m\nk: {<<: *a}\n",
+        "%YAML 2.0\n--- &\nb: {x: 1}\nm: {!**: !int}\n--- !m\nq: {<<: *b, y: 2}\n",
+        /* in a type, a written key replaces a merged one in its place: the
+           type key !str takes a bool, not an int */
+        "%YAML 2.0\n--- &\nbase: {!str: !int}\nm: {<<: *base, !str: !bool}\n--- !m\na: true\n",
+        /* and its key too: why? written is an optional key, why, where
+           "why?" merged is the key why?; as merged keys are kept, so is a
+           line's key from a line before it */
+        "%YAML 2.0\n--- &\nbase: {\"why?\": !int}\nt: {<<: *base, why?: !str, !*: !int}\n--- !t\n{}\n",
+        "%YAML 2.0\n--- &\nbase: {\"why?\": !int}\nt: {<<: *base, why?: !str, !*: !int}\n--- !t\nwhy: a\n",
+        "%YAML 2.0\n--- &\na: {\"why?\": !int}\nb: {why?: !str}\nt: {<<: *a, <<: *b}\n--- !t\nwhy?: 5\n",
+        "%YAML 2.0\n--- &\na: {\"why?\": !int}\nb: {<<: *a, why?: !str}\nt: {<<: *b}\n--- !t\n{}\n",
+        "%YAML 2.0\n--- &\na: {why?: !int}\nb: {<<: *a}\nt: {<<: *b, \"why?\": !str}\n--- !t\nwhy?: x\n",
+        /* a value is the last line's to have it, where a line names a
+           mapping met before: x 1 in c, 2 in d; and in a type, !str */
+        "%YAML 2.0\n--- &\na: {x: 1, y: 0}\nb: {z: 4, x: 2}\nc: {<<: *a, <<: *b, <<: *a}\nm: {!*: !int}\n--- !m\n*c\n",
+        "%YAML 2.0\n--- &\na: {x: 1, y: 0}\nb: {z: 4, x: 2}\nc: {<<: *a, <<: *b, <<: *a}\nd: {<<: *c, <<: *b, q: 3}\n"
+        "m: {!*: !int}\n--- !m\n*d\n",
+        "%YAML 2.0\n--- &\na: {x: !int}\nb: {x: !str}\nt: {<<: *a, <<: *b}\n--- !t\nx: abc\n",
+        "%YAML 2.0\n--- &\na: {x: !int}\nb: {x: !str}\nc: {<<: *b, <<: *a}\nt: {<<: *a, <<: *c}\n--- !t\nx: 5\n",
+    };
+    for (size_t i = 0; i < sizeof alike / sizeof *alike; i++) {
+        const char *e1 = NULL;
+        oylng_parser *q;
+        oylng_typed *full = typed(&q, alike[i], NULL, &e1);
+        y = kept_typed(&p, alike[i], 0, &st, err, sizeof err);
+        CHECK(full && y && same_typed(full, oylng_typed_root(full), y, oylng_typed_root(y)),
+              "kept and full alike %zu: %s %s", i, e1 ? e1 : "", err);
+        oylng_typed_free(full);
+        oylng_parser_free(q);
+        oylng_typed_free(y);
+        oylng_parser_free(p);
+    }
+    /* in data too a written key replaces a merged one, node and all: a
+       refusal at it is marked where it is written */
+    {
+        const char *km = "%YAML 2.0\n--- &\nb: {\"x\": 1}\nm: {!bool: !str}\n--- !m\n<<: *b\n\nx: a\n";
+        const char *e1 = NULL;
+        oylng_parser *q;
+        oylng_typed *full = typed(&q, km, NULL, &e1);
+        y = kept_typed(&p, km, 0, &st, err, sizeof err);
+        oylng_mark a = oylng_parser_error_mark(q), b = oylng_parser_error_mark(p);
+        CHECK(!full && !y && a.line == 8 && b.line == 8 && a.col == b.col, "a written key's mark: %zu:%zu, %zu:%zu",
+              a.line, a.col, b.line, b.col);
+        oylng_parser_free(q);
+        oylng_parser_free(p);
+        /* and given by two lines, the key is the first's, the value the last's */
+        const char *k2 = "%YAML 2.0\n--- &\na: {\"x\": 1}\nb: {x: 2}\nm: {!bool: !str}\n--- !m\n<<: *a\n<<: *b\n";
+        full = typed(&q, k2, NULL, &e1);
+        y = kept_typed(&p, k2, 0, &st, err, sizeof err);
+        a = oylng_parser_error_mark(q), b = oylng_parser_error_mark(p);
+        CHECK(!full && !y && a.line == 3 && b.line == 3 && a.col == b.col, "two lines' key's mark: %zu:%zu, %zu:%zu",
+              a.line, a.col, b.line, b.col);
+        oylng_parser_free(q);
+        oylng_parser_free(p);
+    }
+    /* a type merging a chain of 2^63 - 2 lines, each to {}: within full,
+       as {} gives nothing, and merged a mapping at a time, as the full
+       read merges it, not a line at a time */
+    {
+        char *c62 = malloc(4096);
+        size_t o = (size_t)sprintf(c62, "%%YAML 2.0\n--- &\ne0: {}\n");
+        for (int i = 1; i <= 62; i++) o += (size_t)sprintf(c62 + o, "e%d: {<<: *e%d, <<: *e%d}\n", i, i - 1, i - 1);
+        sprintf(c62 + o, "t: {<<: *e62, !*: !int}\n--- !t\na: 1\n");
+        y = kept_typed(&p, c62, 0, &st, err, sizeof err);
+        int64_t a1 = 0;
+        CHECK(st == OYLNG_OK && y &&
+                  oylng_value_int(y, oylng_value_get(y, oylng_typed_root(y), S("a")), &a1) && a1 == 1,
+              "a type merging 2^63 - 2 lines: %s", err);
+        oylng_typed_free(y);
+        oylng_parser_free(p);
+        free(c62);
+    }
+    /* the order, as written */
+    y = kept_typed(&p, alike[5], 0, &st, err, sizeof err);
+    {
+        oylng_value r = y ? oylng_typed_root(y) : OYLNG_NO_VALUE;
+        int64_t x = 0, p3 = 0;
+        CHECK(y && oylng_value_count(y, r) == 4 && eq(oylng_value_key(y, r, 0), "x", 1) &&
+                  eq(oylng_value_key(y, r, 2), "z", 1) && eq(oylng_value_key(y, r, 3), "p", 1) &&
+                  oylng_value_int(y, oylng_value_at(y, r, 0), &x) && x == 6 &&
+                  oylng_value_int(y, oylng_value_at(y, r, 1), &p3) && p3 == 3,
+              "section 9.1's order: %s", err);
+    }
     oylng_typed_free(y);
     oylng_parser_free(p);
-    const char *sp = "%YAML 2.0\n--- &\ns: [x]\nl: [!str, ...]\n--- !l\n-<< *s\n- y\n";
-    y = kept_typed(&p, sp, 0, &st, err, sizeof err);
-    CHECK(st == OYLNG_ERR_INPUT && !y && strstr(err, "typing a sequence with its -<< items kept isn't supported yet"),
-          "-<< kept, typed: %s", err);
+    /* the typed count's exact sums are part 2's suite's: 9JL8 and 3RKM,
+       FAC6 and 9WDZ, GF98 and CNZ5 */
+    /* lines count, though a line naming {} gives no key: 2^31 - 2 lines
+       past the default limit, refused before anything is built; under
+       !any alone, nothing spreads */
+    char chain[2400];
+    size_t co = (size_t)sprintf(chain, "%%YAML 2.0\n--- &\ne0: {}\n");
+    for (int i = 1; i <= 30; i++) co += (size_t)sprintf(chain + co, "e%d: {<<: *e%d, <<: *e%d}\n", i, i - 1, i - 1);
+    sprintf(chain + co, "m: {!*: !int}\nn: {x: !any}\n--- !m\n<<: *e30\n--- !n\nx: {<<: *e30}\n");
+    y = kept_typed(&p, chain, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_LIMIT && !y && strstr(err, "typed passes the size limit"), "2^31 - 2 lines: %s", err);
     oylng_parser_free(p);
-    const char *rm = "%YAML 2.0\n--- &\na: {k: v}\nb: {<<: *a}\nm: {k: !str}\n--- !m\n*b\n";
-    y = kept_typed(&p, rm, 0, &st, err, sizeof err);
-    CHECK(st == OYLNG_ERR_INPUT && !y, "a reference to a mapping with <<: lines too: %s", err);
-    oylng_parser_free(p);
-    /* a type with a <<: line or a -<< item: compiling it is refused for now
-       too, as the stream's own schema; read in full, it compiles */
-    const char *tm = "%YAML 2.0\n--- &\nbase: {x: !int}\njob: {<<: *base, y: !int}\n--- !job\nx: 1\ny: 2\n";
-    y = kept_typed(&p, tm, 0, &st, err, sizeof err);
-    CHECK(st == OYLNG_ERR_INPUT && !y && strstr(err, "compiling a type with its <<: lines kept isn't supported yet"),
-          "a type's <<: kept: %s", err);
-    oylng_parser_free(p);
-    y = typed(&p, tm, NULL, &e2);
-    CHECK(y && oylng_value_type(y, oylng_value_get(y, oylng_typed_root(y), S("x"))) == OYLNG_T_INT, "in full, x is an int");
+    {
+        const char *nn = strstr(chain, "--- !m\n");
+        char alone[2400];
+        size_t ho = (size_t)(nn - chain);
+        memcpy(alone, chain, ho);
+        strcpy(alone + ho, "--- !n\nx: {<<: *e30}\n");
+        y = kept_typed(&p, alone, 0, &st, err, sizeof err);
+        oylng_value xv = y ? oylng_value_get(y, oylng_typed_root(y), S("x")) : OYLNG_NO_VALUE;
+        CHECK(st == OYLNG_OK && y && oylng_value_type(y, xv) == OYLNG_T_ANY &&
+                  oylng_node_merges(oylng_typed_tree(y), oylng_value_node(y, xv)) == 1,
+              "under !any alone, kept: %s", err);
+        oylng_typed_free(y);
+        oylng_parser_free(p);
+        const char *e1 = NULL;
+        y = typed(&p, chain, NULL, &e1);
+        CHECK(y, "read in full, accepted: %s", e1 ? e1 : "");
+        oylng_typed_free(y);
+        oylng_parser_free(p);
+    }
+    /* the entries a schema reaches are held to their full size together,
+       before they are compiled: big names s 20 times, so its full is some
+       2,000, where held is some 150 */
+    char hold[600];
+    size_t ho = (size_t)sprintf(hold, "%%YAML 2.0\n--- &\ns: ");
+    for (int i = 0; i < 100; i++) hold[ho++] = 'a' + i % 26;
+    ho += (size_t)sprintf(hold + ho, "\nbig: [");
+    for (int i = 0; i < 20; i++) ho += (size_t)sprintf(hold + ho, "%s*s", i ? ", " : "");
+    ho += (size_t)sprintf(hold + ho, "]\nm: {a: !big}\nm2: {a: !int}\n");
+    char *h1 = malloc(ho + 40), *h2 = malloc(ho + 40);
+    sprintf(h1, "%s--- !m2\na: 1\n", hold);
+    sprintf(h2, "%s--- !m\na: *big\n", hold);
+    y = kept_typed(&p, h1, 2000, &st, err, sizeof err);
+    CHECK(st == OYLNG_OK && y, "an entry no type reaches isn't held: %s", err);
     oylng_typed_free(y);
     oylng_parser_free(p);
-    const char *ts = "%YAML 2.0\n--- &\nhead: [!int]\nrow: [-<< *head, !str]\n--- !row\n[1, a]\n";
-    y = kept_typed(&p, ts, 0, &st, err, sizeof err);
-    CHECK(st == OYLNG_ERR_INPUT && !y && strstr(err, "compiling a type with its -<< items kept isn't supported yet"),
-          "a type's -<< kept: %s", err);
+    y = kept_typed(&p, h2, 2000, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_SCHEMA && !y && strstr(err, "the entries this schema reaches come to"),
+          "the entries reached, past the limit: %s", err);
     oylng_parser_free(p);
+    y = kept_typed(&p, h2, 2100, &st, err, sizeof err);
+    CHECK(st == OYLNG_OK && y, "within it, typed: %s", err);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    free(h1);
+    free(h2);
     /* a type is compiled only where a document reaches it, so an entry
-       with <<: no type names leaves typing be; under !any nothing is
-       typed, so a <<: there is delivered as kept, as in an untyped
-       document; a union trying !any last needs the merged keys first */
+       with <<: no type names costs nothing; under !any nothing is typed,
+       so a <<: there is delivered as kept, as in an untyped document */
     const char *nr = "%YAML 2.0\n--- &\na: {k: v}\nb: {<<: *a}\nm: {k: !str}\n--- !m\nk: x\n";
     y = kept_typed(&p, nr, 0, &st, err, sizeof err);
     CHECK(st == OYLNG_OK && y, "an entry with <<: not reached: %s", err);
@@ -1725,10 +1843,6 @@ static void kept_typing(void) {
               oylng_node_merges(oylng_typed_tree(y), oylng_value_node(y, kv)) == 1,
           "<<: under !any, as kept: %s", err);
     oylng_typed_free(y);
-    oylng_parser_free(p);
-    const char *uu = "%YAML 2.0\n--- &\na: {k: v}\nm: {k: {!|: [{j: !int}, !any]}}\n--- !m\nk: {<<: *a}\n";
-    y = kept_typed(&p, uu, 0, &st, err, sizeof err);
-    CHECK(st == OYLNG_ERR_INPUT && !y && !strncmp(err, "/k: typing a mapping", 20), "<<: under a union with !any: %s", err);
     oylng_parser_free(p);
     const char *un = "%YAML 2.0\n--- &\na: {k: v}\n---\n<<: *a\nj: 1\n";
     y = kept_typed(&p, un, 0, &st, err, sizeof err);

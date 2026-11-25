@@ -32,6 +32,7 @@
 #define F_PLAIN  2u      /* a string written plain, or an empty value */
 #define F_TABLE  4u      /* copied from the table, so it may be shared */
 #define F_MERGES 8u      /* a kept tree's mapping with <<: lines, before its pairs */
+#define F_SPLICES 16u    /* a kept tree's sequence with -<< items */
 
 typedef struct {
     uint32_t a;          /* STR: where its text starts. SEQ, MAP: where its kids start.
@@ -184,6 +185,9 @@ static void close_coll(builder *B, oylng_node id, size_t s0) {
         return;
     }
     size_t pairs = map ? nkids / 2 : nkids;
+    if (T->kept && !map)
+        for (size_t i = s0; i < B->ns; i++)
+            if (T->nodes[B->stk[i]].kind == OYLNG_NODE_SPLICE) { T->nodes[id].flags |= F_SPLICES; break; }
     size_t room = nkids + (map && pairs > SMALL ? index_cap(pairs) : 0);
     if (room > UINT32_MAX - T->nk) { oops(B, OYLNG_ERR_LIMIT, "a tree of 4G children or more"); return; }
     tnode *nd = &T->nodes[id];
@@ -532,6 +536,204 @@ uint32_t oylng__node_find(const oylng_tree *T, oylng_node map, oylng_str key) {
 oylng_node oylng_node_get(const oylng_tree *T, oylng_node map, oylng_str key) {
     uint32_t i = oylng__node_find(T, map, key);
     return i == UINT32_MAX ? OYLNG_NO_NODE : T->kids[T->nodes[map].a + 2 * (size_t)i + 1];
+}
+
+size_t oylng__node_lines(const oylng_tree *T, oylng_node n) {
+    const tnode *nd = get(T, n);
+    if (!nd) return 0;
+    if (nd->kind == OYLNG_NODE_MAPPING) return oylng_node_merges(T, n);
+    if (nd->kind != OYLNG_NODE_SEQUENCE || !(nd->flags & F_SPLICES)) return 0;
+    size_t c = 0;
+    for (uint32_t i = 0; i < nd->n; i++) c += T->nodes[T->kids[nd->a + i]].kind == OYLNG_NODE_SPLICE;
+    return c;
+}
+
+/* A step of spreading from the budget: past it, refused */
+#define STEP(B, budget) (*(budget) ? (--*(budget), true) : (oops((B), OYLNG_ERR_LIMIT, "spreading passes its budget"), false))
+
+/* What spreading walks: a mapping or a sequence, and its next line or
+ * item */
+struct sframe { oylng_node n; uint32_t next; };
+
+/* Whether set s, of nodes plus 1, has n; with add, adding it */
+static bool seen_add(builder *B, uint32_t **s, size_t *cap, size_t *count, oylng_node n, bool add) {
+    if (add && 2 * (*count + 1) > *cap) {
+        size_t nc = *cap ? *cap * 2 : 16;
+        uint32_t *nw = calloc(nc, sizeof *nw);
+        if (!nw) { oops(B, OYLNG_ERR_MEMORY, "out of memory"); return false; }
+        for (size_t j = 0; j < *cap; j++)
+            if ((*s)[j]) {
+                size_t h = (((*s)[j] - 1) * 0x9E3779B1u) & (nc - 1);
+                while (nw[h]) h = (h + 1) & (nc - 1);
+                nw[h] = (*s)[j];
+            }
+        free(*s);
+        *s = nw;
+        *cap = nc;
+    }
+    if (!*cap) return false;
+    size_t h = (n * 0x9E3779B1u) & (*cap - 1);
+    while ((*s)[h] && (*s)[h] != n + 1) h = (h + 1) & (*cap - 1);
+    if ((*s)[h]) return true;
+    if (add) {
+        (*s)[h] = n + 1;
+        ++*count;
+    }
+    return false;
+}
+
+/* The pairs of kept mapping m as a full read builds them (part 1, section
+ * 9.1), onto the stack, in time linear in the mappings its lines reach:
+ * - their order: each line's, the first first, the mapping it names built
+ *   the same way, then m's own, each added where it isn't yet: a walk
+ *   forward that adds a mapping's keys once its lines are done;
+ * - a key's node: m's own, else the first line's to have the key, the same
+ *   way down, as a full read's written key replaces a merged one: the
+ *   first found walking forward, own keys before lines;
+ * - a value: m's own, else the last line's to have it: the first found
+ *   walking own keys first, then the lines from the last, as a lookup does.
+ * Each walk visits a mapping once, as a second visit finds no key not
+ * already there. Each line followed and each key looked at takes a step
+ * from the budget, in each walk. */
+static void spread_pairs(builder *B, oylng_node m, struct sframe **fs, size_t *capf, uint64_t budget) {
+    oylng_tree *T = B->T;
+    if (!T->keyed) {
+        oylng_hash_key_new(&T->key);
+        T->keyed = true;
+    }
+    struct kslot { oylng_node key, val; } *sl = NULL;
+    uint32_t *ix = NULL, *order = NULL, *seen = NULL;   /* ix: a slot's number plus 1 */
+    size_t cap = 0, ns = 0, capsl = 0, no = 0, capo = 0, capseen = 0, nseen = 0;
+    const oylng_node UNSET = OYLNG_NO_NODE, PLACED = OYLNG_NO_NODE - 1;
+    for (int pass = 0; pass < 2 && B->st == OYLNG_OK; pass++) {
+        /* pass 0 walks forward, giving the order and the key nodes; pass 1
+           walks the lines from the last, giving the values */
+        uint64_t steps = budget;
+        if (seen) memset(seen, 0, capseen * sizeof *seen);
+        nseen = 0;
+        size_t nf = 0;
+        if (!ROOM(B, *fs, *capf, 1)) break;
+        (*fs)[nf++] = (struct sframe){ m, UINT32_MAX };
+        while (nf && B->st == OYLNG_OK) {
+            struct sframe *f = &(*fs)[nf - 1];
+            oylng_node x = f->n;
+            const tnode *nd = &T->nodes[x];
+            uint32_t lines = (uint32_t)oylng_node_merges(T, x);
+            if (f->next == UINT32_MAX) {   /* come to x: marked seen, its own keys looked at */
+                seen_add(B, &seen, &capseen, &nseen, x, true);
+                for (uint32_t i = 0; i < nd->n && B->st == OYLNG_OK; i++) {
+                    oylng_node k = T->kids[nd->a + 2 * i];
+                    oylng_str ks = text_of(T, &T->nodes[k]);
+                    if (!STEP(B, &steps)) break;
+                    if (2 * (ns + 1) > cap) {   /* a bigger index, the slots hashed again */
+                        size_t nc = cap ? cap * 2 : 16;
+                        uint32_t *ni = calloc(nc, sizeof *ni);
+                        if (!ni) { oops(B, OYLNG_ERR_MEMORY, "out of memory"); break; }
+                        for (size_t j = 0; j < ns; j++) {
+                            size_t h = (size_t)key_hash(T, text_of(T, &T->nodes[sl[j].key])) & (nc - 1);
+                            while (ni[h]) h = (h + 1) & (nc - 1);
+                            ni[h] = (uint32_t)j + 1;
+                        }
+                        free(ix);
+                        ix = ni;
+                        cap = nc;
+                    }
+                    size_t h = (size_t)key_hash(T, ks) & (cap - 1);
+                    while (ix[h] && !same(text_of(T, &T->nodes[sl[ix[h] - 1].key]), ks)) h = (h + 1) & (cap - 1);
+                    if (pass == 0 && !ix[h]) {
+                        if (!ROOM(B, sl, capsl, ns + 1)) break;
+                        sl[ns] = (struct kslot){ k, UNSET };
+                        ix[h] = (uint32_t)++ns;
+                    } else if (pass == 1 && ix[h] && sl[ix[h] - 1].val == UNSET)
+                        sl[ix[h] - 1].val = T->kids[nd->a + 2 * i + 1];
+                }
+                f->next = pass == 0 ? 0 : lines;
+                continue;
+            }
+            if (pass == 0 ? f->next < lines : f->next > 0) {
+                uint32_t i = pass == 0 ? f->next++ : --f->next;
+                oylng_node t = T->nodes[oylng_node_merge(T, x, i)].a;
+                if (!STEP(B, &steps)) break;
+                if (seen_add(B, &seen, &capseen, &nseen, t, false)) continue;
+                if (!ROOM(B, *fs, *capf, nf + 1)) break;
+                (*fs)[nf++] = (struct sframe){ t, UINT32_MAX };
+                continue;
+            }
+            nf--;
+            if (pass == 0)   /* x's lines done: its keys not yet placed, at the end */
+                for (uint32_t i = 0; i < nd->n; i++) {
+                    oylng_str ks = text_of(T, &T->nodes[T->kids[nd->a + 2 * i]]);
+                    size_t h = (size_t)key_hash(T, ks) & (cap - 1);
+                    while (!same(text_of(T, &T->nodes[sl[ix[h] - 1].key]), ks)) h = (h + 1) & (cap - 1);
+                    struct kslot *e = &sl[ix[h] - 1];
+                    if (e->val == UNSET) {
+                        if (!ROOM(B, order, capo, no + 1)) break;
+                        order[no++] = ix[h] - 1;
+                        e->val = PLACED;
+                    }
+                }
+        }
+        if (pass == 0)
+            for (size_t j = 0; j < ns; j++) sl[j].val = UNSET;
+    }
+    for (size_t j = 0; j < no && B->st == OYLNG_OK; j++) {
+        if (!ROOM(B, B->stk, B->caps, B->ns + 2)) break;
+        B->stk[B->ns++] = sl[order[j]].key;
+        B->stk[B->ns++] = sl[order[j]].val;
+    }
+    free(sl);
+    free(ix);
+    free(order);
+    free(seen);
+}
+
+/* The items of kept sequence s, onto the stack, each -<< replaced by the
+ * items of the sequence it names, spread the same way; each item and
+ * each -<< taking a step from the budget */
+static void spread_items(builder *B, oylng_node s, struct sframe **fs, size_t *capf, uint64_t budget) {
+    oylng_tree *T = B->T;
+    size_t nf = 0;
+    if (!ROOM(B, *fs, *capf, 1)) return;
+    (*fs)[nf++] = (struct sframe){ s, 0 };
+    while (nf && B->st == OYLNG_OK) {
+        struct sframe *f = &(*fs)[nf - 1];
+        const tnode *nd = &T->nodes[f->n];
+        if (f->next >= nd->n) { nf--; continue; }
+        oylng_node it = T->kids[nd->a + f->next++];
+        if (!STEP(B, &budget)) break;
+        if (T->nodes[it].kind == OYLNG_NODE_SPLICE) {
+            oylng_node t = T->nodes[it].a;
+            if (!ROOM(B, *fs, *capf, nf + 1)) break;
+            (*fs)[nf++] = (struct sframe){ t, 0 };
+        } else push_child(B, it);
+    }
+}
+
+oylng_status oylng__tree_spread(oylng_tree *T, oylng_node n, uint64_t budget, oylng_node *out) {
+    *out = OYLNG_NO_NODE;
+    const tnode *nd = get(T, n);
+    if (!nd || (nd->kind != OYLNG_NODE_MAPPING && nd->kind != OYLNG_NODE_SEQUENCE)) return OYLNG_ERR_INPUT;
+    builder B = { .T = T, .st = OYLNG_OK };
+    struct sframe *fs = NULL;
+    size_t capf = 0;
+    uint8_t kind = nd->kind, flags = nd->flags & F_TABLE;
+    oylng_node id = new_node(&B, kind, nd->pos);
+    if (id != OYLNG_NO_NODE) {
+        if (kind == OYLNG_NODE_MAPPING) spread_pairs(&B, n, &fs, &capf, budget);
+        else spread_items(&B, n, &fs, &capf, budget);
+    }
+    free(fs);
+    if (B.st == OYLNG_OK) {
+        bool kept = T->kept;
+        T->kept = false;   /* closed as a full read's: no lines among its children */
+        close_coll(&B, id, 0);
+        T->kept = kept;
+    }
+    free(B.stk);
+    if (B.st != OYLNG_OK) return B.st;
+    T->nodes[id].flags = flags;
+    *out = id;
+    return OYLNG_OK;
 }
 
 oylng_mark oylng_node_mark(const oylng_tree *T, oylng_node n) {

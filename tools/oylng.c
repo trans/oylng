@@ -2,7 +2,7 @@
  * oylng — read a YAML 2.0 stream and show what it delivers
  *
  *     oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]
- *     oylng --typed [--schema SCHEMA ROOT] [--store DIR] [--cut] [--no-stamps] [--every-entry] [--limit N] [FILE]
+ *     oylng --typed [--schema SCHEMA ROOT] [--store DIR] [--cut] [--no-stamps] [--every-entry] [--keep] [--limit N] [FILE]
  *
  * --events (the default) writes the events in the suite's notation;
  * --json writes one line of JSON per document; --emit writes the stream
@@ -22,7 +22,10 @@
  * alone (a schema's full size, and typed), as yaml2's checker has them,
  * where --limit sets it for the stream too; --schema-limit N sets it for
  * SCHEMA alone, which is read under it as a stream and held to it for its
- * full size (section 3), as an application's schema is. With no
+ * full size (section 3), as an application's schema is. --keep, for
+ * tests, types with references kept (part 2, section 11), and writes an
+ * untyped value as yaml2's checker gives a kept one: a mapping merged, a
+ * sequence with its own items, its -<< items left out. With no
  * FILE, or with -, reads standard input. On an error, writes it to
  * standard error with its line and column, and exits with 1.
  */
@@ -76,14 +79,28 @@ static void json_str(strbuf *b, const char *s, size_t n) {
     sb_str(b, "\"");
 }
 
-/* The library's own, for --typed-limit */
+/* The library's own, for --typed-limit and --keep */
 void oylng__parser_set_counts_limit(oylng_parser *p, uint64_t limit);
+size_t oylng__node_lines(const oylng_tree *t, oylng_node n);
+oylng_status oylng__tree_spread(oylng_tree *t, oylng_node n, uint64_t budget, oylng_node *out);
 oylng_schema *oylng__schema_new(const char *yaml, size_t len, oylng_str root, uint64_t limit,
                                 uint64_t counts_limit);
 
-/* A tree's node as JSON: strings, arrays and objects */
+/* A tree's node as JSON: strings, arrays and objects. A kept node is
+ * written as yaml2's checker gives one: a mapping merged (part 1, section
+ * 9.1), a sequence with its own items, its -<< items left out. A mapping
+ * that takes more than the default limit to merge is written null. */
 static void tree_json(strbuf *b, const oylng_tree *t, oylng_node n) {
+    oylng_node sp;
+    if (oylng_node_kind(t, n) == OYLNG_NODE_MAPPING && oylng_node_merges(t, n)) {
+        if (oylng__tree_spread((oylng_tree *)t, n, 64u << 20, &sp) != OYLNG_OK) {
+            sb_str(b, "null");
+            return;
+        }
+        n = sp;
+    }
     size_t c = oylng_node_count(t, n);
+    bool first = true;
     oylng_str s;
     switch (oylng_node_kind(t, n)) {
     case OYLNG_NODE_STRING:
@@ -93,8 +110,11 @@ static void tree_json(strbuf *b, const oylng_tree *t, oylng_node n) {
     case OYLNG_NODE_SEQUENCE:
         sb_str(b, "[");
         for (size_t i = 0; i < c; i++) {
-            if (i) sb_str(b, ", ");
-            tree_json(b, t, oylng_node_item(t, n, i));
+            oylng_node it = oylng_node_item(t, n, i);
+            if (oylng_node_kind(t, it) == OYLNG_NODE_SPLICE) continue;
+            if (!first) sb_str(b, ", ");
+            first = false;
+            tree_json(b, t, it);
         }
         sb_str(b, "]");
         break;
@@ -254,7 +274,7 @@ static int run_typed(oylng_parser *p, const char *in, size_t len, const char *pa
 }
 
 int main(int argc, char **argv) {
-    int json = 0, emit = 0, flow = 0, typed = 0, cut = 0, every = 0, no_stamps = 0;
+    int json = 0, emit = 0, flow = 0, typed = 0, cut = 0, every = 0, no_stamps = 0, keep = 0;
     const char *schema_path = NULL, *schema_root = NULL, *store_dir = NULL;
     unsigned indent = 2;
     unsigned long long limit = 0, counts_limit = 0, schema_limit = 0;
@@ -270,6 +290,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--cut")) cut = 1;
         else if (!strcmp(argv[i], "--no-stamps")) no_stamps = 1;
         else if (!strcmp(argv[i], "--every-entry")) every = 1;
+        else if (!strcmp(argv[i], "--keep")) keep = 1;
         else if (!strcmp(argv[i], "--typed-limit") && i + 1 < argc) counts_limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--schema-limit") && i + 1 < argc) schema_limit = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--indent") && i + 1 < argc) indent = (unsigned)strtoul(argv[++i], NULL, 10);
@@ -277,7 +298,7 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
             puts("usage: oylng [--events | --json | --emit [--flow] [--indent N]] [--limit N] [FILE]\n"
                  "       oylng --typed [--schema SCHEMA ROOT] [--store DIR] [--cut] [--no-stamps] [--every-entry]\n"
-                 "                     [--limit N] [FILE]");
+                 "                     [--keep] [--limit N] [FILE]");
             return 0;
         } else if (!path) path = argv[i];
         else { fprintf(stderr, "oylng: one file at a time\n"); return 2; }
@@ -319,6 +340,7 @@ int main(int argc, char **argv) {
         }
         oylng_parser_set_cut(p, cut);
         oylng_parser_set_stamps(p, !no_stamps);
+        oylng_parser_set_keep(p, keep);
         oylng__parser_set_counts_limit(p, counts_limit);
         store st = { store_dir, NULL };
         if (store_dir) oylng_parser_set_lookup(p, store_lookup, &st);
