@@ -425,11 +425,27 @@ static void kid(void *ctx, uint32_t i) {
 }
 
 /* The children of the table's collection node, references followed and
- * merges applied, into k: its v the caller frees */
+ * merges applied, into k: its v the caller frees. With references kept,
+ * the table gives a <<: line or a -<< as written; compiling such a type
+ * would expand it, which the draft says checks full first (part 1,
+ * section 10), and how isn't settled, so for now it is refused, rather
+ * than compiled without what the line names. */
 static void children(sctx *S, uint32_t node, kids *k) {
     *k = (kids){ S, NULL, 0, 0, false };
     bool ok = oylng__table_children(S->P, node, kid, k);
     if (!ok || k->oom) { free(k->v); nomem(S); }
+    for (uint32_t j = 0; j < k->n; j++) {
+        oylng__tnode tn;
+        oylng__table_node(S->P, k->v[j], &tn);
+        if (tn.kind == OYLNG__T_MERGE || tn.kind == OYLNG__T_SPLICE) {
+            free(k->v);
+            snprintf(S->msg, sizeof S->msg, "compiling a type with its %s kept isn't supported yet",
+                     tn.kind == OYLNG__T_MERGE ? "<<: lines" : "-<< items");
+            S->st = OYLNG_ERR_INPUT;
+            S->errpos = tn.pos;
+            longjmp(S->jb, 1);
+        }
+    }
 }
 
 /* The same, in the arena */

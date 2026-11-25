@@ -123,9 +123,19 @@ follow, however the parser finds the key, and a stream's lookups together
 may follow as many as the limit (section 10). So a path to the far end of a
 chain of n merged mappings counts n - 1 lines. Events would deliver every
 reference in full, so with references kept `oylng_parse_next` is
-`OYLNG_ERR_INPUT`, and so is `oylng_emit_tree` on a kept tree, and for now
-`oylng_parse_typed`. What walks a kept tree in full should check its full
-size first, as section 10 says.
+`OYLNG_ERR_INPUT`, and so is `oylng_emit_tree` on a kept tree. What walks a
+kept tree in full should check its full size first, as section 10 says.
+
+`oylng_parse_typed` types a kept document too. The limit applies to held,
+and to typed, which counts a shared node once for each type it is typed as
+and each nearest `!**` (part 2, section 11). So `[*s, *s, ...]` under
+`[!str, ...]` counts `s` once, while three types for it count it three
+times. Each place still gets its own value where bound code makes one
+(section 12). For now, typing a mapping whose `<<:` lines are kept, a
+sequence whose `-<<` items are, or a type of the stream's own schema
+written with either, is `OYLNG_ERR_INPUT`. The draft doesn't yet say how
+those are counted and delivered, so the engine doesn't guess. Read in full,
+they type as section 9.1 says.
 
 An application that keeps every document it reads says so with
 `oylng_parser_set_together`. The documents' sizes then add up, rather than
@@ -330,8 +340,10 @@ or later.
   with the suite's `bin/suite-to-data`, which needs PyYAML. Part 2's suite,
   `suite/yes` (`make test-yes`), types each test and compares its typed
   events, or its refusal and the refusal's kind, with a lookup of the
-  test's store of published files where it has one; it skips tests with
-  `keep`, and times held otherwise than the engine holds them. Then
+  test's store of published files where it has one. A test with `keep` is
+  read with references kept, and only its acceptance or refusal is
+  compared, as the suite says. It skips times held otherwise than the
+  engine holds them. Then
   `make test-plain` runs them all again, built without SIMD and without the
   fast paths for flow collections on one line and simple block lines, so
   the code those stand in for stays tested.

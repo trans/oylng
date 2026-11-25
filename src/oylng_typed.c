@@ -96,6 +96,7 @@ typedef struct {
     const oylng_tree *T;
     oylng_parser     *P;
     bool              cut;
+    bool              kept;       /* the tree keeps references (section 11) */
     uint64_t          limit, typed;
     frame            *f;
     size_t            nf, capf;
@@ -856,6 +857,19 @@ static uint32_t walk(typer *R, uint32_t node, const xt *scope) {
     return open_coll(R, k == OYLNG_NODE_MAPPING ? OYLNG_T_MAPPING : OYLNG_T_SEQUENCE, node, NULL, scope, NULL);
 }
 
+/* In a kept tree, a mapping with <<: lines or a sequence with -<< items:
+ * what typing them counts and delivers, the draft doesn't say yet, so for
+ * now they are refused, rather than typed without what they name */
+static void kept_spread(typer *R, uint32_t node) {
+    oylng_kind k = oylng_node_kind(R->T, node);
+    if (k == OYLNG_NODE_MAPPING && oylng_node_merges(R->T, node))
+        refuse_as(R, OYLNG_ERR_INPUT, node, "typing a mapping with its <<: lines kept isn't supported yet");
+    if (k == OYLNG_NODE_SEQUENCE)
+        for (size_t i = 0, n = oylng_node_count(R->T, node); i < n; i++)
+            if (oylng_node_kind(R->T, oylng_node_item(R->T, node, i)) == OYLNG_NODE_SPLICE)
+                refuse_as(R, OYLNG_ERR_INPUT, node, "typing a sequence with its -<< items kept isn't supported yet");
+}
+
 /* The value at node typed with t, or walked if t is NULL: once for each
  * type and nearest `!**`, if node is shared */
 static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope, bool opt);
@@ -870,6 +884,7 @@ static uint32_t conv(typer *R, const xt *t, uint32_t node, const xt *scope) {
             if (R->memo[i].node == node && R->memo[i].k == k && R->memo[i].scope == scope) return R->memo[i].val;
         }
     }
+    if (R->kept) kept_spread(R, node);
     R->typed += own_size(R->T, node);
     if (R->typed > R->limit)
         refuse_as(R, OYLNG_ERR_LIMIT, node, "typed passes the size limit of %llu", (unsigned long long)R->limit);
@@ -1382,7 +1397,6 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
     if (!out) return OYLNG_ERR_INPUT;
     *out = NULL;
     if (!P || (app && (app->st != OYLNG_OK || !app->root))) return OYLNG_ERR_INPUT;
-    if (oylng__parser_keep(P)) return OYLNG_ERR_INPUT;   /* typing a kept tree: not yet */
     struct start c = { P, app, NULL, NULL, OYLNG_TYPED_NOT };
     oylng_tree *T;
     oylng_status st = oylng__tree_read(P, &T, at_start, &c);
@@ -1394,7 +1408,10 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
     }
     Y->T = T;
     Y->how = c.how;
-    typer R = { .Y = Y, .S = c.S, .T = T, .P = P, .cut = oylng__parser_cut(P), .limit = oylng__parser_counts_limit(P) };
+    /* with references kept, the limit is on held, which the parser keeps,
+       and on typed (section 11) */
+    typer R = { .Y = Y, .S = c.S, .T = T, .P = P, .cut = oylng__parser_cut(P), .kept = oylng__parser_keep(P),
+                .limit = oylng__parser_counts_limit(P) };
     bool ok;
     if (!c.root) {
         ok = !setjmp(R.jb);

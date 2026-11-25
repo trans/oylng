@@ -1570,6 +1570,138 @@ static void emitting_more(void) {
     oylng_schema_free(rs);
 }
 
+/* ── Typing with references kept (section 11) ───────────── */
+
+/* The stream's first document read with references kept and typed, under
+ * limit: NULL with the error in err, and the status in *st */
+static oylng_typed *kept_typed(oylng_parser **pp, const char *s, uint64_t limit, oylng_status *st, char *err,
+                               size_t errlen) {
+    *pp = oylng_parser_new(s, strlen(s));
+    if (limit) oylng_parser_set_limit(*pp, limit);
+    oylng_parser_set_keep(*pp, true);
+    oylng_typed *y = NULL;
+    *st = oylng_parse_typed(*pp, NULL, &y);
+    snprintf(err, errlen, "%s", *st == OYLNG_OK ? "" : oylng_parser_error(*pp));
+    return y;
+}
+
+static void kept_typing(void) {
+    char err[300];
+    oylng_parser *p;
+    oylng_status st;
+    oylng_typed *y;
+
+    /* a string of 1,000 bytes named 1,000 times: full is a million, so the
+       normal read refuses it at 10,000; kept, held is some 3,000, and typed
+       1,002, as `...` repeats one type and s is typed once */
+    size_t cap = 1000 * 6 + 1200, o = 0;
+    char *big = malloc(cap);
+    o += (size_t)sprintf(big, "%%YAML 2.0\n--- &\ns: ");
+    for (int i = 0; i < 1000; i++) big[o++] = 'a' + i % 26;
+    o += (size_t)sprintf(big + o, "\none: [!str, ...]\n--- !one\n[");
+    for (int i = 0; i < 1000; i++) o += (size_t)sprintf(big + o, "%s*s", i ? ", " : "");
+    o += (size_t)sprintf(big + o, "]\n");
+    p = oylng_parser_new(big, o);
+    oylng_parser_set_limit(p, 10000);
+    CHECK(oylng_parse_typed(p, NULL, &y) == OYLNG_ERR_LIMIT && !y, "in full at 10,000: refused for full");
+    oylng_parser_free(p);
+    y = kept_typed(&p, big, 10000, &st, err, sizeof err);
+    oylng_value r = y ? oylng_typed_root(y) : OYLNG_NO_VALUE;
+    CHECK(st == OYLNG_OK && y && oylng_value_count(y, r) == 1000 &&
+              oylng_value_type(y, oylng_value_item(y, r, 999)) == OYLNG_T_STR &&
+              oylng_value_text(y, oylng_value_item(y, r, 999)).len == 1000 &&
+              oylng_value_item(y, r, 0) == oylng_value_item(y, r, 999),
+          "kept: typed once, one value for all 1,000: %s", err);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    /* under three types, s is typed three times: typed is 1 + 3 x 1,001,
+       3,004, which the limit must reach, though held is some 1,050 */
+    char *t3 = malloc(1200);
+    size_t n3 = (size_t)sprintf(t3, "%%YAML 2.0\n--- &\ns: ");
+    for (int i = 0; i < 1000; i++) t3[n3++] = 'a' + i % 26;
+    sprintf(t3 + n3, "\nthree: [!str(1..), !str(2..), !str(3..)]\n--- !three\n[*s, *s, *s]\n");
+    y = kept_typed(&p, t3, 3004, &st, err, sizeof err);
+    CHECK(st == OYLNG_OK && y, "three types at 3,004: %s", err);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    y = kept_typed(&p, t3, 3003, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_LIMIT && !y && strstr(err, "/2: typed passes the size limit of 3003"), "and at 3,003: %s", err);
+    oylng_parser_free(p);
+    free(t3);
+    free(big);
+
+    /* a mapping with its <<: lines kept, or a sequence with its -<< items,
+       is refused for now, rather than typed without what they name; read
+       in full, each is typed as section 9.1 has it */
+    const char *mg = "%YAML 2.0\n--- &\na: {k: v}\nm: {k: !str, j: !int}\n--- !m\n<<: *a\nj: 1\n";
+    y = kept_typed(&p, mg, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_INPUT && !y && strstr(err, "typing a mapping with its <<: lines kept isn't supported yet"),
+          "<<: kept, typed: %s", err);
+    oylng_parser_free(p);
+    const char *e2 = NULL;
+    y = typed(&p, mg, NULL, &e2);
+    CHECK(y && oylng_value_text(y, oylng_value_get(y, oylng_typed_root(y), S("k"))).len == 1, "in full: k is v");
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    const char *sp = "%YAML 2.0\n--- &\ns: [x]\nl: [!str, ...]\n--- !l\n-<< *s\n- y\n";
+    y = kept_typed(&p, sp, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_INPUT && !y && strstr(err, "typing a sequence with its -<< items kept isn't supported yet"),
+          "-<< kept, typed: %s", err);
+    oylng_parser_free(p);
+    const char *rm = "%YAML 2.0\n--- &\na: {k: v}\nb: {<<: *a}\nm: {k: !str}\n--- !m\n*b\n";
+    y = kept_typed(&p, rm, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_INPUT && !y, "a reference to a mapping with <<: lines too: %s", err);
+    oylng_parser_free(p);
+    /* a type with a <<: line or a -<< item: compiling it is refused for now
+       too, as the stream's own schema; read in full, it compiles */
+    const char *tm = "%YAML 2.0\n--- &\nbase: {x: !int}\njob: {<<: *base, y: !int}\n--- !job\nx: 1\ny: 2\n";
+    y = kept_typed(&p, tm, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_INPUT && !y && strstr(err, "compiling a type with its <<: lines kept isn't supported yet"),
+          "a type's <<: kept: %s", err);
+    oylng_parser_free(p);
+    y = typed(&p, tm, NULL, &e2);
+    CHECK(y && oylng_value_type(y, oylng_value_get(y, oylng_typed_root(y), S("x"))) == OYLNG_T_INT, "in full, x is an int");
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    const char *ts = "%YAML 2.0\n--- &\nhead: [!int]\nrow: [-<< *head, !str]\n--- !row\n[1, a]\n";
+    y = kept_typed(&p, ts, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_INPUT && !y && strstr(err, "compiling a type with its -<< items kept isn't supported yet"),
+          "a type's -<< kept: %s", err);
+    oylng_parser_free(p);
+    /* a type is compiled only where a document reaches it, so an entry
+       with <<: no type names leaves typing be; under !any a <<: is refused
+       too, as a !** around it would type what it names */
+    const char *nr = "%YAML 2.0\n--- &\na: {k: v}\nb: {<<: *a}\nm: {k: !str}\n--- !m\nk: x\n";
+    y = kept_typed(&p, nr, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_OK && y, "an entry with <<: not reached: %s", err);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    const char *ua = "%YAML 2.0\n--- &\na: {k: v}\nm: {k: !any}\n--- !m\nk: {<<: *a}\n";
+    y = kept_typed(&p, ua, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_ERR_INPUT && !y && !strncmp(err, "/k: typing a mapping", 20), "<<: under !any: %s", err);
+    oylng_parser_free(p);
+    const char *un = "%YAML 2.0\n--- &\na: {k: v}\n---\n<<: *a\nj: 1\n";
+    y = kept_typed(&p, un, 0, &st, err, sizeof err);
+    CHECK(st == OYLNG_OK && y && oylng_typed_how(y) == OYLNG_TYPED_NOT, "untyped, kept as read: %s", err);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+
+    /* code runs once per use, kept or not: *o twice is two points */
+    const char *pt = "%YAML 2.0\n--- &\npoint: {x: !int, y: !int}\nps: [!point, ...]\no: {x: 1, y: 2}\n--- !ps\n[*o, *o]\n";
+    binder b = { 0 };
+    p = oylng_parser_new(pt, strlen(pt));
+    oylng_parser_set_keep(p, true);
+    oylng_parser_bind(p, S("point"), bind_point, drop_obj, &b);
+    y = typed_next(p, NULL, err, sizeof err);
+    r = y ? oylng_typed_root(y) : OYLNG_NO_VALUE;
+    point *q0 = y ? oylng_value_object(y, oylng_value_item(y, r, 0)) : NULL;
+    point *q1 = y ? oylng_value_object(y, oylng_value_item(y, r, 1)) : NULL;
+    CHECK(y && b.calls == 2 && q0 && q1 && q0 != q1 && q1->y == 2, "kept, *o twice: two calls, two points: %s", err);
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    CHECK(b.dropped == 2, "both let go: %d", b.dropped);
+}
+
 static void api(void) {
     oylng_parser *p;
     const char *err;
@@ -1907,6 +2039,7 @@ static void api(void) {
     bindings();
     emitting();
     emitting_more();
+    kept_typing();
 }
 
 int main(int argc, char **argv) {

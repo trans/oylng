@@ -739,7 +739,9 @@ static void test_keep(void) {
     p = oylng_parser_new(one, strlen(one));
     oylng_parser_set_keep(p, true);
     oylng_typed *y;
-    CHECK(oylng_parse_typed(p, NULL, &y) == OYLNG_ERR_INPUT && !y, "nor typed, yet");
+    CHECK(oylng_parse_typed(p, NULL, &y) == OYLNG_OK && y && oylng_typed_how(y) == OYLNG_TYPED_NOT,
+          "typed, untyped as it has no stamp (test_schema.c has the rest)");
+    oylng_typed_free(y);
     oylng_parser_free(p);
 
     /* a chain doubling 62 times through -<< reads as 2^63 items, and as a

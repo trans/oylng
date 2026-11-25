@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Typing with references kept** (part 2, section 11): `oylng_parse_typed`
+  now types a document read with `oylng_parser_set_keep`, where it was
+  `OYLNG_ERR_INPUT`. The limit applies to held, and to typed, which counts
+  a shared node once for each type and nearest `!**` it is typed under.
+  A kept mapping's `<<:` lines and a kept sequence's `-<<` items, in the
+  data or in a type of the stream's own schema, are refused for now with
+  `OYLNG_ERR_INPUT`, as the draft doesn't yet say how typing counts and
+  delivers them. Part 2's 24 `keep` tests now run, and pass.
+
 ## 0.3.0 (2026-11-24)
 
 Part 2 of YAML 2.0, the Easy Schema, and references kept for part 1.

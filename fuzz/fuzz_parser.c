@@ -406,14 +406,21 @@ static bool same_nodes(const oylng_tree *a, oylng_node n, const oylng_tree *b, o
 
 static bool same_str(oylng_str x, oylng_str y) { return x.len == y.len && (!x.len || !memcmp(x.data, y.data, x.len)); }
 
-/* Whether two typed values are the same: type, value and name */
-static bool same_typed(const oylng_typed *a, oylng_value v, const oylng_typed *b, oylng_value w) {
+/* Whether two typed values are the same: type, value and name. With kb,
+ * b's tree keeps references, and an untyped value is compared spread, as
+ * far as the budget *kb goes */
+static bool same_typed(const oylng_typed *a, oylng_value v, const oylng_typed *b, oylng_value w, size_t *kb) {
     oylng_type t = oylng_value_type(a, v);
     if (t != oylng_value_type(b, w)) return false;
     oylng_str na = oylng_value_name(a, v), nb = oylng_value_name(b, w);
     if (!na.data != !nb.data || (na.data && !same_str(na, nb))) return false;
     switch (t) {
     case OYLNG_T_ANY:
+        if (kb) {
+            uint64_t ha = tree_hash(0xCBF29CE484222325u, oylng_typed_tree(a), oylng_value_node(a, v));
+            uint64_t hb = kept_hash(0xCBF29CE484222325u, oylng_typed_tree(b), oylng_value_node(b, w), kb);
+            return !*kb || ha == hb;   /* past the budget, not compared */
+        }
         return same_nodes(oylng_typed_tree(a), oylng_value_node(a, v), oylng_typed_tree(b), oylng_value_node(b, w));
     case OYLNG_T_SEQUENCE:
     case OYLNG_T_MAPPING: {
@@ -421,8 +428,8 @@ static bool same_typed(const oylng_typed *a, oylng_value v, const oylng_typed *b
         if (c != oylng_value_count(b, w)) return false;
         for (size_t i = 0; i < c; i++) {
             if (t == OYLNG_T_MAPPING && !same_str(oylng_value_key(a, v, i), oylng_value_key(b, w, i))) return false;
-            if (t == OYLNG_T_SEQUENCE ? !same_typed(a, oylng_value_item(a, v, i), b, oylng_value_item(b, w, i))
-                                      : !same_typed(a, oylng_value_at(a, v, i), b, oylng_value_at(b, w, i)))
+            if (t == OYLNG_T_SEQUENCE ? !same_typed(a, oylng_value_item(a, v, i), b, oylng_value_item(b, w, i), kb)
+                                      : !same_typed(a, oylng_value_at(a, v, i), b, oylng_value_at(b, w, i), kb))
                 return false;
         }
         return true;
@@ -518,7 +525,7 @@ static void write_again(const oylng_typed *y, const oylng_schema *sc, unsigned o
                 oylng_typed *back = NULL;
                 st = oylng_parse_typed(q, sc, &back);
                 if (st != OYLNG_ERR_MEMORY &&
-                    (st != OYLNG_OK || !back || !same_typed(y, oylng_typed_root(y), back, oylng_typed_root(back))))
+                    (st != OYLNG_OK || !back || !same_typed(y, oylng_typed_root(y), back, oylng_typed_root(back), NULL)))
                     abort();
                 oylng_typed_free(back);
                 oylng_parser_free(q);
@@ -774,6 +781,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         app = NULL;
     }
     oylng_parser *yp = parser_for(in, size, opt);
+    /* and alongside, typed with references kept (section 11): each
+       document the typed read accepts is within full, so held and typed
+       are too, and it must be accepted alike, with the same values, unless
+       typing meets a <<: line or a -<< item, which is refused for now */
+    oylng_parser *kyp = parser_for(in, size, opt);
+    bool kdone = !kyp;
+    if (kyp) {
+        oylng_parser_set_keep(kyp, true);
+        oylng_parser_set_cut(kyp, (opt & 0x40) != 0);
+    }
     fbinder fb = { 0 };
     if (yp) {
         oylng_parser_set_cut(yp, (opt & 0x40) != 0);
@@ -801,6 +818,21 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             check_objects(y, root, &seen, &cap, &ob);
             free(seen);
             if (how == OYLNG_TYPED_APP || how == OYLNG_TYPED_NOT) write_again(y, how == OYLNG_TYPED_APP ? app : NULL, opt);
+            if (!kdone) {
+                oylng_parser_set_stamps(kyp, !off);
+                oylng_typed *ky = NULL;
+                oylng_status ks = oylng_parse_typed(kyp, app, &ky);
+                if (ks == OYLNG_OK && ky) {
+                    size_t kb = 1 << 16, cb = 1 << 16;
+                    if (oylng_typed_how(ky) != how || !same_typed(y, root, ky, oylng_typed_root(ky), &kb)) abort();
+                    check_value(ky, oylng_typed_root(ky), &cb);
+                    oylng_typed_free(ky);
+                } else if (ks == OYLNG_ERR_MEMORY ||
+                           (ks == OYLNG_ERR_INPUT && strstr(oylng_parser_error(kyp), "isn't supported yet")))
+                    kdone = true;
+                else
+                    abort();
+            }
             oylng_typed_free(y);
         }
         if (fb.made != fb.dropped) abort();
@@ -819,6 +851,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
         oylng_parser_free(yp);
     }
+    oylng_parser_free(kyp);
     oylng_schema_free(app);
     oylng_parser_free(p);
     published(in, size, opt);

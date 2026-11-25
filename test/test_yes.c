@@ -14,10 +14,12 @@
  * compared with at (a different one is counted, not failed: the suite's is
  * the first fault its checker meets). The limit applies to the stream, and
  * to an application's schema, which is read under it as a stream and then
- * held to it for its full size (section 3).
+ * held to it for its full size (section 3). A test with keep is read with
+ * references kept, under the limit on held and typed (section 11), and
+ * only checks that it is accepted or refused, as the suite's README says.
  *
- * Skipped, and counted: keep and together, interfaces this parser doesn't
- * offer; holds other than its
+ * Skipped, and counted: together, which part 2's suite has no test of
+ * and this harness doesn't set; holds other than its
  * own (9 fraction digits, a second 60, the year 0000), and a test without
  * holds that it refuses for a time it can't hold; a limit of 0, which
  * the library takes as the default. Exits with 1 if any test fails.
@@ -34,7 +36,7 @@
 #include <sys/stat.h>
 
 static int passed, failed, verbose, paths;
-static int skip_keep, skip_holds, skip_zero, published;
+static int skip_together, skip_holds, skip_zero, published, kept;
 
 static char *slurp(const char *dir, const char *name, size_t *len) {
     char path[4096];
@@ -347,7 +349,9 @@ static const char *again(oylng_parser *rp, const oylng_typed *y, const oylng_sch
 }
 
 static void run(const char *dir) {
-    if (has(dir, "keep") || has(dir, "together")) { skip_keep++; return; }
+    if (has(dir, "together")) { skip_together++; return; }
+    /* with keep, read with references kept, and only accepted or refused */
+    bool keep = has(dir, "keep");
     char *holds = line(dir, "holds");
     bool ours = !holds || (!strcmp(holds, "9") && has(dir, "leap-second") && has(dir, "year-zero"));
     if (!ours) { skip_holds++; free(holds); return; }
@@ -365,7 +369,7 @@ static void run(const char *dir) {
     uint64_t lim = limit ? strtoull(limit, NULL, 10) : 0;
 
     const char *err = NULL, *why = NULL;
-    bool schema_err = false;
+    bool schema_err = false, typed_limit = false;
     char detail[8192] = "";
     oylng_mark m = { 0, 0, 0 };
     strbuf got = { 0 };
@@ -386,6 +390,8 @@ static void run(const char *dir) {
         p = oylng_parser_new(in, len);
         if (lim) oylng_parser_set_limit(p, lim);
         oylng_parser_set_cut(p, cut);
+        oylng_parser_set_keep(p, keep);
+        if (keep) kept++;
         if (has(dir, "store")) {
             oylng_parser_set_lookup(p, store_lookup, &st);
             published++;
@@ -398,6 +404,7 @@ static void run(const char *dir) {
                 err = oylng_parser_error(p);
                 m = oylng_parser_error_mark(p);
                 schema_err = st == OYLNG_ERR_SCHEMA;
+                typed_limit = st == OYLNG_ERR_LIMIT;
                 break;
             }
             if (!y) break;
@@ -406,7 +413,7 @@ static void run(const char *dir) {
             else sb_str(&got, "+DOC\n");
             typed_events(&got, y, oylng_typed_root(y), cut);
             sb_str(&got, "-DOC\n");
-            if (!want_error && !why) {
+            if (!want_error && !why && !keep) {   /* the emitter takes no kept tree */
                 if (again(p, y, app, cut, lim, detail, sizeof detail)) why = "written again:";
                 else trips++;
             }
@@ -415,8 +422,9 @@ static void run(const char *dir) {
         sb_str(&got, "-STR\n");
     }
 
-    /* the engine's path, where it refused a document: its error up to ": " */
-    bool doc_err = schema_err && err && err[0] == '/';
+    /* the engine's path, where it refused a document: its error up to ": ".
+       Typed past the limit (section 11), a document is refused at a path too */
+    bool doc_err = (schema_err || typed_limit) && err && err[0] == '/';
     size_t plen = doc_err ? strcspn(err, ":") : 0;
     if (err && !holds && strstr(err, "can't hold")) { skip_holds++; goto done; }
     if (want_error) {
@@ -433,7 +441,7 @@ static void run(const char *dir) {
     } else if (err) {
         why = "refused";
         snprintf(detail, sizeof detail, "%zu:%zu: %s", m.line, m.col, err);
-    } else if (!want || !same_events(got.data, want)) why = "wrong events";
+    } else if (!keep && (!want || !same_events(got.data, want))) why = "wrong events";
 
     if (why) {
         failed++;
@@ -498,9 +506,9 @@ int main(int argc, char **argv) {
     }
     if (!data) { fprintf(stderr, "usage: test_yes DATA [-v]\n"); return 2; }
     walk(data);
-    printf("yes: %d passed, %d failed (%d run with a store); skipped %d with keep, %d holding more,"
-           " %d with a limit of 0; %d refused at another path\n",
-           passed, failed, published, skip_keep, skip_holds, skip_zero, paths);
+    printf("yes: %d passed, %d failed (%d run with a store, %d with references kept); skipped %d with together,"
+           " %d holding more, %d with a limit of 0; %d refused at another path\n",
+           passed, failed, published, kept, skip_together, skip_holds, skip_zero, paths);
     printf("yes: %d typed documents written again read back the same (%d with published names not tried)\n", trips,
            trips_skipped);
     return failed ? 1 : 0;
