@@ -370,9 +370,8 @@ or later.
   its `calls`, in order. Each accepted test's documents are also written
   again from their typed events alone, as its `emit` says: after the
   stream's table documents, read back the same, or refused where it says
-  `emit: refused` (which `test/suite-emit.py` marks, as `suite-to-data`
-  doesn't yet). It skips times held otherwise than the
-  engine holds them. Then
+  `emit: refused`. It skips times held otherwise than the engine holds
+  them. Then
   `make test-plain` runs them all again, built without SIMD and without the
   fast paths for flow collections on one line and simple block lines, so
   the code those stand in for stays tested.
