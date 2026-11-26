@@ -233,7 +233,9 @@ typedef void (*oylng_drop_fn)(void *ctx, void *object);
  *  once the document is typed, never while it is, so never on trial; once
  *  for each place a value is used, so `*p` twice is two calls and two
  *  objects; innermost first, so the code finds the objects of the values
- *  below its own made; and in the order written. Its refusal refuses the
+ *  below its own made; and in the order written. It runs for no key, even
+ *  one a type key names a bound entry for, and for no optional key written
+ *  with no value, whose null has no name. Its refusal refuses the
  *  document, OYLNG_ERR_SCHEMA with the value's path and where it is
  *  written, and the objects made are let go. Binding a name again
  *  replaces its binding, and @p fn NULL unbinds it; from inside a binding,

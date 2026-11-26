@@ -233,7 +233,9 @@ never on trial, innermost first, and once for each place a value is used:
 `*p` named twice makes two objects. A value typed through several names,
 as a `!spot` is through `spot` and then `point` with `spot: !point`, gets
 the code of the outermost one bound, and no other's; a union's name counts
-the same way (`oylng_value_bound` says which). The document holds the
+the same way (`oylng_value_bound` says which). Code runs only for a typed
+value: none for a key, even one a type key names a bound entry for, and
+none for an optional key written with no value. The document holds the
 objects until the application takes them, and lets go the rest when it is
 freed.
 
@@ -353,7 +355,9 @@ or later.
   events, or its refusal and the refusal's kind, with a lookup of the
   test's store of published files where it has one. A test with `keep` is
   read with references kept, and only its acceptance or refusal is
-  compared, as the suite says. It skips times held otherwise than the
+  compared, as the suite says. A test with `bind` binds each name in it
+  to code that notes the name, and an accepted one's names noted must be
+  its `calls`, in order. It skips times held otherwise than the
   engine holds them. Then
   `make test-plain` runs them all again, built without SIMD and without the
   fast paths for flow collections on one line and simple block lines, so

@@ -16,6 +16,13 @@
   first. Against the suite at yaml2's `v0.2.0` (`a2c46f4`), part 2's 43
   tests read with references kept now run, and pass. `oylng --typed
   --keep`, for tests, types with references kept.
+- **Bindings against the suite** (part 2, section 12): part 2's 33 tests
+  with `bind` and `calls` now run, binding each name to code that notes
+  it, and pass: the code of the outermost bound name runs, for each place
+  a value is used, the parts before the whole in the data's order. As
+  yaml2 `9d8b160` rules, code runs for no key, even one a type key names a
+  bound entry for, and for no optional key written with no value; the
+  engine already did so.
 - **A type key takes a scalar type** (part 2, section 7, yaml2 `bd5f8ed`):
   since a key is always a scalar, a schema is refused as it is read
   (`OYLNG_ERR_SCHEMA`) where a type key's type, or one of its union's

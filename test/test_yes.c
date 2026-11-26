@@ -17,6 +17,10 @@
  * held to it for its full size (section 3). A test with keep is read with
  * references kept, under the limit on held and typed (section 11), and
  * only checks that it is accepted or refused, as the suite's README says.
+ * A test with bind binds each name in it (oylng_parser_bind, section 12)
+ * to code that notes the name and makes no object; accepted, the names
+ * noted in the stream must be calls, in order. A refused test's calls may
+ * differ between parsers, so only its refusal is checked.
  *
  * Skipped, and counted: together, which part 2's suite has no test of
  * and this harness doesn't set; holds other than its
@@ -36,7 +40,7 @@
 #include <sys/stat.h>
 
 static int passed, failed, verbose, paths;
-static int skip_together, skip_holds, skip_zero, published, kept;
+static int skip_together, skip_holds, skip_zero, published, kept, binding;
 
 static char *slurp(const char *dir, const char *name, size_t *len) {
     char path[4096];
@@ -78,6 +82,23 @@ static bool store_lookup(void *ctx, oylng_str address, oylng_str sha256, oylng_s
     if (!st->last) return false;
     *file = (oylng_str){ st->last, n };
     return true;
+}
+
+/* A name in bind: its code notes the name and makes no object, so the
+ * typed events are what they'd be with nothing bound (section 12) */
+typedef struct {
+    char   *name;
+    strbuf *calls;
+} bound;
+
+static const char *note(void *ctx, oylng_typed *t, oylng_value v, void **object) {
+    (void)t;
+    (void)v;
+    bound *b = ctx;
+    sb_str(b->calls, b->name);
+    sb_str(b->calls, "\n");
+    *object = NULL;
+    return NULL;
 }
 
 /* A one-line file's line, without its break; NULL if there's none */
@@ -366,7 +387,19 @@ static void run(const char *dir) {
     char *at = line(dir, "at");
     bool want_error = has(dir, "error"), cut = has(dir, "cut");
     char *want = want_error ? NULL : slurp(dir, "typed.event", NULL);
+    char *bind = slurp(dir, "bind", NULL), *calls = slurp(dir, "calls", NULL);
     uint64_t lim = limit ? strtoull(limit, NULL, 10) : 0;
+    bound names[64];
+    size_t nnames = 0;
+    strbuf noted = { 0 };
+    sb_add(&noted, "", 0);
+    for (char *s = bind; s && *s && nnames < 64;) {
+        size_t n = strcspn(s, "\n");
+        bool more = s[n] != '\0';
+        s[n] = '\0';
+        if (n) names[nnames++] = (bound){ s, &noted };
+        s += n + more;
+    }
 
     const char *err = NULL, *why = NULL;
     bool schema_err = false, typed_limit = false;
@@ -392,6 +425,9 @@ static void run(const char *dir) {
         oylng_parser_set_cut(p, cut);
         oylng_parser_set_keep(p, keep);
         if (keep) kept++;
+        for (size_t i = 0; i < nnames; i++)
+            oylng_parser_bind(p, (oylng_str){ names[i].name, strlen(names[i].name) }, note, NULL, &names[i]);
+        if (nnames) binding++;
         if (has(dir, "store")) {
             oylng_parser_set_lookup(p, store_lookup, &st);
             published++;
@@ -442,6 +478,11 @@ static void run(const char *dir) {
         why = "refused";
         snprintf(detail, sizeof detail, "%zu:%zu: %s", m.line, m.col, err);
     } else if (!keep && (!want || !same_events(got.data, want))) why = "wrong events";
+    else if (nnames && strcmp(noted.data, calls ? calls : "")) {
+        /* a refused test's calls may differ between parsers: only an accepted one's are checked */
+        why = "wrong calls";
+        snprintf(detail, sizeof detail, "\n--- want\n%s--- got\n%s", calls ? calls : "", noted.data);
+    }
 
     if (why) {
         failed++;
@@ -466,6 +507,9 @@ done:
     free(at);
     free(want);
     free(holds);
+    free(bind);
+    free(calls);
+    free(noted.data);
 }
 
 static int cmp(const void *a, const void *b) {
@@ -506,9 +550,9 @@ int main(int argc, char **argv) {
     }
     if (!data) { fprintf(stderr, "usage: test_yes DATA [-v]\n"); return 2; }
     walk(data);
-    printf("yes: %d passed, %d failed (%d run with a store, %d with references kept); skipped %d with together,"
-           " %d holding more, %d with a limit of 0; %d refused at another path\n",
-           passed, failed, published, kept, skip_together, skip_holds, skip_zero, paths);
+    printf("yes: %d passed, %d failed (%d run with a store, %d with references kept, %d with names bound);"
+           " skipped %d with together, %d holding more, %d with a limit of 0; %d refused at another path\n",
+           passed, failed, published, kept, binding, skip_together, skip_holds, skip_zero, paths);
     printf("yes: %d typed documents written again read back the same (%d with published names not tried)\n", trips,
            trips_skipped);
     return failed ? 1 : 0;
