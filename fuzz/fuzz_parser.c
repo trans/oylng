@@ -39,6 +39,10 @@
  * that gives it, once each #sha256= and the 64 hex digits after it are set
  * to the file's hash: a published document must be typed as its type says,
  * and a refusal must say why.
+ * A refusal's place, from the events, the typed read or the stream's table
+ * as a schema, must give the line and, where the line up to it is UTF-8,
+ * fall between two characters and give the column in characters, each
+ * worked out again here (part 1, section 2).
  *
  *     clang -fsanitize=fuzzer,address,undefined -Iinclude src/oylng_*.c fuzz/fuzz_parser.c
  */
@@ -562,6 +566,28 @@ static oylng_parser *parser_for(const char *in, size_t size, unsigned opt) {
     return p;
 }
 
+/* A refusal's place in the input (part 1, section 2): the line one more
+ * than the line feeds before it, and where the line up to it is UTF-8, the
+ * column one more than its characters, decoded one by one, the place
+ * falling between two of them */
+static void check_mark(const char *in, size_t size, oylng_mark m) {
+    if (m.offset > size) abort();
+    size_t line = 1, start = 0;
+    for (size_t i = 0; i < m.offset; i++)
+        if (in[i] == '\n') line++, start = i + 1;
+    if (m.line != line) abort();
+    size_t col = 1, i = start;
+    while (i < m.offset) {
+        unsigned c = (unsigned char)in[i];
+        size_t n = c < 0x80 ? 1 : c >= 0xC2 && c < 0xE0 ? 2 : c >= 0xE0 && c < 0xF0 ? 3 : c >= 0xF0 && c < 0xF5 ? 4 : 0;
+        for (size_t k = 1; k < n; k++)
+            if (i + k >= size || ((unsigned char)in[i + k] & 0xC0) != 0x80) n = 0;
+        if (!n) return;   /* not UTF-8: refused, at this place or before */
+        i += n, col++;
+    }
+    if (i != m.offset || m.col != col) abort();
+}
+
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (size < 1) return 0;
     unsigned opt = data[0];
@@ -642,6 +668,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         }
         if (e->type == OYLNG_EVT_STREAM_END) { clean = true; break; }
     }
+
+    if (pst != OYLNG_OK) check_mark(in, size, oylng_parser_error_mark(p));
 
     /* read as trees, the same, or the same error; written, the same text */
     oylng_parser *tp = parser_for(in, size, opt);
@@ -779,6 +807,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     oylng_schema *app = oylng_schema_new(in, size, (oylng_str){ "a", 1 }, limits[opt & 7]);
     if (app && oylng_schema_status(app) != OYLNG_OK) {
         if (!oylng_schema_error(app)) abort();
+        if (oylng_schema_error_mark(app).line)   /* line 0: no place, as for "no schema" */
+            check_mark(in, size, oylng_schema_error_mark(app));
         oylng_schema_free(app);
         app = NULL;
     }
@@ -843,6 +873,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             if (!clean && pst != OYLNG_ERR_MEMORY) abort();
         } else {
             if (!oylng_parser_error(yp)) abort();
+            check_mark(in, size, oylng_parser_error_mark(yp));
             /* a type's names walked again differently: the whole message, as
                a refusal may quote the input */
             if (!strcmp(oylng_parser_error(yp), "/: a type's names walked again differently (a bug)")) abort();

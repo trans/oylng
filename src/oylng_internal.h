@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 
 /* ── Characters (section 3), for the parser and the emitter ─ */
 
@@ -43,6 +44,21 @@ static inline bool oylng_allowed(uint32_t c, bool dq) {
     if (c < 0xA0) return dq;
     if (c == 0x2028 || c == 0x2029 || c == 0xFEFF || c == 0xFFFE || c == 0xFFFF) return dq;
     return true;
+}
+
+/* The place at offset at in the input in..: lines and columns from 1, a
+ * column counting characters (part 1, section 2), so a tab counts 1 and
+ * 名 counts 1. A line ends with LF, or CR LF, whose CR counts in the
+ * line it ends. Counts the bytes that don't continue a character, which
+ * are the code points where the input is UTF-8, as it is up to a
+ * refusal's place. Takes time in proportion to at, for messages. */
+static inline oylng_mark oylng__mark_at(const char *in, size_t at) {
+    oylng_mark m = { at, 1, 1 };
+    if (!in) return m;
+    const char *q = in, *e = in + at, *line = in;
+    while (q < e && (q = memchr(q, '\n', (size_t)(e - q)))) { m.line++; line = ++q; }
+    for (q = line; q < e; q++) m.col += ((unsigned char)*q & 0xC0) != 0x80;
+    return m;
 }
 
 /* Whether a byte may be in a name's fragment, after its # (section 4.3):

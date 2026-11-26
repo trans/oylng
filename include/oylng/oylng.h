@@ -62,8 +62,11 @@ typedef enum {
                              schema (part 2, oylng/schema.h). */
 } oylng_status;
 
-/** A place in the input. Lines and columns count from 1, and a column
- *  counts bytes. */
+/** A place in the input (part 1, section 2): the offset in bytes from the
+ *  input's start, a CR LF counting two, and the line and the column, both
+ *  from 1, the column counting characters, so a tab counts 1 and so does
+ *  名. In "%YAML 2.0\n---\n{名前: 東京, 名前: x}\n" the second 名前 is at
+ *  line 3, column 10, offset 31. */
 typedef struct {
     size_t offset;
     size_t line;

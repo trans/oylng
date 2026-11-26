@@ -2145,6 +2145,20 @@ static void api(void) {
           "a schema file checked, its error's line: %s", oylng_schema_error(sc));
     oylng_schema_free(sc);
 
+    /* a schema's error and a document's refusal: a column counts
+       characters, and the offset bytes (part 1, section 2) */
+    const char *cjk = "%YAML 2.0\n--- &\n名前: !int\nb:\n  東京: !nosuch\n";
+    sc = oylng_schema_new(cjk, strlen(cjk), (oylng_str){ NULL, 0 }, 0);
+    oylng_mark wm = oylng_schema_error_mark(sc);
+    CHECK(oylng_schema_status(sc) == OYLNG_ERR_SCHEMA && wm.line == 5 && wm.col == 7 && wm.offset == 42,
+          "a schema's error, in characters: %zu:%zu (%zu): %s", wm.line, wm.col, wm.offset, oylng_schema_error(sc));
+    oylng_schema_free(sc);
+    y = typed(&p, "%YAML 2.0\n--- &\nv:\n  名前: !str\n  n: !int\n--- !v\n{名前: 東京, n: x}\n", NULL, &err);
+    wm = oylng_parser_error_mark(p);
+    CHECK(!y && err && wm.line == 7 && wm.col == 13 && wm.offset == 71, "a refusal, in characters: %zu:%zu (%zu): %s",
+          wm.line, wm.col, wm.offset, err ? err : "");
+    oylng_parser_free(p);
+
     /* what nothing reaches isn't a type; what something reached can't be replaced */
     y = typed(&p, "%YAML 2.0\n--- &\nmotd: !important\nn: !int\n--- !n\n3\n", NULL, &err);
     CHECK(y != NULL, "an entry nothing reaches: %s", err ? err : "");

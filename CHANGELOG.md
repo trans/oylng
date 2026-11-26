@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- **A column counts characters** (part 1, section 2, yaml2 `5f55845`).
+  `oylng_mark`'s `col`, from a parser's error, a schema's error or
+  `oylng_node_mark`, counts characters from 1 where it counted bytes, so a
+  tab counts 1 and so does `名`: in `{名前: 東京, 名前: x}` the second `名前`
+  is at column 10, not 18. `offset` still counts bytes, a CR LF two. The
+  `oylng` tool's `file:line:col:` messages count the same way, and the
+  refusal of an indented table entry no longer speaks of column 0.
 - **Typed emitting as section 13 now rules** (yaml2 `54fcd63`, `340fe27`,
   `8b774fc`, `b40c6f5`). A number, a boolean, null or a time has one
   spelling, its standard one. The emitter no longer tries a `+`, zeros

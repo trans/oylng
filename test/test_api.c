@@ -45,9 +45,22 @@ static void test_error_marks(void) {
     CHECK(parse("%YAML 2.0\n---\na:\n  b: !x\n", 0, &m) == OYLNG_ERR_PARSE, "tag");
     CHECK(m.line == 4 && m.col == 6, "tag at %zu:%zu", m.line, m.col);
     CHECK(parse("%YAML 2.0\r\n---\r\na: *nope\r\n", 0, &m) == OYLNG_ERR_PARSE, "missing entry");
-    CHECK(m.line == 3 && m.col == 4, "missing entry at %zu:%zu", m.line, m.col);
+    CHECK(m.line == 3 && m.col == 4 && m.offset == 19, "missing entry at %zu:%zu (%zu), a CR LF two bytes",
+          m.line, m.col, m.offset);
     CHECK(parse("%YAML 1.2\n---\na: 1\n", 0, &m) == OYLNG_ERR_PARSE, "1.2 stream");
     CHECK(m.line == 1 && m.col == 1, "1.2 stream at %zu:%zu", m.line, m.col);
+
+    /* a column counts characters, and the offset bytes (part 1, section 2):
+       the draft's example, whose line 1 and offset 17 count from the
+       example's {, then a tab, é, and a character of four bytes */
+    CHECK(parse("%YAML 2.0\n---\n{名前: 東京, 名前: x}\n", 0, &m) == OYLNG_ERR_PARSE, "repeated key, not ASCII");
+    CHECK(m.line == 3 && m.col == 10 && m.offset == 31, "the draft's example at %zu:%zu (%zu)", m.line, m.col, m.offset);
+    CHECK(parse("%YAML 2.0\n---\ncafé: \"\t\\x41\"\n", 0, &m) == OYLNG_ERR_PARSE, "bad escape after é and a tab");
+    CHECK(m.line == 3 && m.col == 9 && m.offset == 23, "bad escape at %zu:%zu (%zu)", m.line, m.col, m.offset);
+    CHECK(parse("%YAML 2.0\r\n---\r\n[😀, *nope]\r\n", 0, &m) == OYLNG_ERR_PARSE, "missing entry after 😀");
+    CHECK(m.line == 3 && m.col == 5 && m.offset == 23, "missing entry at %zu:%zu (%zu)", m.line, m.col, m.offset);
+    CHECK(parse("%YAML 2.0\n---\n東京: \xe6\x97\n", 0, &m) == OYLNG_ERR_PARSE, "invalid UTF-8");
+    CHECK(m.line == 3 && m.col == 5 && m.offset == 22, "invalid UTF-8 at %zu:%zu (%zu)", m.line, m.col, m.offset);
 }
 
 static void test_stop(void) {
@@ -483,6 +496,15 @@ static void test_tree(void) {
     oylng_mark mk = oylng_node_mark(t, oylng_node_value(t, r, 2));
     CHECK(mk.line == 5 && mk.col == 5, "a value's mark: %zu:%zu", mk.line, mk.col);
     oylng_tree_free(t);
+    t = tree_of("%YAML 2.0\n---\n{名前: 東京, 都市: [é, x]}\n", NULL);
+    CHECK(t, "a tree, not ASCII");
+    if (t) {
+        oylng_node r = oylng_tree_root(t), x = oylng_node_item(t, at(t, r, "都市"), 1);
+        mk = oylng_node_mark(t, x);
+        CHECK(mk.line == 3 && mk.col == 18 && mk.offset == 44, "x's mark, in characters: %zu:%zu (%zu)",
+              mk.line, mk.col, mk.offset);
+        oylng_tree_free(t);
+    }
 
     /* many small trees naming the end of a large table: each tree's notes
      * of what it copied are the parser's, never cleared */

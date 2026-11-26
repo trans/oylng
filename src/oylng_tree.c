@@ -739,14 +739,7 @@ oylng_status oylng__tree_spread(oylng_tree *T, oylng_node n, uint64_t budget, oy
 oylng_mark oylng_node_mark(const oylng_tree *T, oylng_node n) {
     const tnode *nd = get(T, n);
     if (!nd) return (oylng_mark){ 0, 0, 0 };
-    oylng_mark m = { nd->pos, 1, 1 };
-    const char *q = T->in, *at = T->in + nd->pos, *line = q;
-    while ((q = memchr(q, '\n', (size_t)(at - q)))) {
-        m.line++;
-        line = ++q;
-    }
-    m.col = (size_t)(at - line) + 1;
-    return m;
+    return oylng__mark_at(T->in, nd->pos);
 }
 
 /* ── A tree the emitter builds (part 2, section 13) ──────── */

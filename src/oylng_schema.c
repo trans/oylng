@@ -1098,12 +1098,7 @@ xt *oylng__sctx_root(sctx *S, const char *name, size_t len, bool *found) {
 
 static oylng_mark mark_in(const char *in, size_t len, size_t at) {
     if (at > len) at = len;
-    oylng_mark m = { at, 1, 1 };
-    const char *line = in;
-    for (const char *q = in; q < in + at; q++)
-        if (*q == '\n') { m.line++; line = q + 1; }
-    m.col = (size_t)(in + at - line) + 1;
-    return m;
+    return oylng__mark_at(in, at);
 }
 
 static void schema_fail(oylng_schema *sc, oylng_status st, const char *msg, oylng_mark m) {

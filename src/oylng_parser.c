@@ -315,12 +315,7 @@ typedef struct oylng_parser parser;
 static oylng_mark mark_of(const parser *P, const char *at) {
     if (at < P->in) at = P->in;
     if (at > P->end) at = P->end;
-    oylng_mark m = { (size_t)(at - P->in), 1, 1 };
-    const char *line = P->in;
-    for (const char *q = P->in; q < at; q++)
-        if (*q == '\n') { m.line++; line = q + 1; }
-    m.col = (size_t)(at - line) + 1;
-    return m;
+    return oylng__mark_at(P->in, (size_t)(at - P->in));
 }
 
 #if defined(__GNUC__) || defined(__clang__)
@@ -2437,7 +2432,7 @@ static void tmap_step(parser *P, gframe *f) {
         P->ng--;
         return;
     }
-    if (c == ' ') fail(P, P->p, "the table's entries start at column 0");
+    if (c == ' ') fail(P, P->p, "the table's entries aren't indented");
     if (P->end - P->p >= 3 && memcmp(P->p, "<<:", 3) == 0)
         fail(P, P->p, "<<: belongs inside an entry, not at the top of the table");
     const char *ks = P->p;

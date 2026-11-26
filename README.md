@@ -25,9 +25,11 @@ string. The parser:
   document needs the limit raised;
 - goes to 256 levels, with references followed, or up to 4096 if set;
 - stops at `...` and says where the rest of the input starts;
-- reports errors with a line, a column and a message. A document in error
-  may already have delivered events, but the error comes before its end,
-  so a caller drops what that document gave.
+- reports errors with a line, a column, a byte offset and a message, as
+  part 1, section 2 says: the column counts characters, so a tab counts 1
+  and so does `名`. A document in error may already have delivered events,
+  but the error comes before its end, so a caller drops what that document
+  gave.
 
 ## Using it
 
