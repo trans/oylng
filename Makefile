@@ -32,7 +32,7 @@ SCHEMACHECK ?= $(YAML2)/.ai/memory/schemacheck.py
 
 SAN := -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -fno-omit-frame-pointer
 
-.PHONY: all test test-api test-emit test-schema test-suite test-yes test-plain test-diff test-schema-diff test-pattern-diff test-asan bench bench-files fuzz clean
+.PHONY: all test test-api test-emit test-schema test-suite test-yes test-plain test-diff test-schema-diff test-pattern-diff test-asan bench bench-typed bench-files fuzz clean
 
 all: $(LIB) $(TOOL)
 
@@ -80,6 +80,12 @@ $(OBJDIR)/bench_parser: bench/bench_parser.c bench/bench_gen.h $(LIB)
 
 $(OBJDIR)/bench_files: bench/bench_files.c $(LIB)
 	$(CC) $(OYLNG_CFLAGS) $(BENCH_LIBYAML) $< $(LIB) $(OYLNG_LDFLAGS) $(BENCH_LIBS) -o $@
+
+$(OBJDIR)/bench_typed: bench/bench_typed.c bench/bench_gen.h $(LIB)
+	$(CC) $(OYLNG_CFLAGS) -Ibench $< $(LIB) $(OYLNG_LDFLAGS) -o $@
+
+$(OBJDIR)/bench_typed_mem: bench/bench_typed.c bench/bench_gen.h $(LIB)
+	$(CC) $(OYLNG_CFLAGS) -DMEM -Ibench $< $(LIB) $(OYLNG_LDFLAGS) -o $@
 
 # The library built into each test with AddressSanitizer and UBSan
 $(OBJDIR)/%_asan: test/%.c $(SRCS) $(HDRS) tools/events.h | $(OBJDIR)
@@ -161,6 +167,11 @@ test-pattern-diff: $(OBJDIR)/rx_batch
 # Pinned to one core if BENCH_CPU is set: make bench BENCH_CPU=5
 bench: $(OBJDIR)/bench_parser
 	$(if $(BENCH_CPU),taskset -c $(BENCH_CPU)) $(OBJDIR)/bench_parser
+
+# Typed reading (part 2): speed, pinned if BENCH_CPU is set, then memory
+bench-typed: $(OBJDIR)/bench_typed $(OBJDIR)/bench_typed_mem
+	$(if $(BENCH_CPU),taskset -c $(BENCH_CPU)) $(OBJDIR)/bench_typed
+	$(OBJDIR)/bench_typed_mem
 
 # Real files, each directory of FILES a group: make bench-files FILES='dir1 dir2'
 bench-files: $(OBJDIR)/bench_files

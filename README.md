@@ -399,6 +399,11 @@ or later.
 - `make bench` times the parser on generated inputs, then the inputs read
   and written again by the emitter. If pkg-config finds libyaml, it times
   libyaml on the same inputs, too. Set `BENCH_CPU=` to pin it to one core.
+- `make bench-typed` times typed reading (part 2) on the same inputs, each
+  with the schema an application would give for it, against events and
+  trees of the same text, in turn: typed with no schema, by the schema,
+  and with code bound to the item type. Then it gives each way's peak heap.
+  `BENCH_CPU=` pins the timing.
 - `make bench-files FILES='DIR ...'` times the parser on real files: each
   directory is a group, and every `.yaml` and `.yml` file under it is read
   as 2.0, with `%YAML 2.0` in front (and `---` where the file doesn't start

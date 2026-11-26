@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **`make bench-typed`** times typed reading on the generated inputs, each
+  with the schema an application would give for it, against events and
+  trees of the same text, typed with no schema, by the schema, and with
+  code bound to the item type, and gives each way's peak heap.
 - **A column counts characters** (part 1, section 2, yaml2 `5f55845`).
   `oylng_mark`'s `col`, from a parser's error, a schema's error or
   `oylng_node_mark`, counts characters from 1 where it counted bytes, so a
