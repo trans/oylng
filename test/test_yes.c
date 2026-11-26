@@ -20,7 +20,12 @@
  * A test with bind binds each name in it (oylng_parser_bind, section 12)
  * to code that notes the name and makes no object; accepted, the names
  * noted in the stream must be calls, in order. A refused test's calls may
- * differ between parsers, so only its refusal is checked.
+ * differ between parsers, so only its refusal is checked. Each accepted
+ * document is also written again from its typed events (emit, below),
+ * each name in bind bound to the emitter too (oylng_emitter_bind), its code
+ * writing what writes.json says for the name, else what it was given
+ * (section 13); read back with the same names bound, the document must
+ * give the calls it gave when read.
  *
  * Skipped, and counted: together, which part 2's suite has no test of
  * and this harness doesn't set; holds other than its
@@ -85,10 +90,13 @@ static bool store_lookup(void *ctx, oylng_str address, oylng_str sha256, oylng_s
 }
 
 /* A name in bind: its code notes the name and makes no object, so the
- * typed events are what they'd be with nothing bound (section 12) */
+ * typed events are what they'd be with nothing bound (section 12). Bound
+ * to an emitter, its code writes writes, the JSON writes.json has for the
+ * name, or if there's none, the value it was given. */
 typedef struct {
-    char   *name;
-    strbuf *calls;
+    char       *name;
+    strbuf     *calls;
+    const char *writes;
 } bound;
 
 static const char *note(void *ctx, oylng_typed *t, oylng_value v, void **object) {
@@ -106,6 +114,149 @@ static char *line(const char *dir, const char *name) {
     char *s = slurp(dir, name, NULL);
     if (s) s[strcspn(s, "\n")] = '\0';
     return s;
+}
+
+/* writes.json (suite/yes/README.md): JSON, read here as far as the suite
+ * needs it, and written as section 13's bound code would write it */
+static void json_ws(const char **p) {
+    while (**p == ' ' || **p == '\t' || **p == '\n' || **p == '\r') (*p)++;
+}
+
+static bool json_hex4(const char *s, unsigned long *c) {
+    *c = 0;
+    for (int i = 0; i < 4; i++) {
+        char h = s[i];
+        int d = h >= '0' && h <= '9' ? h - '0' : h >= 'a' && h <= 'f' ? h - 'a' + 10 : h >= 'A' && h <= 'F' ? h - 'A' + 10 : -1;
+        if (d < 0) return false;
+        *c = *c << 4 | (unsigned long)d;
+    }
+    return true;
+}
+
+static void sb_utf8(strbuf *b, unsigned long c) {
+    char u[4];
+    size_t n = c < 0x80 ? 1 : c < 0x800 ? 2 : c < 0x10000 ? 3 : 4;
+    if (n == 1) u[0] = (char)c;
+    else {
+        for (size_t i = n - 1; i > 0; i--, c >>= 6) u[i] = (char)(0x80 | (c & 0x3F));
+        u[0] = (char)((n == 2 ? 0xC0 : n == 3 ? 0xE0 : 0xF0) | c);
+    }
+    sb_add(b, u, n);
+}
+
+/* The JSON string at *p, decoded into b; false if it isn't one */
+static bool json_string(const char **p, strbuf *b) {
+    const char *s = *p;
+    if (*s++ != '"') return false;
+    sb_add(b, "", 0);
+    while (*s != '"') {
+        if (!*s) return false;
+        if (*s != '\\') {
+            sb_add(b, s++, 1);
+            continue;
+        }
+        unsigned long c, lo;
+        const char *named = strchr("\"\\/bfnrt", *++s);
+        if (*s && named) {
+            sb_add(b, &"\"\\/\b\f\n\r\t"[named - "\"\\/bfnrt"], 1);
+            s++;
+        } else if (*s == 'u' && json_hex4(s + 1, &c)) {
+            s += 5;
+            if (c >= 0xDC00 && c < 0xE000) return false;
+            if (c >= 0xD800 && c < 0xDC00) {
+                if (s[0] != '\\' || s[1] != 'u' || !json_hex4(s + 2, &lo) || lo < 0xDC00 || lo >= 0xE000) return false;
+                c = 0x10000 + ((c - 0xD800) << 10) + (lo - 0xDC00);
+                s += 6;
+            }
+            sb_utf8(b, c);
+        } else return false;
+    }
+    *p = s + 1;
+    return true;
+}
+
+/* The JSON value at *p, written with e, or with e NULL only read: a
+ * string as a scalar's text, spelled so; an object as a mapping and an
+ * array as a sequence; a number as an int, or with a fraction or an
+ * exponent as a float; true, false and null as they are. OYLNG_ERR_INPUT
+ * if it isn't JSON as the suite writes it */
+static oylng_status json_write(oylng_emitter *e, const char **p) {
+    json_ws(p);
+    const char *s = *p;
+    if (*s == '"') {
+        strbuf b = { 0 };
+        oylng_status st = json_string(p, &b) ? e ? oylng_emit_scalar(e, (oylng_str){ b.data, b.len }) : OYLNG_OK
+                                              : OYLNG_ERR_INPUT;
+        free(b.data);
+        return st;
+    }
+    if (*s == '{' || *s == '[') {
+        bool map = *s == '{';
+        oylng_status st = !e ? OYLNG_OK : map ? oylng_emit_map_start(e, false) : oylng_emit_seq_start(e, false);
+        *p = s + 1;
+        json_ws(p);
+        bool more = **p != (map ? '}' : ']');
+        while (more && st == OYLNG_OK) {
+            json_ws(p);
+            if (map && **p != '"') return OYLNG_ERR_INPUT;
+            if (map && (st = json_write(e, p)) != OYLNG_OK) return st;   /* the key */
+            json_ws(p);
+            if (map && *(*p)++ != ':') return OYLNG_ERR_INPUT;
+            if ((st = json_write(e, p)) != OYLNG_OK) return st;
+            json_ws(p);
+            more = **p == ',';
+            if (!more && **p != (map ? '}' : ']')) return OYLNG_ERR_INPUT;
+            if (more) (*p)++;
+        }
+        if (st != OYLNG_OK) return st;
+        (*p)++;
+        return !e ? OYLNG_OK : map ? oylng_emit_map_end(e) : oylng_emit_seq_end(e);
+    }
+    if (!strncmp(s, "true", 4) || !strncmp(s, "false", 5)) {
+        *p = s + (*s == 't' ? 4 : 5);
+        return e ? oylng_emit_bool(e, *s == 't') : OYLNG_OK;
+    }
+    if (!strncmp(s, "null", 4)) {
+        *p = s + 4;
+        return e ? oylng_emit_null(e) : OYLNG_OK;
+    }
+    if (*s != '-' && !(*s >= '0' && *s <= '9')) return OYLNG_ERR_INPUT;
+    size_t n = strspn(s, "-+0123456789.eE");
+    char *end;
+    if (memchr(s, '.', n) || memchr(s, 'e', n) || memchr(s, 'E', n)) {
+        double d = strtod(s, &end);
+        *p = end;
+        return e ? oylng_emit_float(e, d) : OYLNG_OK;
+    }
+    long long i = strtoll(s, &end, 10);
+    *p = end;
+    return e ? oylng_emit_int(e, i) : OYLNG_OK;
+}
+
+/* writes.json, an object whose keys are names in bind: each name's writes
+ * set to where its value starts. False if it is anything else */
+static bool read_writes(const char *s, bound *names, size_t n) {
+    json_ws(&s);
+    if (*s++ != '{') return false;
+    json_ws(&s);
+    if (*s == '}') return true;
+    for (;;) {
+        strbuf k = { 0 };
+        json_ws(&s);
+        bool ok = json_string(&s, &k);
+        json_ws(&s);
+        ok = ok && *s++ == ':';
+        json_ws(&s);
+        size_t i = 0;
+        while (ok && i < n && strcmp(names[i].name, k.data)) i++;
+        free(k.data);
+        if (!ok || i == n) return false;
+        names[i].writes = s;
+        if (json_write(NULL, &s) != OYLNG_OK) return false;
+        json_ws(&s);
+        if (*s != ',') return *s == '}';
+        s++;
+    }
 }
 
 static void ev(strbuf *b, const char *head, const char *s, size_t n) {
@@ -434,9 +585,40 @@ static oylng_status write_node(oylng_emitter *e, const oylng_tree *t, oylng_node
     return st;
 }
 
+/* The names bound to the emitter, while from_events writes */
+static const bound *wnames;
+static size_t nwnames;
+
+/* A value given to the code bound for it */
+typedef struct {
+    const oylng_typed *y;
+    oylng_value        v;
+} valref;
+
+static oylng_status write_alone(oylng_emitter *e, const oylng_typed *y, oylng_value v, bool self);
+
+/* The code bound to a name in bind, as the emitter's: it writes what
+ * writes.json says for the name, else what it was given */
+static const char *rewrite(void *ctx, oylng_emitter *e, const void *object) {
+    const bound *b = ctx;
+    const valref *r = object;
+    const char *p = b->writes;
+    oylng_status st = p ? json_write(e, &p) : write_alone(e, r->y, r->v, true);
+    return st == OYLNG_OK ? NULL : "its code couldn't write it";
+}
+
 /* Value v from its typed event alone: its type and value, and a string's
- * text */
-static oylng_status write_alone(oylng_emitter *e, const oylng_typed *y, oylng_value v) {
+ * text; through the code bound for it where its bound name is bound to the
+ * emitter, unless self, when that code is writing it */
+static oylng_status write_alone(oylng_emitter *e, const oylng_typed *y, oylng_value v, bool self) {
+    if (!self && nwnames) {
+        oylng_str nm = oylng_value_bound(y, v);
+        for (size_t i = 0; nm.data && i < nwnames; i++)
+            if (strlen(wnames[i].name) == nm.len && !memcmp(wnames[i].name, nm.data, nm.len)) {
+                valref r = { y, v };
+                return oylng_emit_object(e, nm, &r);
+            }
+    }
     oylng_type ty = oylng_value_type(y, v);
     switch (ty) {
     case OYLNG_T_ANY: return write_node(e, oylng_typed_tree(y), oylng_value_node(y, v));
@@ -468,8 +650,8 @@ static oylng_status write_alone(oylng_emitter *e, const oylng_typed *y, oylng_va
         for (size_t i = 0; i < c && st == OYLNG_OK; i++) {
             if (map) {
                 st = oylng_emit_scalar(e, oylng_value_key(y, v, i));
-                if (st == OYLNG_OK) st = write_alone(e, y, oylng_value_at(y, v, i));
-            } else st = write_alone(e, y, oylng_value_item(y, v, i));
+                if (st == OYLNG_OK) st = write_alone(e, y, oylng_value_at(y, v, i), false);
+            } else st = write_alone(e, y, oylng_value_item(y, v, i), false);
         }
         if (st == OYLNG_OK) st = map ? oylng_emit_map_end(e) : oylng_emit_seq_end(e);
         return st;
@@ -478,12 +660,16 @@ static oylng_status write_alone(oylng_emitter *e, const oylng_typed *y, oylng_va
     }
 }
 
-/* Document number k of the stream (tables not counted), typed as y: NULL
- * if it is written and reads back the same, with *refused set if the
- * emitter refused it, else why not */
+/* Document number k of the stream (tables not counted), typed as y, with
+ * the nnames names of bind bound, calls the names its code noted: NULL if
+ * it is written and reads back the same, and with the names bound gives
+ * those calls again, with *refused set if the emitter refused it, else why
+ * not */
+static int ebound;
+
 static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oylng_schema *app, bool cut, uint64_t lim,
-                               const char *in, size_t len, size_t k, const char *dir, bool *refused, char *why,
-                               size_t whyn) {
+                               const char *in, size_t len, size_t k, const char *dir, const bound *names,
+                               size_t nnames, const char *calls, bool *refused, char *why, size_t whyn) {
     oylng_str name = oylng_tree_name(oylng_typed_tree(y));
     oylng_schema *own = NULL;
     const oylng_schema *sc = NULL;
@@ -545,13 +731,18 @@ static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oyl
     strbuf want = { 0 };
     time_fields = true;
     typed_events(&want, y, oylng_typed_root(y), cut);
+    wnames = names;
+    nwnames = nnames;
     for (int flow = 0; flow < 2 && !res && !*refused; flow++) {
         oylng_emitter *e = oylng_emitter_new();
         oylng_emitter_set_flow(e, flow);
         oylng_emitter_set_schema(e, sc);
-        oylng_status st = oylng_emit_stream_start(e);
+        oylng_status st = OYLNG_OK;
+        for (size_t j = 0; j < nnames && st == OYLNG_OK; j++)
+            st = oylng_emitter_bind(e, (oylng_str){ names[j].name, strlen(names[j].name) }, rewrite, (void *)&names[j]);
+        if (st == OYLNG_OK) st = oylng_emit_stream_start(e);
         if (st == OYLNG_OK) st = oylng_emit_doc_start(e, name);
-        if (st == OYLNG_OK) st = write_alone(e, y, oylng_typed_root(y));
+        if (st == OYLNG_OK) st = write_alone(e, y, oylng_typed_root(y), false);
         if (st == OYLNG_OK) st = oylng_emit_doc_end(e);
         if (st == OYLNG_OK) st = oylng_emit_stream_end(e);
         oylng_str out = oylng_emitter_output(e);
@@ -579,6 +770,15 @@ static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oyl
             store stb = { .last = NULL };
             snprintf(stb.dir, sizeof stb.dir, "%s/store", dir);
             if (has(dir, "store")) oylng_parser_set_lookup(p, store_lookup, &stb);
+            /* the same names bound, noting into backcalls */
+            strbuf backcalls = { 0 };
+            sb_add(&backcalls, "", 0);
+            bound rb[64];
+            for (size_t j = 0; j < nnames; j++) {
+                rb[j] = names[j];
+                rb[j].calls = &backcalls;
+                oylng_parser_bind(p, (oylng_str){ rb[j].name, strlen(rb[j].name) }, note, NULL, &rb[j]);
+            }
             oylng_typed *back = NULL, *last = NULL;
             while ((st = oylng_parse_typed(p, app, &back)) == OYLNG_OK && back) {
                 oylng_typed_free(last);
@@ -595,7 +795,12 @@ static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oyl
                 snprintf(why, whyn, "written %s from its events, it reads back otherwise:\n%.*s--- want\n%s--- got\n%s",
                          how, shown, s.data, want.data, got.data);
                 res = why;
+            } else if (nnames && strcmp(backcalls.data, calls)) {
+                snprintf(why, whyn, "written %s from its events, it reads back with other calls:\n%.*s--- want\n%s--- got\n%s",
+                         how, shown, s.data, calls, backcalls.data);
+                res = why;
             }
+            free(backcalls.data);
             free(got.data);
             oylng_typed_free(last);
             oylng_parser_free(p);
@@ -604,11 +809,16 @@ static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oyl
         }
         oylng_emitter_free(e);
     }
+    wnames = NULL;
+    nwnames = 0;
     time_fields = false;
     free(want.data);
     free(pre.data);
     oylng_schema_free(own);
-    if (!res && !*refused) etrips++;
+    if (!res && !*refused) {
+        etrips++;
+        if (nnames) ebound++;
+    }
     return res;
 }
 
@@ -645,9 +855,11 @@ static void run(const char *dir) {
         size_t n = strcspn(s, "\n");
         bool more = s[n] != '\0';
         s[n] = '\0';
-        if (n) names[nnames++] = (bound){ s, &noted };
+        if (n) names[nnames++] = (bound){ s, &noted, NULL };
         s += n + more;
     }
+    char *writes = slurp(dir, "writes.json", NULL);
+    bool writes_ok = !writes || read_writes(writes, names, nnames);
 
     const char *err = NULL, *why = NULL;
     bool schema_err = false, typed_limit = false;
@@ -659,6 +871,11 @@ static void run(const char *dir) {
     store st = { .last = NULL };
     snprintf(st.dir, sizeof st.dir, "%s/store", dir);
     if (limit && !lim) { skip_zero++; goto done; }   /* the library's 0 is the default */
+    if (!writes_ok) {
+        failed++;
+        printf("FAIL %s (%s): its writes.json isn't an object of names in bind\n", dir, name ? name : "?");
+        goto done;
+    }
     if (schema) {
         app = oylng_schema_new(schema, slen, root ? (oylng_str){ root, strlen(root) } : (oylng_str){ NULL, 0 }, lim);
         if (oylng_schema_status(app) != OYLNG_OK) {
@@ -683,6 +900,7 @@ static void run(const char *dir) {
         sb_str(&got, "+STR\n");
         for (;;) {
             oylng_typed *y;
+            size_t called = noted.len;   /* where this document's calls start */
             oylng_status st = oylng_parse_typed(p, app, &y);
             if (st != OYLNG_OK) {
                 err = oylng_parser_error(p);
@@ -703,7 +921,8 @@ static void run(const char *dir) {
             }
             if (!want_error && !ewhy && !keep) {
                 bool r = false;
-                if (from_events(p, y, app, cut, lim, in, len, docno, dir, &r, edetail, sizeof edetail))
+                if (from_events(p, y, app, cut, lim, in, len, docno, dir, names, nnames, noted.data + called, &r,
+                                edetail, sizeof edetail))
                     ewhy = "written from its events:";
                 else if (r) {
                     refused_here = true;
@@ -773,6 +992,7 @@ done:
     free(bind);
     free(calls);
     free(emit);
+    free(writes);
     free(noted.data);
 }
 
@@ -819,8 +1039,8 @@ int main(int argc, char **argv) {
            passed, failed, published, kept, binding, skip_together, skip_holds, skip_zero, paths);
     printf("yes: %d typed documents written again read back the same (%d with published names not tried)\n", trips,
            trips_skipped);
-    printf("yes: %d written from their typed events alone read back the same, %d tests refused as emit says"
-           " (%d with published names not tried)\n",
-           etrips, erefusals, etrips_skipped);
+    printf("yes: %d written from their typed events alone read back the same, %d of them through bound code with"
+           " the same calls; %d tests refused as emit says (%d with published names not tried)\n",
+           etrips, ebound, erefusals, etrips_skipped);
     return failed ? 1 : 0;
 }

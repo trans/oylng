@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **What bound code writes, against the suite** (part 2, section 13,
+  yaml2 `v0.2.2`): part 2's 8 tests with `writes` now run, and pass. Each
+  name a test binds is bound to the emitter too, its code writing what
+  `writes` says. The emitter refuses a document where what the code wrote
+  doesn't read back through the bound name, even as the same value: `5`
+  from `signed`'s code under `{!|: [!small, !signed]}` reads back as the
+  int 5, but through `small`, so it is refused. Read back with the names
+  bound, each document gives the calls it gave when read. The engine
+  already did all this; only the test harness changed.
 - **`make bench-typed`** times typed reading on the generated inputs, each
   with the schema an application would give for it, against events and
   trees of the same text, typed with no schema, by the schema, and with
