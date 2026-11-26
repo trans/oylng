@@ -320,13 +320,13 @@ bool         oylng__tree_set_str(oylng_tree *t, oylng_node n, const char *s, siz
 oylng_status oylng__emitter_fail(oylng_emitter *e, oylng_status st, const char *msg);
 
 /* What the emitter gives the typer, to choose how each string a schema
- * types is written (part 2, section 13): its spelling k, from 0 on, false
- * when there is none left; NULL if value v of t, node read with that
+ * types is written (part 2, section 13): its spelling k, from 0 on, as
+ * the value of an optional key if opt, false when there is none left; NULL if value v of t, node read with that
  * spelling, or a collection as typed, is what was given, else why not;
  * and what was given, for a message */
 typedef struct {
     void *ctx;
-    bool (*next)(void *ctx, uint32_t node, unsigned k, oylng_str *text, bool *plain);
+    bool (*next)(void *ctx, uint32_t node, unsigned k, bool opt, oylng_str *text, bool *plain);
     const char *(*fits)(void *ctx, uint32_t node, const struct oylng_typed *t, uint32_t v);
     void (*desc)(void *ctx, uint32_t node, char *buf, size_t n);
 } oylng__speller;

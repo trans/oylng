@@ -298,10 +298,17 @@ the output so far, so a large stream needn't be held whole.
 With a schema (part 2, section 13), the emitter writes typed data so that
 the same schema reads it back unchanged. `oylng_emitter_set_schema` holds
 each document until it ends, types it as a parser would, and writes each
-scalar in the first spelling that reads back as what it was given: a
-string quoted where its type would read it plain as something else, a
-number as its type reads it. A document with a value it can't write so is
-refused, with the path to the value, and none of it is written.
+scalar so that it reads back as what it was given: a string plain, or
+quoted where its type would read it plain as something else or refuse it.
+A number, a boolean, null or a time has one spelling, its standard one: a
+float in the fewest digits that read back, with `.0` where it has no
+fraction (`2.0`) and a signed exponent past 1e21 (`1e+21`); null as
+`null`, or no value under an optional key (`retries:`). A value written
+again with `oylng_emit_value` may also take the text it was read from.
+Nothing else is tried: 5 under `!signed` below is refused, as `5` doesn't
+match its pattern, and an application that wants `+5` writes it with its
+own code (`oylng_emit_object`). A document with a value it can't write so
+is refused, with the path to the value, and none of it is written.
 
 ```c
 const char *app = "%YAML 2.0\n--- &\nsigned: !int(/[-+][0-9]+/)\nrow:\n  id: {!|: [!int, !str]}\n  at: !signed\n";
@@ -312,7 +319,7 @@ oylng_emit_map_start(em, false);
 oylng_emit_scalar(em, (oylng_str){ "id", 2 });
 oylng_emit_scalar(em, (oylng_str){ "3", 1 });       /* a string: id: '3' */
 oylng_emit_scalar(em, (oylng_str){ "at", 2 });
-oylng_emit_int(em, 5);                              /* at: +5 */
+oylng_emit_int(em, -5);                             /* at: -5; a 5 would refuse it */
 oylng_emit_map_end(em);
 oylng_emit_doc_end(em);                             /* written now, or refused */
 ```
@@ -322,7 +329,8 @@ and `oylng_emit_object` give a bound type its way back: the application's
 code writes its object as the value its entry takes, and the emitter
 checks that it reads back with that bound name, the names bound to the
 emitter taken as bound, so that a parser with the same bindings gets it
-from that name's code.
+from that name's code. Under `!any`, where nothing is typed, an object is
+written through its code and reads back as the data that wrote.
 
 The `oylng` tool prints a stream's events, the stream as JSON, or the
 stream written again, with its references and merges resolved:
@@ -357,7 +365,11 @@ or later.
   read with references kept, and only its acceptance or refusal is
   compared, as the suite says. A test with `bind` binds each name in it
   to code that notes the name, and an accepted one's names noted must be
-  its `calls`, in order. It skips times held otherwise than the
+  its `calls`, in order. Each accepted test's documents are also written
+  again from their typed events alone, as its `emit` says: after the
+  stream's table documents, read back the same, or refused where it says
+  `emit: refused` (which `test/suite-emit.py` marks, as `suite-to-data`
+  doesn't yet). It skips times held otherwise than the
   engine holds them. Then
   `make test-plain` runs them all again, built without SIMD and without the
   fast paths for flow collections on one line and simple block lines, so

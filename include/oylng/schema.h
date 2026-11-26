@@ -261,13 +261,19 @@ OYLNG_API void *oylng_value_take(oylng_typed *t, oylng_value v);
  *  document is held until it ends, and the output stops short of it till
  *  then. It is typed with s, as the parser would type it, and each scalar
  *  is written in the first of its spellings that reads back as given. A
- *  string is plain, else quoted. A number is in its standard spelling,
- *  then with a +, then with zeros before its digits, and for a float after
- *  its point too, as a pattern may ask (section 4.5), so 5 under `!signed`
- *  is +5. Null is null, ~, or empty. What reads back is a value of the
- *  type given, the same value, and for an object, of its named type; an
- *  integer may read as OYLNG_T_INT or OYLNG_T_BIGINT. Where s doesn't type
- *  a value (OYLNG_T_ANY), any value reads back. If one doesn't, or the
+ *  string is plain, else quoted, as is one whose plain spelling would
+ *  refuse the document (`1e999` under `{!|: [!float, !str]}`). A number, a
+ *  boolean, null or a time has its standard spelling alone (section 13): a
+ *  float in the fewest significant digits, positional from 1e-7 to below
+ *  1e21 with .0 where it has no fraction, else with a signed exponent
+ *  (2.0, 1e+21); null is null, or no value under an optional key. A value
+ *  written by oylng_emit_value may also take the text it was read from,
+ *  if that reads back where the standard spelling doesn't, so 5 under
+ *  `!signed` is refused, but a +5 read there is written +5. What reads
+ *  back is a value of the type given, the same value, and for an object,
+ *  of its named type; an integer may read as OYLNG_T_INT or
+ *  OYLNG_T_BIGINT. Where s doesn't type a value (OYLNG_T_ANY), any value
+ *  reads back, an object as what its code wrote. If one doesn't, or the
  *  document doesn't fit s, the document is refused, OYLNG_ERR_EMIT with
  *  the path to the value, and none of it is written. @p s must have a
  *  root, else OYLNG_ERR_INPUT, and outlive its use; NULL, the default, for
@@ -312,7 +318,12 @@ OYLNG_API oylng_status oylng_emitter_bind(oylng_emitter *e, oylng_str name, oyln
  *  value, where a node goes. With a schema, it must read back with that
  *  bound name (oylng_value_bound), the names bound to this emitter taken
  *  as bound, so that a parser with the same bindings gets it from that
- *  name's code, or the document is refused. OYLNG_ERR_INPUT if nothing is bound to
+ *  name's code, or the document is refused; but where the schema types
+ *  nothing (`!any`), it reads back as the data its code wrote. Code that
+ *  writes the object as one string (oylng_emit_scalar) gives its spelling,
+ *  which need only read back with the bound name, so code bound to
+ *  `signed` may write a 5 as +5, which its standard spelling can't be
+ *  (section 13). OYLNG_ERR_INPUT if nothing is bound to
  *  the name, and the emitter is as it was. */
 OYLNG_API oylng_status oylng_emit_object(oylng_emitter *e, oylng_str name, const void *object);
 

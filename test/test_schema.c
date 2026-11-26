@@ -1139,6 +1139,16 @@ static const char *unbind_point(void *ctx, oylng_emitter *e, const void *o) {
     return NULL;
 }
 
+/* A point's x as a signed number, in the spelling the code chose: +1 */
+static const char *unbind_signed(void *ctx, oylng_emitter *e, const void *o) {
+    const pt *p = o;
+    char b[24];
+    (void)ctx;
+    snprintf(b, sizeof b, "%+d", p->x);
+    oylng_emit_scalar(e, (oylng_str){ b, strlen(b) });
+    return NULL;
+}
+
 /* A typed value in short: s3 i5 I5 f0.5 d19.99 btrue n D2001-02-03
  * T(as written) x(hex) A(untyped, as written) {k:v,...} [v,...], an entry's
  * name after an @ */
@@ -1230,6 +1240,7 @@ static emitted emit_doc(const char *yaml, const char *root, const char *script, 
     if (sc) oylng_emitter_set_schema(e, sc);
     oylng_emitter_bind(e, S("point"), unbind_point, NULL);
     oylng_emitter_bind(e, S("sweep"), unbind_point, NULL);   /* written as a point */
+    oylng_emitter_bind(e, S("signed"), unbind_signed, NULL);
     oylng_status st = oylng_emit_stream_start(e);
     if (st == OYLNG_OK) st = oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
     char w[200];
@@ -1306,6 +1317,99 @@ static emitted emit_doc(const char *yaml, const char *root, const char *script, 
               "%s: [%d] %s\n%s", script, r_.st, r_.err, r_.out);                                             \
     } while (0)
 
+/* Floats written under !float (section 4.4): each finite double reads
+ * back with its bits, in the fewest significant digits that do, as the C
+ * library finds them; positional, with a point, for 0 and from 1e-7 to
+ * below 1e21, else with an exponent and its sign. Raw bits, decimals of
+ * up to 17 digits from 1e-30 to 1e30, and values next to the bounds, the
+ * same every run. */
+static uint64_t mix(uint64_t *x) {
+    uint64_t z = (*x += 0x9E3779B97F4A7C15u);
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9u;
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EBu;
+    return z ^ (z >> 31);
+}
+
+static void float_spellings(void) {
+    const char *yaml = "%YAML 2.0\n--- &\nf: !float\n";
+    oylng_schema *sc = oylng_schema_new(yaml, strlen(yaml), S("f"), 0);
+    uint64_t x = 1;
+    int bad = 0, tried = 0;
+    char first[200] = "";
+    for (int i = 0; i < 60000; i++) {
+        double f;
+        uint64_t r = mix(&x);
+        if (i % 3 == 0) {
+            memcpy(&f, &r, sizeof f);
+            if (!isfinite(f)) continue;
+        } else if (i % 3 == 1) {
+            char d[48];
+            snprintf(d, sizeof d, "%s%llue%d", r & 1 ? "-" : "", (unsigned long long)(r >> 8) % 100000000000000000ull,
+                     (int)((r >> 1) % 61) - 30);
+            f = strtod(d, NULL);
+        } else {
+            /* a positive double's bits count up with it */
+            double b = (r & 1) ? 1e-7 : 1e21;
+            uint64_t bits;
+            memcpy(&bits, &b, sizeof bits);
+            bits += (uint64_t)((int64_t)((r >> 1) % 9) - 4);
+            memcpy(&f, &bits, sizeof f);
+            if (r & 2) f = -f;
+        }
+        tried++;
+        oylng_emitter *e = oylng_emitter_new();
+        oylng_emitter_set_schema(e, sc);
+        oylng_status st = oylng_emit_stream_start(e);
+        if (st == OYLNG_OK) st = oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+        if (st == OYLNG_OK) st = oylng_emit_float(e, f);
+        if (st == OYLNG_OK) st = oylng_emit_doc_end(e);
+        oylng_str out = oylng_emitter_output(e);
+        char text[80] = "";
+        const char *at = out.data ? strstr(out.data, "--- ") : NULL;
+        if (at) snprintf(text, sizeof text, "%.*s", (int)strcspn(at + 4, "\n"), at + 4);
+        const char *why = NULL;
+        double g = NAN;
+        if (st != OYLNG_OK) why = oylng_emitter_error(e);
+        else {
+            oylng_parser *p = oylng_parser_new(out.data, out.len);
+            oylng_typed *y = NULL;
+            if (oylng_parse_typed(p, sc, &y) == OYLNG_OK && y && oylng_value_type(y, oylng_typed_root(y)) == OYLNG_T_FLOAT)
+                g = oylng_value_float(y, oylng_typed_root(y));
+            oylng_typed_free(y);
+            oylng_parser_free(p);
+            const char *ex = strchr(text, 'e');
+            bool positional = f == 0 || (fabs(f) >= 1e-7 && fabs(f) < 1e21);
+            /* its significant digits, and the fewest the C library needs:
+               zeros before the point of a whole number hold places, and its
+               .0 marks it a float, but any other zero at the end is a digit */
+            char dig[64];
+            size_t nd = 0;
+            const char *pt = strchr(text, '.');
+            bool whole = !ex && pt && !strcmp(pt, ".0");
+            for (const char *q = text; *q && q != ex && !(whole && q == pt); q++)
+                if (*q >= '0' && *q <= '9' && nd < sizeof dig) dig[nd++] = *q;
+            size_t lo = 0;
+            while (lo < nd && dig[lo] == '0') lo++;
+            if (whole)
+                while (nd > lo && dig[nd - 1] == '0') nd--;
+            int need = 1;
+            for (; f != 0 && need < 17; need++) {
+                char c[48];
+                snprintf(c, sizeof c, "%.*e", need - 1, f);
+                if (strtod(c, NULL) == f) break;
+            }
+            if (memcmp(&f, &g, sizeof f)) why = "it reads back otherwise";
+            else if (positional && (ex || !strchr(text, '.'))) why = "not positional with a point";
+            else if (!positional && (!ex || (ex[1] != '+' && ex[1] != '-'))) why = "no signed exponent";
+            else if (f != 0 && (int)(nd - lo) > need) why = "more digits than it needs";
+        }
+        if (why && !bad++) snprintf(first, sizeof first, "%.17g written %s: %s", f, text, why);
+        oylng_emitter_free(e);
+    }
+    CHECK(!bad && tried > 50000, "%d of %d floats: first %s", bad, tried, first);
+    oylng_schema_free(sc);
+}
+
 static void emitting(void) {
     /* section 13: a string the type would read as something else is quoted */
     const char *u = "n: {!|: [!int, !str]}\n";
@@ -1313,19 +1417,32 @@ static void emitting(void) {
     WRITES(u, "n", "i:3", false, "--- 3\n", "i3@n");
     WRITES(u, "n", "s:abc", false, "--- abc\n", "sabc@n");
     REFUSES(u, "n", "f:1.5", false, "/: no spelling of the float 1.5 reads back: written 1.5, it reads as !str");
+    /* and one whose plain spelling would refuse the document: 1e999 is a
+       float too large (yaml2 8b774fc) */
+    WRITES("n: {!|: [!float, !str]}\n", "n", "s:1e999", false, "--- '1e999'\n", "s1e999@n");
+    /* 5 fits {!|: [!signed, !str]} only as the string "5", so it's refused
+       (yaml2 340fe27) */
+    REFUSES("signed: !int(/[-+][0-9]+/)\nn: {!|: [!signed, !str]}\n", "n", "i:5", false,
+            "/: no spelling of the integer 5 reads back: written 5, it reads as !str");
 
-    /* and an integer is written as the type reads it, or refused */
+    /* a number in its standard spelling alone, which a pattern must match,
+       else refused: no +, no zeros added (section 13, yaml2 54fcd63) */
     const char *sg = "signed: !int(/[-+][0-9]+/)\noffsets: [!signed, ...]\n";
-    WRITES(sg, "offsets", "[ i:5 i:-3 i:0 ]", false, "- +5\n- -3\n- +0\n", "[i5@signed,i-3@signed,i0@signed]@offsets");
-    WRITES(sg, "offsets", "[ i:5 i:-3 ]", true, "[+5, -3]", "[i5@signed,i-3@signed]@offsets");
-    REFUSES(sg, "offsets", "[ i:5 s:5 ]", false, "/1: no spelling of the string '5' reads back: written 5, '5' does not match");
-    WRITES("p: !int(/[0-9]{4}/)\n", "p", "i:7", false, "--- 0007\n", "i7@p");
+    WRITES(sg, "offsets", "[ i:-3 i:-10 ]", false, "- -3\n- -10\n", "[i-3@signed,i-10@signed]@offsets");
+    WRITES(sg, "offsets", "[ i:-3 i:-10 ]", true, "[-3, -10]", "[i-3@signed,i-10@signed]@offsets");
+    REFUSES(sg, "offsets", "[ i:-3 i:5 ]", false, "/1: no spelling of the integer 5 reads back: written 5, '5' does not match");
+    REFUSES(sg, "offsets", "[ i:0 ]", false, "/0: no spelling of the integer 0 reads back: written 0, '0' does not match");
+    REFUSES(sg, "offsets", "[ i:-5 s:5 ]", false, "/1: no spelling of the string '5' reads back: written 5, '5' does not match");
+    REFUSES("p: !int(/[0-9]{4}/)\n", "p", "i:7", false, "/: no spelling of the integer 7 reads back: written 7, '7' does not match");
+    WRITES("p: !int(/[0-9]{4}/)\n", "p", "i:1234", false, "--- 1234\n", "i1234@p");
     REFUSES("p: !int(/[0-9]{4}/)\n", "p", "i:12345", false, "no spelling of the integer 12345");
-    WRITES("p: !bigint(/[+][0-9]+/)\n", "p", "B:123456789012345678901234567890", false,
-           "+123456789012345678901234567890", "I123456789012345678901234567890@p");
+    REFUSES("p: !bigint(/[+][0-9]+/)\n", "p", "B:123456789012345678901234567890", false,
+            "no spelling of the integer 123456789012345678901234567890 reads back");
 
-    /* a float in the fewest digits, then with zeros and a point as a
-       pattern asks; a decimal as written, so 19.9 isn't 19.90 */
+    /* a float in the fewest significant digits, positionally from 1e-7 to
+       below 1e21 with .0 where it has no fraction, else with an exponent
+       and its sign (section 4.4); a decimal as written, so 19.9 isn't
+       19.90; and a pattern must match that spelling, or it's refused */
     const char *it = "cents: !decimal(/[0-9]+\\.[0-9]{2}/)\nnone: !null(/(~|null)?/)\n"
                      "item:\n  price: !cents\n  ratio: !float(/[0-9]*\\.[0-9]+/)\n  note: {!|: [!none, !str]}\n";
     WRITES(it, "item", "{ s:price D:19.99 s:ratio f:1 s:note n }", false, "price: 19.99\nratio: 1.0\nnote: null\n",
@@ -1334,12 +1451,15 @@ static void emitting(void) {
            "{price:d0.50@cents,ratio:f0.5,note:snull}@item");
     REFUSES(it, "item", "{ s:price D:19.9 s:ratio f:1 s:note n }", false,
             "/price: no spelling of the decimal 19.9 reads back: written 19.9, '19.9' does not match");
-    WRITES("c: !float(/[0-9]+\\.[0-9]{2}/)\n", "c", "f:19.9", false, "--- 19.90\n", "f19.899999999999999@c");
-    WRITES("c: !float(/\\.[0-9]+/)\n", "c", "f:0.25", false, "--- .25\n", "f0.25@c");
-    WRITES("c: !decimal(/[0-9]+\\./)\n", "c", "D:12", false, "--- 12.\n", "d12@c");
-    WRITES("c: [!float, ...]\n", "c", "[[ f:1e21 f:1e-7 f:1e-8 f:-0 f:123456.789 f:5e-324 ]", false,
-           "[1e21, 0.0000001, 1e-8, -0, 123456.789, 5e-324]",
-           "[f1e+21,f9.9999999999999995e-08,f1e-08,f-0,f123456.789,f4.9406564584124654e-324]@c");
+    REFUSES("c: !float(/[0-9]+\\.[0-9]{2}/)\n", "c", "f:19.9", false,
+            "/: no spelling of the float 19.9 reads back: written 19.9, '19.9' does not match");
+    WRITES("c: !float(/[0-9]+\\.[0-9]{2}/)\n", "c", "f:19.25", false, "--- 19.25\n", "f19.25@c");
+    REFUSES("c: !float(/\\.[0-9]+/)\n", "c", "f:0.25", false, "no spelling of the float 0.25 reads back");
+    REFUSES("c: !decimal(/[0-9]+\\./)\n", "c", "D:12", false, "no spelling of the decimal 12 reads back");
+    WRITES("c: [!float, ...]\n", "c", "[[ f:1e21 f:1e-7 f:1e-8 f:-0 f:123456.789 f:5e-324 f:2 f:1e20 f:-1.5e300 ]", false,
+           "[1e+21, 0.0000001, 1e-8, -0.0, 123456.789, 5e-324, 2.0, 100000000000000000000.0, -1.5e+300]",
+           "[f1e+21,f9.9999999999999995e-08,f1e-08,f-0,f123456.789,f4.9406564584124654e-324,f2,f1e+20,"
+           "f-1.5000000000000001e+300]@c");
     WRITES("c: {!|: [!int, !float]}\n", "c", "f:2", false, "--- 2.0\n", "f2@c");
     REFUSES(NULL, NULL, "f:inf", false, "a float that isn't finite");
     REFUSES(NULL, NULL, "B:007", false, "'007' isn't an integer in the standard spelling");
@@ -1351,13 +1471,15 @@ static void emitting(void) {
     WRITES("k: !int\n", "k", "u:18446744073709551615", false, "--- 18446744073709551615\n", "i18446744073709551615@k");
     REFUSES("k: !int\n", "k", "B:18446744073709551616", false, "no spelling of the integer 18446744073709551616");
 
-    /* null: null, ~ or empty, where empty reads back */
+    /* null: no value under an optional key, which always reads back as
+       null there, and null anywhere else (section 13, yaml2 340fe27) */
     const char *m = "m: {a?: !int, b?: !str, c: !null, d?: !null(/~/), e?: [!null(/(-)?/), ...]}\n";
-    WRITES(m, "m", "{ s:a n s:b n s:c n s:d n s:e [ n n ] }", false, "a:\nb:\nc: null\nd: ~\ne:\n  -\n  -\n",
-           "{a:n,b:n,c:n,d:n,e:[n,n]}@m");
+    WRITES(m, "m", "{ s:a n s:b n s:c n s:d n }", false, "a:\nb:\nc: null\nd:\n", "{a:n,b:n,c:n,d:n}@m");
     WRITES(m, "m", "{ s:a n s:b n s:c n }", true, "{a:, b:, c: null}", "{a:n,b:n,c:n}@m");
     REFUSES(m, "m", "{ s:c n s:e [[ n ] }", false, "/e/0: no spelling of null reads back: written null, 'null' does not match");
-    WRITES("r: !null(/(-)?/)\n", "r", "n", false, "---\n", "n@r");
+    REFUSES(m, "m", "{ s:c n s:e [ n ] }", false, "/e/0: no spelling of null reads back: written null, 'null' does not match");
+    REFUSES("r: !null(/(-)?/)\n", "r", "n", false, "/: no spelling of null reads back: written null, 'null' does not match");
+    WRITES("r: {!|: [!null, !str]}\n", "r", "n", false, "--- null\n", "n@r");
     WRITES("r: {!|: [!null(/(-)?/), !str]}\n", "r", "s:", false, "--- \"\"\n", "s@r");
 
     /* a string where its type is another: quoted if that reads it back */
@@ -1395,7 +1517,10 @@ static void emitting(void) {
     WRITES(sh, "shapes", "[ o:point { s:target i:3 } ]", false, "- x: 1\n  y: 2\n- target: 3\n",
            "[{x:i1,y:i2}@point,{target:i3}@sweep]@shapes");
     REFUSES(sh, "shapes", "[ o:sweep ]", false, "/0: written as a sweep object, it reads as a point");
-    REFUSES(sh, "w", "{ s:a [ o:point ] }", false, "/a: it reads as untyped, and a point object is in it");
+    /* under !any, an object is written through its code and reads back as
+       what that wrote, as 3 reads back as "3" (section 13, yaml2 b40c6f5) */
+    WRITES(sh, "w", "{ s:a [ o:point ] }", false, "a:\n  - x: 1\n    y: 2\n", "{a:A[]}@w");
+    WRITES(sh, "w", "{ s:a o:point }", true, "{a: {x: 1, y: 2}}", "{a:A{}}@w");
     WRITES(sh, "w", "{ s:a i:1 s:b o:point }", false, "a: 1\nb:\n  x: 1", "{a:A1,b:{x:i1,y:i2}@point}@w");
     REFUSES(sh, "q", "o:point", false, "/: written as a point object, it reads as a q");
     /* names in a chain: with sweep: !point, both bound here, a value where
@@ -1405,6 +1530,15 @@ static void emitting(void) {
     WRITES(ch, "r", "[ o:sweep ]", false, "- x: 1\n  y: 2\n", "[{x:i1,y:i2}@point]@r");
     REFUSES(ch, "r", "[ o:point ]", false, "/0: written as a point object, it reads as a sweep");
     REFUSES(sh, "shapes", "[ o!point ]", false, "a point object: it has no x");
+    /* an object its code writes as one string is spelled so, and need only
+       read back with its name: code bound to signed writes 1 as +1, which
+       its standard spelling can't be (section 13) */
+    const char *sn = "signed: !int(/[-+][0-9]+/)\nrow: {at: !signed}\nloose: {at: !str}\n";
+    WRITES(sn, "row", "{ s:at o:signed }", false, "at: +1\n", "{at:i1@signed}@row");
+    WRITES(sn, "row", "{ s:at o:signed }", true, "{at: +1}", "{at:i1@signed}@row");
+    REFUSES(sn, "row", "{ s:at i:1 }", false, "/at: no spelling of the integer 1 reads back");
+    REFUSES(sn, "loose", "{ s:at o:signed }", false,
+            "/at: no spelling of the string '+1' reads back: written +1, written as a signed object, it reads as no named type");
     REFUSES(sh, "shapes", "[ o2point ]", false, "the code bound to point wrote more than one value");
     {
         oylng_emitter *e = oylng_emitter_new();
@@ -1701,8 +1835,8 @@ static void kept_typing(void) {
         /* a value is the last line's to have it, where a line names a
            mapping met before: x 1 in c, 2 in d; and in a type, !str */
         "%YAML 2.0\n--- &\na: {x: 1, y: 0}\nb: {z: 4, x: 2}\nc: {<<: *a, <<: *b, <<: *a}\nm: {!*: !int}\n--- !m\n*c\n",
-        "%YAML 2.0\n--- &\na: {x: 1, y: 0}\nb: {z: 4, x: 2}\nc: {<<: *a, <<: *b, <<: *a}\nd: {<<: *c, <<: *b, q: 3}\n"
-        "m: {!*: !int}\n--- !m\n*d\n",
+        ("%YAML 2.0\n--- &\na: {x: 1, y: 0}\nb: {z: 4, x: 2}\nc: {<<: *a, <<: *b, <<: *a}\nd: {<<: *c, <<: *b, q: 3}\n"
+         "m: {!*: !int}\n--- !m\n*d\n"),
         "%YAML 2.0\n--- &\na: {x: !int}\nb: {x: !str}\nt: {<<: *a, <<: *b}\n--- !t\nx: abc\n",
         "%YAML 2.0\n--- &\na: {x: !int}\nb: {x: !str}\nc: {<<: *b, <<: *a}\nt: {<<: *a, <<: *c}\n--- !t\nx: 5\n",
     };
@@ -2202,6 +2336,7 @@ static void api(void) {
     ignored_stamps();
     bindings();
     emitting();
+    float_spellings();
     emitting_more();
     kept_typing();
     scalar_type_keys();

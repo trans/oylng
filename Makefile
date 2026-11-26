@@ -104,10 +104,11 @@ test-suite: $(OBJDIR)/test_suite $(SUITE_DATA)
 	$(OBJDIR)/test_suite $(SUITE_DATA)
 
 # Part 2's suite, suite/yes
-$(YES_DATA): $(wildcard $(SUITE)/yes/src/*.yaml) | $(OBJDIR)
+$(YES_DATA): $(wildcard $(SUITE)/yes/src/*.yaml) test/suite-emit.py | $(OBJDIR)
 	@test -d $(SUITE)/yes/src || { echo "no part 2 suite at $(SUITE)/yes: set SUITE=path/to/yaml2/suite"; exit 1; }
 	rm -rf $@
 	python3 -I $(SUITE)/bin/suite-to-data $(SUITE)/yes/src $@
+	python3 -I test/suite-emit.py $(SUITE)/yes/src $@
 
 test-yes: $(OBJDIR)/test_yes $(YES_DATA)
 	$(OBJDIR)/test_yes $(YES_DATA)

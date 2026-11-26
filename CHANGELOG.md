@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- **Typed emitting as section 13 now rules** (yaml2 `54fcd63`, `340fe27`,
+  `8b774fc`, `b40c6f5`). A number, a boolean, null or a time has one
+  spelling, its standard one. The emitter no longer tries a `+`, zeros
+  before or after the digits, `.5`, `1.`, `~` or an empty value to fit a
+  pattern, so 5 under `!int(/[-+][0-9]+/)` and 7 under
+  `!int(/[0-9]{4}/)` are now refused, `OYLNG_ERR_EMIT`. A value written
+  again with `oylng_emit_value` may still take the text it was read from,
+  so a `+5` read there is written `+5`.
+  - A float is written in the fewest significant digits, with `.0` where
+    it has no fraction (`2.0`, `-0.0`) and a signed exponent outside 1e-7
+    to below 1e21 (`1e+21`, `5e-324`).
+  - Null under an optional key is written as no value (`retries:`), and
+    `null` elsewhere.
+  - An object under `!any` is written through its code, and reads back as
+    the data that wrote, where it was refused.
+  - Code bound with `oylng_emitter_bind` that writes its object as one
+    string gives that object's spelling, which need only read back with
+    the bound name. So code bound to `signed` may write a 5 as `+5`.
+  - Against the suite at yaml2's `v0.2.0`, each accepted test's documents
+    are written again from their typed events alone and read back the
+    same, and the 22 marked `emit: refused` are refused.
 - **Typing with references kept** (part 2, section 11): `oylng_parse_typed`
   now types a document read with `oylng_parser_set_keep`, where it was
   `OYLNG_ERR_INPUT`. The limit applies to held, and to typed, which counts

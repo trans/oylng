@@ -369,6 +369,249 @@ static const char *again(oylng_parser *rp, const oylng_typed *y, const oylng_sch
     return res;
 }
 
+/* The suite's emit (suite/yes/README.md): each typed document written
+ * again from its typed events alone, with none of the text it was read
+ * from, by the typed calls, under the schema that typed it, after the
+ * table documents that come before it in the stream, as written there;
+ * and read back with the test's schema and settings, it gives the same
+ * typed events. A time is compared by its fields, as written again its
+ * standard spelling may differ from the text (`t` for `T`). The suite
+ * doesn't fix how it's laid out or quoted, so it is read back with no
+ * limit, which the test's may be set too close to allow that. */
+static int etrips, etrips_skipped, erefusals;
+
+/* in.yaml's documents: where each starts, at its --- line, and ends, and
+ * whether it is a table document (--- &); and where the first starts */
+typedef struct {
+    size_t at, end;
+    bool   table;
+} span;
+
+static size_t doc_spans(const char *s, size_t n, span **out, size_t *head) {
+    span *sp = NULL;
+    size_t ns = 0, cap = 0;
+    bool open = false;
+    *head = n;
+    for (size_t i = 0; i < n;) {
+        size_t e = i;
+        while (e < n && s[e] != '\n') e++;
+        size_t ll = e - i;
+        bool marker = ll >= 3 && (ll == 3 || s[i + 3] == ' ' || s[i + 3] == '\t' || s[i + 3] == '\r');
+        bool start = marker && !memcmp(s + i, "---", 3), stop = marker && !memcmp(s + i, "...", 3);
+        if (start) {
+            if (open) sp[ns - 1].end = i;
+            if (ns == cap) sp = realloc(sp, (cap = cap ? cap * 2 : 8) * sizeof *sp);
+            size_t j = i + 3;
+            while (j < e && (s[j] == ' ' || s[j] == '\t')) j++;
+            bool table = j < e && s[j] == '&' && (j + 1 == e || s[j + 1] == ' ' || s[j + 1] == '\t' ||
+                                                  s[j + 1] == '\r' || s[j + 1] == '#');
+            sp[ns++] = (span){ i, n, table };
+            if (*head == n) *head = i;
+            open = true;
+        } else if (stop && open) {
+            sp[ns - 1].end = e < n ? e + 1 : e;
+            open = false;
+        }
+        i = e < n ? e + 1 : e;
+    }
+    *out = sp;
+    return ns;
+}
+
+static oylng_status write_node(oylng_emitter *e, const oylng_tree *t, oylng_node n) {
+    oylng_kind k = oylng_node_kind(t, n);
+    if (k == OYLNG_NODE_STRING) return oylng_emit_scalar(e, oylng_node_text(t, n));
+    bool map = k == OYLNG_NODE_MAPPING;
+    oylng_status st = map ? oylng_emit_map_start(e, false) : oylng_emit_seq_start(e, false);
+    size_t c = oylng_node_count(t, n);
+    for (size_t i = 0; i < c && st == OYLNG_OK; i++) {
+        if (map) {
+            st = write_node(e, t, oylng_node_key(t, n, i));
+            if (st == OYLNG_OK) st = write_node(e, t, oylng_node_value(t, n, i));
+        } else st = write_node(e, t, oylng_node_item(t, n, i));
+    }
+    if (st == OYLNG_OK) st = map ? oylng_emit_map_end(e) : oylng_emit_seq_end(e);
+    return st;
+}
+
+/* Value v from its typed event alone: its type and value, and a string's
+ * text */
+static oylng_status write_alone(oylng_emitter *e, const oylng_typed *y, oylng_value v) {
+    oylng_type ty = oylng_value_type(y, v);
+    switch (ty) {
+    case OYLNG_T_ANY: return write_node(e, oylng_typed_tree(y), oylng_value_node(y, v));
+    case OYLNG_T_STR: return oylng_emit_scalar(e, oylng_value_text(y, v));
+    case OYLNG_T_INT: {
+        int64_t i;
+        uint64_t u = 0;
+        if (oylng_value_int(y, v, &i)) return oylng_emit_int(e, i);
+        oylng_value_uint(y, v, &u);
+        return oylng_emit_uint(e, u);
+    }
+    case OYLNG_T_BIGINT:
+    case OYLNG_T_DECIMAL: return oylng_emit_number(e, ty, oylng_value_text(y, v));
+    case OYLNG_T_FLOAT: return oylng_emit_float(e, oylng_value_float(y, v));
+    case OYLNG_T_BOOL: return oylng_emit_bool(e, oylng_value_bool(y, v));
+    case OYLNG_T_NULL: return oylng_emit_null(e);
+    case OYLNG_T_DATE:
+    case OYLNG_T_DATETIME: {
+        oylng_datetime d;
+        oylng_value_datetime(y, v, &d);
+        return oylng_emit_datetime(e, ty, &d);
+    }
+    case OYLNG_T_BINARY: return oylng_emit_bytes(e, oylng_value_bytes(y, v));
+    case OYLNG_T_SEQUENCE:
+    case OYLNG_T_MAPPING: {
+        bool map = ty == OYLNG_T_MAPPING;
+        oylng_status st = map ? oylng_emit_map_start(e, false) : oylng_emit_seq_start(e, false);
+        size_t c = oylng_value_count(y, v);
+        for (size_t i = 0; i < c && st == OYLNG_OK; i++) {
+            if (map) {
+                st = oylng_emit_scalar(e, oylng_value_key(y, v, i));
+                if (st == OYLNG_OK) st = write_alone(e, y, oylng_value_at(y, v, i));
+            } else st = write_alone(e, y, oylng_value_item(y, v, i));
+        }
+        if (st == OYLNG_OK) st = map ? oylng_emit_map_end(e) : oylng_emit_seq_end(e);
+        return st;
+    }
+    default: return OYLNG_ERR_INPUT;
+    }
+}
+
+/* Document number k of the stream (tables not counted), typed as y: NULL
+ * if it is written and reads back the same, with *refused set if the
+ * emitter refused it, else why not */
+static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oylng_schema *app, bool cut, uint64_t lim,
+                               const char *in, size_t len, size_t k, const char *dir, bool *refused, char *why,
+                               size_t whyn) {
+    oylng_str name = oylng_tree_name(oylng_typed_tree(y));
+    oylng_schema *own = NULL;
+    const oylng_schema *sc = NULL;
+    switch (oylng_typed_how(y)) {
+    case OYLNG_TYPED_APP: sc = app; break;
+    case OYLNG_TYPED_STAMP: {
+        oylng_tree *tt;
+        if (oylng_parser_table(rp, &tt) != OYLNG_OK || !tt) {
+            snprintf(why, whyn, "its table can't be had");
+            return why;
+        }
+        strbuf tx = { 0 };
+        sb_str(&tx, "%YAML 2.0\n--- &\n");
+        table_text(&tx, tt, oylng_tree_root(tt), 0);
+        oylng_tree_free(tt);
+        sc = own = oylng_schema_new(tx.data, tx.len, name, lim);
+        free(tx.data);
+        if (oylng_schema_status(own) != OYLNG_OK) {
+            snprintf(why, whyn, "its schema: %s", oylng_schema_error(own));
+            oylng_schema_free(own);
+            return why;
+        }
+        break;
+    }
+    case OYLNG_TYPED_PUBLISHED: etrips_skipped++; return NULL;
+    default: break;
+    }
+
+    /* the table documents before document k, as written */
+    span *sp;
+    size_t head, ns = doc_spans(in, len, &sp, &head), seen = 0, i;
+    /* a first document with no ---: text before the first that isn't a
+       directive, a comment or blank */
+    bool bare = false;
+    for (size_t j = 0; j < head && !bare;) {
+        size_t e = j;
+        while (e < head && in[e] != '\n') e++;
+        size_t a = j;
+        while (a < e && (in[a] == ' ' || in[a] == '\t' || in[a] == '\r')) a++;
+        if (a < e && in[a] != '#' && !(a == j && in[a] == '%')) bare = true;
+        j = e + 1;
+    }
+    if (bare) seen = 1;
+    strbuf pre = { 0 };
+    for (i = 0; i < ns && !(bare && !k); i++) {
+        if (!sp[i].table && seen++ == k) break;
+        if (sp[i].table) {
+            if (!pre.len) sb_add(&pre, in, head);
+            sb_add(&pre, in + sp[i].at, sp[i].end - sp[i].at);
+        }
+    }
+    free(sp);
+    const char *res = NULL;
+    if (i == ns && !(bare && !k) && (ns || k)) {
+        snprintf(why, whyn, "document %zu isn't in the stream's text", k);
+        res = why;
+    }
+
+    strbuf want = { 0 };
+    time_fields = true;
+    typed_events(&want, y, oylng_typed_root(y), cut);
+    for (int flow = 0; flow < 2 && !res && !*refused; flow++) {
+        oylng_emitter *e = oylng_emitter_new();
+        oylng_emitter_set_flow(e, flow);
+        oylng_emitter_set_schema(e, sc);
+        oylng_status st = oylng_emit_stream_start(e);
+        if (st == OYLNG_OK) st = oylng_emit_doc_start(e, name);
+        if (st == OYLNG_OK) st = write_alone(e, y, oylng_typed_root(y));
+        if (st == OYLNG_OK) st = oylng_emit_doc_end(e);
+        if (st == OYLNG_OK) st = oylng_emit_stream_end(e);
+        oylng_str out = oylng_emitter_output(e);
+        const char *how = flow ? "in flow" : "in block";
+        if (st == OYLNG_ERR_EMIT) {
+            *refused = true;
+            snprintf(why, whyn, "written %s from its events, refused: %s", how, oylng_emitter_error(e));
+        } else if (st != OYLNG_OK) {
+            snprintf(why, whyn, "written %s from its events: %s", how, oylng_emitter_error(e));
+            res = why;
+        } else {
+            /* after the tables, which carry the stream's %YAML line */
+            strbuf s = { 0 };
+            sb_add(&s, pre.data ? pre.data : "", pre.len);
+            const char *body = out.data;
+            size_t blen = out.len;
+            if (pre.len && blen >= 10 && !memcmp(body, "%YAML 2.0\n", 10)) {
+                body += 10;
+                blen -= 10;
+            }
+            sb_add(&s, body, blen);
+            oylng_parser *p = oylng_parser_new(s.data, s.len);
+            oylng_parser_set_limit(p, UINT64_MAX);
+            oylng_parser_set_cut(p, cut);
+            store stb = { .last = NULL };
+            snprintf(stb.dir, sizeof stb.dir, "%s/store", dir);
+            if (has(dir, "store")) oylng_parser_set_lookup(p, store_lookup, &stb);
+            oylng_typed *back = NULL, *last = NULL;
+            while ((st = oylng_parse_typed(p, app, &back)) == OYLNG_OK && back) {
+                oylng_typed_free(last);
+                last = back;
+            }
+            strbuf got = { 0 };
+            if (last) typed_events(&got, last, oylng_typed_root(last), cut);
+            int shown = (int)(s.len > 2000 ? 2000 : s.len);
+            if (st != OYLNG_OK || !last) {
+                snprintf(why, whyn, "written %s from its events, it doesn't read: %s\n%.*s", how,
+                         st ? oylng_parser_error(p) : "no document", shown, s.data);
+                res = why;
+            } else if (!same_events(got.data, want.data)) {
+                snprintf(why, whyn, "written %s from its events, it reads back otherwise:\n%.*s--- want\n%s--- got\n%s",
+                         how, shown, s.data, want.data, got.data);
+                res = why;
+            }
+            free(got.data);
+            oylng_typed_free(last);
+            oylng_parser_free(p);
+            free(stb.last);
+            free(s.data);
+        }
+        oylng_emitter_free(e);
+    }
+    time_fields = false;
+    free(want.data);
+    free(pre.data);
+    oylng_schema_free(own);
+    if (!res && !*refused) etrips++;
+    return res;
+}
+
 static void run(const char *dir) {
     if (has(dir, "together")) { skip_together++; return; }
     /* with keep, read with references kept, and only accepted or refused */
@@ -386,6 +629,11 @@ static void run(const char *dir) {
     char *refused = line(dir, "refused");
     char *at = line(dir, "at");
     bool want_error = has(dir, "error"), cut = has(dir, "cut");
+    char *emit = line(dir, "emit");
+    bool emit_refused = emit && !strcmp(emit, "refused"), refused_here = false;
+    char edetail[8192] = "";
+    const char *ewhy = NULL;
+    size_t docno = 0;
     char *want = want_error ? NULL : slurp(dir, "typed.event", NULL);
     char *bind = slurp(dir, "bind", NULL), *calls = slurp(dir, "calls", NULL);
     uint64_t lim = limit ? strtoull(limit, NULL, 10) : 0;
@@ -453,6 +701,16 @@ static void run(const char *dir) {
                 if (again(p, y, app, cut, lim, detail, sizeof detail)) why = "written again:";
                 else trips++;
             }
+            if (!want_error && !ewhy && !keep) {
+                bool r = false;
+                if (from_events(p, y, app, cut, lim, in, len, docno, dir, &r, edetail, sizeof edetail))
+                    ewhy = "written from its events:";
+                else if (r) {
+                    refused_here = true;
+                    if (!emit_refused) ewhy = "written from its events:";
+                }
+            }
+            docno++;
             oylng_typed_free(y);
         }
         sb_str(&got, "-STR\n");
@@ -478,6 +736,11 @@ static void run(const char *dir) {
         why = "refused";
         snprintf(detail, sizeof detail, "%zu:%zu: %s", m.line, m.col, err);
     } else if (!keep && (!want || !same_events(got.data, want))) why = "wrong events";
+    else if (ewhy) {
+        why = ewhy;
+        snprintf(detail, sizeof detail, "%s", edetail);
+    } else if (emit_refused && !refused_here) why = "written from its events, not refused (emit: refused)";
+    else if (emit_refused) erefusals++;
     else if (nnames && strcmp(noted.data, calls ? calls : "")) {
         /* a refused test's calls may differ between parsers: only an accepted one's are checked */
         why = "wrong calls";
@@ -509,6 +772,7 @@ done:
     free(holds);
     free(bind);
     free(calls);
+    free(emit);
     free(noted.data);
 }
 
@@ -555,5 +819,8 @@ int main(int argc, char **argv) {
            passed, failed, published, kept, binding, skip_together, skip_holds, skip_zero, paths);
     printf("yes: %d typed documents written again read back the same (%d with published names not tried)\n", trips,
            trips_skipped);
+    printf("yes: %d written from their typed events alone read back the same, %d tests refused as emit says"
+           " (%d with published names not tried)\n",
+           etrips, erefusals, etrips_skipped);
     return failed ? 1 : 0;
 }

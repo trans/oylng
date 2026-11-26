@@ -608,12 +608,12 @@ static bool can_plain(const char *s, size_t n, const place *pl) {
 }
 
 /* Spelling i of a value of type want whose standard spelling is t, n
- * long: 1, with it in *out; 0 past the last; -1 if spelling i is none.
- * A number's spellings are in an order: its sign, its form, the zeros
- * after its point and those before its digits, the first changing
- * fastest. */
-static int raw_spelling(oylng_emitter *E, uint8_t want, const char *t, size_t n, unsigned i, oylng_str *out,
-                        bool *plain) {
+ * long, as an optional key's value if opt: 1, with it in *out; 0 past
+ * the last; -1 if spelling i is none. A string, a date, a time or bytes
+ * is plain, then quoted. Anything else has its standard spelling alone
+ * (section 13), and null is null, or no value under an optional key,
+ * which always reads back as null there. */
+static int raw_spelling(uint8_t want, const char *t, size_t n, unsigned i, bool opt, oylng_str *out, bool *plain) {
     *plain = true;
     switch (want) {
     case OYLNG_T_STR:
@@ -625,57 +625,15 @@ static int raw_spelling(oylng_emitter *E, uint8_t want, const char *t, size_t n,
         *out = (oylng_str){ t, n };
         *plain = i == 0;
         return 1;
-    case OYLNG_T_BOOL:
+    case OYLNG_T_NULL:
+        if (i) return 0;
+        *out = opt ? (oylng_str){ "", 0 } : (oylng_str){ "null", 4 };
+        return 1;
+    default:
         if (i) return 0;
         *out = (oylng_str){ t, n };
         return 1;
-    case OYLNG_T_NULL: {
-        static const char *const nulls[] = { "null", "~", "" };
-        if (i > 2) return 0;
-        *out = (oylng_str){ nulls[i], strlen(nulls[i]) };
-        return 1;
     }
-    default:
-        break;
-    }
-    bool neg = n && t[0] == '-';
-    const char *ib = t + neg, *end = t + n, *ie = ib;
-    while (ie < end && *ie >= '0' && *ie <= '9') ie++;
-    const char *fb = ie, *fe = ie;
-    if (fe < end && *fe == '.') {
-        fb = ++fe;
-        while (fe < end && *fe >= '0' && *fe <= '9') fe++;
-    }
-    const char *xb = fe;   /* the exponent, from its e */
-    bool real = want == OYLNG_T_FLOAT || want == OYLNG_T_DECIMAL;
-    unsigned ns = neg ? 1 : 2, nf = real ? 3 : 1, nt = want == OYLNG_T_FLOAT ? 21 : 1;
-    unsigned sgn = i % ns, form = i / ns % nf, tz = i / ns / nf % nt, z = i / ns / nf / nt;
-    if (z > 20) return 0;
-    bool frac = fe > fb, exp = xb < end;
-    /* form 1 is .5 for 0.5, form 2 is 1. for 1 */
-    if ((form == 1 && !(ie - ib == 1 && *ib == '0' && frac)) || (form == 2 && (frac || exp || tz)) ||
-        (tz && exp))
-        return -1;
-    if (!grow(E, (void **)&E->cb, &E->ccap, n + 48, 1)) return 0;
-    char *o = E->cb;
-    size_t k = 0;
-    if (neg) o[k++] = '-';
-    else if (sgn) o[k++] = '+';
-    memset(o + k, '0', z);
-    k += z;
-    if (form != 1) {
-        memcpy(o + k, ib, (size_t)(ie - ib));
-        k += (size_t)(ie - ib);
-    }
-    if (frac || tz || form == 2) o[k++] = '.';
-    memcpy(o + k, fb, (size_t)(fe - fb));
-    k += (size_t)(fe - fb);
-    memset(o + k, '0', tz);
-    k += tz;
-    memcpy(o + k, xb, (size_t)(end - xb));
-    k += (size_t)(end - xb);
-    *out = (oylng_str){ o, k };
-    return 1;
 }
 
 static bool str_is(oylng_str a, const char *s, size_t n) {
@@ -687,10 +645,10 @@ static bool writable(oylng_str s, bool plain, const place *pl, bool empty) {
 }
 
 /* The first spelling of a value that reads back written here */
-static void first_spelling(oylng_emitter *E, uint8_t want, const char *t, size_t n, const place *pl, bool empty,
-                           oylng_str *out, bool *plain) {
+static void first_spelling(uint8_t want, const char *t, size_t n, const place *pl, bool empty, oylng_str *out,
+                           bool *plain) {
     for (unsigned i = 0;; i++) {
-        int got = raw_spelling(E, want, t, n, i, out, plain);
+        int got = raw_spelling(want, t, n, i, false, out, plain);
         if (got > 0 && writable(*out, *plain, pl, empty)) return;
         if (!got) break;
     }
@@ -698,25 +656,29 @@ static void first_spelling(oylng_emitter *E, uint8_t want, const char *t, size_t
     *plain = false;
 }
 
-/* Spelling i of record r: the standard one, then how it was written where
- * it was read, if it was, which reads back there, then the others */
-static int spelling(oylng_emitter *E, const erec *r, const oylng__tnew *t, unsigned i, oylng_str *out, bool *plain) {
+/* Spelling i of record r, as an optional key's value if opt: the
+ * standard one; then the text it was read from, where it was read and
+ * the application kept that, by writing a typed document again (section
+ * 13); then, for a string, a date, a time or bytes, quoted */
+static int spelling(const oylng_emitter *E, const erec *r, const oylng__tnew *t, unsigned i, bool opt,
+                    oylng_str *out, bool *plain) {
+    const char *std = E->tb + t->off;
     if (r->hint != SIZE_MAX && i) {
-        if (i > 1) return raw_spelling(E, r->want, E->tb + t->off, t->len, i - 1, out, plain);
+        if (i > 1) return raw_spelling(r->want, std, t->len, i - 1, opt, out, plain);
         *out = (oylng_str){ E->tb + r->hint, r->hlen };
         *plain = r->hplain;
         oylng_str first;
         bool fp;
-        if (raw_spelling(E, r->want, E->tb + t->off, t->len, 0, &first, &fp) > 0 && fp == *plain &&
+        if (raw_spelling(r->want, std, t->len, 0, opt, &first, &fp) > 0 && fp == *plain &&
             str_is(first, out->data, out->len))
             return -1;   /* the same */
         return 1;
     }
-    return raw_spelling(E, r->want, E->tb + t->off, t->len, i, out, plain);
+    return raw_spelling(r->want, std, t->len, i, opt, out, plain);
 }
 
 /* For the typer (oylng__speller) */
-static bool next_spelling(void *ctx, uint32_t node, unsigned k, oylng_str *out, bool *plain) {
+static bool next_spelling(void *ctx, uint32_t node, unsigned k, bool opt, oylng_str *out, bool *plain) {
     oylng_emitter *E = ctx;
     if (!k || node != E->cnode) {
         E->cnode = node;
@@ -726,7 +688,7 @@ static bool next_spelling(void *ctx, uint32_t node, unsigned k, oylng_str *out, 
     const oylng__tnew *t = &E->tn[node];
     place pl = { NULL, r->flow, false, false, -1 };
     for (;;) {
-        int got = spelling(E, r, t, E->craw++, out, plain);
+        int got = spelling(E, r, t, E->craw++, opt, out, plain);
         if (!got) return false;
         if (got > 0 && writable(*out, *plain, &pl, r->empty)) return true;
     }
@@ -750,15 +712,14 @@ static const char *fits(void *ctx, uint32_t node, const oylng_typed *Y, uint32_t
     oylng_type ty = oylng_value_type(Y, v);
     char *why = E->why;   /* read before the next call */
     bool ok = true;
-    if (t->kind != OYLNG_NODE_STRING) {
-        if (ty == OYLNG_T_ANY)   /* nothing below it is typed, so no object below it reads back */
-            for (uint32_t i = node + 1; i < r->end; i++)
-                if (E->rec[i].name != SIZE_MAX) {
-                    snprintf(why, sizeof E->why, "it reads as untyped, and a %.*s object is in it",
-                             (int)(E->rec[i].nlen > 40 ? 40 : E->rec[i].nlen), E->tb + E->rec[i].name);
-                    return why;
-                }
-    } else if (ty != OYLNG_T_ANY) {
+    /* under !any nothing is typed, so whatever was written reads back as
+       plain data: 3 as "3", an object as what its code wrote (section 13) */
+    if (ty == OYLNG_T_ANY) return NULL;
+    /* an object its code wrote as one string: that text is how it's
+       spelled, so it need only read back with the object's bound name, as
+       code bound to signed may write a 5 as +5 (section 13) */
+    bool spelled = r->name != SIZE_MAX && r->want == OYLNG_T_STR;
+    if (t->kind == OYLNG_NODE_STRING && !spelled) {
         bool ints = (r->want == OYLNG_T_INT || r->want == OYLNG_T_BIGINT) &&
                     (ty == OYLNG_T_INT || ty == OYLNG_T_BIGINT);
         if (ty != r->want && !ints) ok = false;
@@ -867,7 +828,7 @@ static oylng_status typed_out(oylng_emitter *E, uint8_t want, const char *s, siz
     }
     oylng_str c;
     bool plain;
-    first_spelling(E, want, s, n, &pl, empty, &c, &plain);
+    first_spelling(want, s, n, &pl, empty, &c, &plain);
     if (holding(E)) E->tn[E->nrec - 1].plain = plain;
     st = scalar_out(E, c.data, c.len, &pl, plain ? (c.len ? F_PLAIN : F_EMPTY) : F_QUOTED);
     if (st != OYLNG_OK) return st;
@@ -1233,10 +1194,12 @@ oylng_status oylng_emit_uint(oylng_emitter *E, uint64_t v) {
     return typed_out(E, OYLNG_T_INT, b, (size_t)n, NULL);
 }
 
-/* f, which is finite, in the fewest digits that read back as it:
- * positional from 1e-7 to below 1e21, else with an exponent, as JSON's
- * writers have it. The digits are found by printf, whatever the locale's
- * point, and read back by the parser's own reader. */
+/* f, which is finite, in the fewest significant digits that read back as
+ * it (section 4.4): positional for 0 and from 1e-7 to below 1e21, with .0
+ * where it has no fraction, so that it never reads as an integer, else
+ * with an exponent and its sign: 0.1, 2.0, -0.0, 1e+21, 5e-324. The
+ * digits are found by printf, whatever the locale's point, and read back
+ * by the parser's own reader. */
 static size_t float_text(double f, char *out) {
     char buf[48], dig[24] = "0";
     int nd = 1, x = 0;
@@ -1270,14 +1233,14 @@ static size_t float_text(double f, char *out) {
             memcpy(out + k, dig + 1, (size_t)nd - 1);
             k += (size_t)nd - 1;
         }
-        k += (size_t)snprintf(out + k, 16, "e%d", x);
+        k += (size_t)snprintf(out + k, 16, "e%+d", x);
     } else if (x >= 0) {
         for (int i = 0; i <= x; i++) out[k++] = i < nd ? dig[i] : '0';
+        out[k++] = '.';
         if (nd > x + 1) {
-            out[k++] = '.';
             memcpy(out + k, dig + x + 1, (size_t)(nd - x - 1));
             k += (size_t)(nd - x - 1);
-        }
+        } else out[k++] = '0';
     } else {
         out[k++] = '0';
         out[k++] = '.';

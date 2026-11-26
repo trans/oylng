@@ -1053,7 +1053,7 @@ static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope, boo
     for (unsigned k = 0;; k++) {
         oylng_str s;
         bool plain;
-        if (!E->next(E->ctx, node, k, &s, &plain)) {
+        if (!E->next(E->ctx, node, k, opt, &s, &plain)) {
             char what[96];
             E->desc(E->ctx, node, what, sizeof what);
             refuse_as(R, OYLNG_ERR_EMIT, node, "no spelling of %s reads back: written %s, %s", what, first,
