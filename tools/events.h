@@ -3,7 +3,9 @@
  *
  * The suite (trans/yaml2, suite/README.md) follows yaml-test-suite's
  * notation with fewer events: +STR, +DOC (and +DOC !name), +MAP, +SEQ,
- * =VAL :text, and their ends. Shared by the oylng tool and the harness.
+ * =VAL :text, or =VAL "text for a value that isn't plain in a stream
+ * marked quotes or json, and their ends. Shared by the oylng tool and the
+ * harness.
  */
 
 #ifndef OYLNG_EVENTS_H
@@ -82,26 +84,62 @@ static inline void ev_esc(strbuf *b, const char *s, size_t n) {
     }
 }
 
-/* One event, as a line of the suite's test.event */
+/* Where the events written are: whether the document's stream is marked
+ * quotes or json, and, for each collection open, whether it is a mapping
+ * and how many nodes it has had, so that a mapping's key is known. The
+ * events go through ev_line in order, from a document's start. */
+static struct {
+    bool      marked;
+    uint64_t *n;      /* each one's nodes, times 2, plus 1 for a mapping */
+    size_t    depth, cap;
+} ev_at;
+
+static inline void ev_node(void) {
+    if (ev_at.depth) ev_at.n[ev_at.depth - 1] += 2;
+}
+
+static inline void ev_open(bool map) {
+    ev_node();
+    if (ev_at.depth == ev_at.cap) {
+        size_t c = ev_at.cap ? ev_at.cap * 2 : 64;
+        uint64_t *n = realloc(ev_at.n, c * sizeof *n);
+        if (!n) { fputs("out of memory\n", stderr); exit(2); }
+        ev_at.n = n;
+        ev_at.cap = c;
+    }
+    ev_at.n[ev_at.depth++] = map;
+}
+
+/* One event, as a line of the suite's test.event: in a stream marked
+ * quotes or json, a value that isn't plain is =VAL " (suite/README.md) */
 static inline void ev_line(strbuf *b, const oylng_event *e) {
     switch (e->type) {
     case OYLNG_EVT_STREAM_START: sb_str(b, "+STR\n"); break;
     case OYLNG_EVT_STREAM_END:   sb_str(b, "-STR\n"); break;
     case OYLNG_EVT_DOC_START:
+        ev_at.marked = e->word != OYLNG_WORD_NONE;
+        ev_at.depth = 0;
         sb_str(b, "+DOC");
         if (e->value.data) { sb_str(b, " !"); ev_esc(b, e->value.data, e->value.len); }
         sb_str(b, "\n");
         break;
     case OYLNG_EVT_DOC_END:   sb_str(b, "-DOC\n"); break;
-    case OYLNG_EVT_MAP_START: sb_str(b, "+MAP\n"); break;
-    case OYLNG_EVT_MAP_END:   sb_str(b, "-MAP\n"); break;
-    case OYLNG_EVT_SEQ_START: sb_str(b, "+SEQ\n"); break;
-    case OYLNG_EVT_SEQ_END:   sb_str(b, "-SEQ\n"); break;
-    case OYLNG_EVT_SCALAR:
-        sb_str(b, "=VAL :");
+    case OYLNG_EVT_MAP_START: ev_open(true); sb_str(b, "+MAP\n"); break;
+    case OYLNG_EVT_SEQ_START: ev_open(false); sb_str(b, "+SEQ\n"); break;
+    case OYLNG_EVT_MAP_END:
+    case OYLNG_EVT_SEQ_END:
+        if (ev_at.depth) ev_at.depth--;
+        sb_str(b, e->type == OYLNG_EVT_MAP_END ? "-MAP\n" : "-SEQ\n");
+        break;
+    case OYLNG_EVT_SCALAR: {
+        uint64_t n = ev_at.depth ? ev_at.n[ev_at.depth - 1] : 0;
+        bool key = (n & 1) && (n >> 1) % 2 == 0;
+        ev_node();
+        sb_str(b, ev_at.marked && !key && !e->plain ? "=VAL \"" : "=VAL :");
         ev_esc(b, e->value.data, e->value.len);
         sb_str(b, "\n");
         break;
+    }
     default: break;
     }
 }

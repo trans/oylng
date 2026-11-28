@@ -44,7 +44,8 @@ def corpus(suite):
 TOKENS = [' ', '  ', '\t', '\n', '\r\n', '\r', '-', '- ', '-  ', ':', ': ', ':\t', '#', ' #', ' # c',
           '*', '*a', '*a:b', '*<a:b>', '<<: ', '<<: *a', '-<< ', '-<< *s', '[', ']', '{', '}',
           ',', ', ', '"', "'", "''", '|', '|-', '>', '>-', '---', '--- ', '--- &', '--- !n', '...',
-          '!', '&', '%', '%YAML 2.0', '<', '>', '\\', '\\n', '\\u00e9', '\\uD83D\\uDE00', 'é', '中',
+          '!', '&', '%', '%YAML 2.0', '%YAML 2.0 quotes', '%YAML 2.0 json', ' quotes', ' json',
+          '\n...\n%YAML 2.0 quotes\n---\n', '<', '>', '\\', '\\n', '\\u00e9', '\\uD83D\\uDE00', 'é', '中',
           ' ', '\x01', '\x7f', '\x85', '﻿', 'a', 'b', 'key', 'a: 1', '- x', '\n---\n',
           '\n...\n', '\n--- &\n', '\n--- &\na: [x, y]\ns: {k: v}\n---\n', '\n  ', '\n    ', '?', '@',
           '`', '<<', '"<<"', '::', ':::']
@@ -256,7 +257,8 @@ def by_checker(ck, t):
     except Exception as e:
         return ('CRASH', repr(e))
     rest = None if r.stopped is None else r.t[r.stopped:]
-    return ('OK', ck['events'](r.docs), rest)
+    # each document's word, so that a value not plain under one is =VAL "
+    return ('OK', ck['events'](r.docs, getattr(r, 'marks', ())), rest)
 
 def by_engine(batch, texts):
     data = b''.join(struct.pack('<I', len(b)) + b + struct.pack('<I', 0)

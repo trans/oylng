@@ -276,6 +276,11 @@ typedef bool (*oylng__lookup)(void *ctx, oylng_str address, oylng_str sha256, oy
 oylng__lookup oylng__parser_lookup(const oylng_parser *p, void **ctx);
 void        *oylng__parser_pubs(const oylng_parser *p);
 void         oylng__parser_set_pubs(oylng_parser *p, void *pubs, void (*free_fn)(void *));
+/* The standard !json as a schema, made the first time %YAML 2.0 json
+ * reads a document nothing else types (part 2, section 3), which the
+ * parser lets go at its end */
+void        *oylng__parser_json(const oylng_parser *p);
+void         oylng__parser_set_json(oylng_parser *p, void *json, void (*free_fn)(void *));
 /* The application's bindings (part 2, section 12), as oylng_parser_bind
  * gives them: the fn and drop of schema.h's oylng_bind_fn and
  * oylng_drop_fn */
@@ -328,25 +333,34 @@ typedef struct {
 } oylng__tnew;
 /* The tree of the n nodes at nd: OYLNG_ERR_MEMORY or OYLNG_ERR_LIMIT if it
  * can't be made. Its marks are all 0. */
-oylng_status oylng__tree_make(const oylng__tnew *nd, size_t n, const char *text, oylng_tree **out);
+oylng_status oylng__tree_make(const oylng__tnew *nd, size_t n, const char *text, oylng_word word, oylng_tree **out);
 /* String node n written as s, plain or not: false if memory runs out */
 bool         oylng__tree_set_str(oylng_tree *t, oylng_node n, const char *s, size_t len, bool plain);
 
 /* Fails the emitter, as its own errors do (oylng_emitter.c) */
 oylng_status oylng__emitter_fail(oylng_emitter *e, oylng_status st, const char *msg);
 
-/* How a boolean or null is written at a place: its value (0 false, 1
- * true, 2 null) and its text, the first word of its type or its standard
- * spelling (part 2, section 13) */
+/* A text a schema holds, such as a word */
 typedef struct {
-    uint8_t   what;
-    oylng_str text;
+    const char *s;
+    uint32_t    len;
+} oylng__text;
+
+/* How a boolean or null may be written at a place, for an alternative
+ * that takes one: its value (0 false, 1 true, 2 null) and its words in
+ * order, or its standard spelling alone where it has none (part 2,
+ * section 13). The words are its type's own, not copied. */
+typedef struct {
+    uint8_t            what;
+    const oylng__text *words;
+    uint32_t           n;
 } oylng__word;
 enum { OYLNG__FALSE, OYLNG__TRUE, OYLNG__NULL };
 
 /* What the emitter gives the typer, to choose how each string a schema
  * types is written (part 2, section 13): its spelling k, from 0 on, where
- * a boolean or null is written as one of the nw words w, in order, false
+ * a boolean or null is written as one of the words of the nw groups w, in
+ * order, false
  * when there is none left; NULL if value v of t, node read with that
  * spelling, or a collection as typed, is what was given, else why not;
  * and what was given, for a message */

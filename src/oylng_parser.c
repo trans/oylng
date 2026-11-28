@@ -184,6 +184,7 @@ struct oylng_parser {
     bool     in_key;     /* reading a key, whose text is kept until its mapping closes */
     bool     defer;      /* reading an entry's key: check the limit after */
     bool     any_doc;    /* a marker has been read */
+    uint8_t  word;       /* oylng_word: the last %YAML 2.0 line's (section 4.1) */
     bool     keep;       /* references kept: the limit is on held alone (section 10) */
     bool     together;   /* every document kept: sizes add up (section 10) */
     unsigned depth;      /* collections open, as written */
@@ -273,6 +274,8 @@ struct oylng_parser {
     void         *lookup_ctx;
     void         *pubs;
     void        (*pubs_free)(void *);
+    void         *json;
+    void        (*json_free)(void *);
     bool          dotted;
 
     /* for the typed reader: the application's bindings (section 12) */
@@ -555,12 +558,42 @@ static bool line_is(const parser *P, const char *q, const char *m) {
 static bool marker(const parser *P) { return line_is(P, P->p, "---"); }
 static bool dots(const parser *P)   { return line_is(P, P->p, "..."); }
 
+/* A space, a tab, a break or the end at q */
+static inline bool sep_at(const parser *P, const char *q) {
+    return q >= P->end || *q == ' ' || *q == '\t' || is_brk(P, q);
+}
+
+/* A %YAML 2.0 line at q, at a line's start (section 4.1): its word, and
+ * *after where the word ends; D_NOT if it isn't one, a later version
+ * among them; D_BAD if a word it doesn't take follows a space or a tab */
+enum { D_NOT = -1, D_BAD = -2 };
+
+static int directive_at(const parser *P, const char *q, const char **after) {
+    if (!bol(P, q) || P->end - q < 9 || memcmp(q, "%YAML 2.0", 9) != 0 || !sep_at(P, q + 9)) return D_NOT;
+    static const struct { const char *w; size_t n; int word; } words[] = {
+        { "quotes", 6, OYLNG_WORD_QUOTES }, { "json", 4, OYLNG_WORD_JSON } };
+    q += 9;
+    if (q < P->end && *q == ' ')
+        for (size_t i = 0; i < sizeof words / sizeof *words; i++)
+            if ((size_t)(P->end - q - 1) >= words[i].n && !memcmp(q + 1, words[i].w, words[i].n) &&
+                eol_skip(P, q + 1 + words[i].n)) {
+                if (after) *after = q + 1 + words[i].n;
+                return words[i].word;
+            }
+    if (!eol_skip(P, q)) return D_BAD;
+    if (after) *after = q;
+    return OYLNG_WORD_NONE;
+}
+
+static _Noreturn void bad_word(parser *P, const char *q) {
+    fail(P, q, "%%YAML 2.0 takes one space and quotes or json after it, or nothing (section 4.1)");
+}
+
 /* A %YAML 2.0 line with a marker after it (section 4.4) */
 static bool directive_then_marker(const parser *P) {
-    const char *q = P->p;
-    if (!bol(P, q) || P->end - q < 9 || memcmp(q, "%YAML 2.0", 9) != 0) return false;
-    q = eol_skip(P, q + 9);
-    if (!q) return false;
+    const char *q;
+    if (directive_at(P, P->p, &q) < 0) return false;
+    q = eol_skip(P, q);
     return line_is(P, gap_skip(P, q), "---");
 }
 
@@ -655,6 +688,7 @@ static void emit(parser *P, oylng_event_type t, const char *data, size_t len, si
     oylng_event *e = &P->q[P->qn++];
     e->type = t;
     e->plain = false;
+    e->word = t == OYLNG_EVT_DOC_START ? (oylng_word)P->word : OYLNG_WORD_NONE;
     e->value.data = data;
     e->value.len = len;
     e->offset = at;
@@ -737,11 +771,6 @@ static inline bool is_indicator(int c) {
     default:
         return false;
     }
-}
-
-/* A space, a tab, a break or the end at q */
-static inline bool sep_at(const parser *P, const char *q) {
-    return q >= P->end || *q == ' ' || *q == '\t' || is_brk(P, q);
 }
 
 /* -<< then spaces or tabs then *: only a sequence item (section 9.2) */
@@ -1913,6 +1942,7 @@ static inline void ff_emit(oylng_event *e, oylng_event_type t, const char *data,
                            bool plain) {
     e->type = t;
     e->plain = plain;
+    e->word = OYLNG_WORD_NONE;
     e->value.data = data;
     e->value.len = len;
     e->offset = at;
@@ -2629,9 +2659,12 @@ static void stream_start(parser *P) {
             fail(P, P->in, "this parser reads YAML 2.0 only, and the stream says another version");
         fail(P, P->in, "a YAML 2.0 stream starts with the line %%YAML 2.0");
     }
-    P->p += 9;
-    if (!sep_at(P, P->p))
-        fail(P, P->in, "this parser reads YAML 2.0 only, and the stream says another version");
+    const char *after;
+    int w = directive_at(P, P->in, &after);
+    if (w == D_NOT) fail(P, P->in, "this parser reads YAML 2.0 only, and the stream says another version");
+    if (w == D_BAD) bad_word(P, P->in + 10);
+    P->word = (uint8_t)w;
+    P->p = after;
     eol(P);
     gap(P);
 }
@@ -2655,6 +2688,8 @@ static bool next_document(parser *P) {
                 else { P->p = j; break; }
             }
             if (eof(P)) return false;
+            /* a word this draft doesn't know can't cut a stream short */
+            if (directive_at(P, P->p, NULL) == D_BAD) bad_word(P, P->p + 10);
             if (!marker(P) && !directive_then_marker(P)) {
                 P->stopped = true;
                 P->stop_offset = (size_t)(after - P->in);
@@ -2665,7 +2700,9 @@ static bool next_document(parser *P) {
         }
         if (directive_then_marker(P)) {
             if (!ended) fail(P, P->p, "%%YAML 2.0 comes again only after ...");
-            P->p += 9;
+            const char *after;
+            P->word = (uint8_t)directive_at(P, P->p, &after);
+            P->p = after;
             eol(P);
             gap(P);
         }
@@ -2894,6 +2931,8 @@ oylng_mark oylng_parser_error_mark(const oylng_parser *P) {
     return P->errmark;
 }
 
+oylng_word oylng_parser_word(const oylng_parser *P) { return P ? (oylng_word)P->word : OYLNG_WORD_NONE; }
+
 bool oylng_parser_stopped(const oylng_parser *P, size_t *offset) {
     if (!P || P->state != ST_DONE || !P->stopped) return false;
     if (offset) *offset = P->stop_offset;
@@ -2922,6 +2961,7 @@ void oylng_parser_free(oylng_parser *P) {
     free(P->tmemo);
     if (P->sctx) P->sctx_free(P->sctx);
     if (P->pubs) P->pubs_free(P->pubs);
+    if (P->json) P->json_free(P->json);
     for (uint32_t i = 0; i < P->nbinds; i++) free(P->binds[i].name);
     free(P->binds);
     oylng_arena_free(P->strings);
@@ -3092,6 +3132,13 @@ void *oylng__parser_pubs(const oylng_parser *P) { return P->pubs; }
 void oylng__parser_set_pubs(oylng_parser *P, void *pubs, void (*free_fn)(void *)) {
     P->pubs = pubs;
     P->pubs_free = free_fn;
+}
+
+void *oylng__parser_json(const oylng_parser *P) { return P->json; }
+
+void oylng__parser_set_json(oylng_parser *P, void *json, void (*free_fn)(void *)) {
+    P->json = json;
+    P->json_free = free_fn;
 }
 
 void oylng__parser_shape(const oylng_parser *P, uint32_t *tables, bool *dotted) {

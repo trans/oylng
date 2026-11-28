@@ -421,9 +421,80 @@ static void test_strings(int maxlen) {
     printf("strings: %zu, each written in every place a scalar goes: %d scalars read back\n", strings, places);
 }
 
+/* Words on the %YAML 2.0 line (part 1, section 4.1): kept, and under one,
+ * each value plain or not as it was */
+static void test_words(void) {
+    SAME("%YAML 2.0 quotes\n", "%YAML 2.0\n");   /* no document, so no event, carries the word */
+    SAME("%YAML 2.0 json # x\n---\na\n", "%YAML 2.0 json\n--- a\n");
+    SAME("%YAML 2.0 quotes\n---\n", "%YAML 2.0 quotes\n---\n");   /* an empty document is plain */
+    SAME("%YAML 2.0 quotes\n---\na: \"1\"\nb: 1\nc:\nd: \"\"\n\"e\": x\n",
+         "%YAML 2.0 quotes\n---\na: '1'\nb: 1\nc:\nd: \"\"\ne: x\n");
+    SAME("%YAML 2.0 quotes\n---\n- |-\n  x\n- x\n", "%YAML 2.0 quotes\n---\n- 'x'\n- x\n");
+    /* a change of word: ..., and the line again */
+    SAME("%YAML 2.0\n---\na\n...\n%YAML 2.0 quotes\n---\nb\n...\n---\nc\n...\n%YAML 2.0\n---\n\"d\"\n",
+         "%YAML 2.0\n--- a\n...\n%YAML 2.0 quotes\n--- b\n--- c\n...\n%YAML 2.0\n--- d\n");
+    SAME_FLOW("%YAML 2.0 json\n---\n{\"a\": [1, \"1\", null, \"\"]}\n",
+              "%YAML 2.0 json\n--- {a: [1, '1', null, \"\"]}\n");
+    /* flow can't hold every plain value, and a stream marked keeps them so */
+    CHECK(!strncmp(rewrite("%YAML 2.0 quotes\n---\nx: a, b\n", true, 2), "ERR: 'a, b' is plain", 20),
+          "a, b plain in flow: %s", rewrite("%YAML 2.0 quotes\n---\nx: a, b\n", true, 2));
+    CHECK(!strncmp(rewrite("%YAML 2.0 quotes\n---\n-\n", true, 2), "ERR: an empty value is plain", 28),
+          "an empty item in flow: %s", rewrite("%YAML 2.0 quotes\n---\n-\n", true, 2));
+    SAME_FLOW("%YAML 2.0\n---\nx: a, b\n", "%YAML 2.0\n--- {x: 'a, b'}\n");
+
+    /* by hand: oylng_emit_scalar gives a string, quoted under a word */
+    oylng_emitter *e = oylng_emitter_new();
+    oylng_emitter_set_word(e, OYLNG_WORD_JSON);
+    oylng_emit_stream_start(e);
+    oylng_emit_doc_start(e, (oylng_str){ NULL, 0 });
+    oylng_emit_map_start(e, false);
+    oylng_emit_scalar(e, S("n"));
+    oylng_emit_scalar(e, S("1"));
+    oylng_emit_scalar(e, S("s"));
+    oylng_event v = { OYLNG_EVT_SCALAR, S("1"), 0, true, OYLNG_WORD_NONE };
+    oylng_emit(e, &v);
+    oylng_emit_map_end(e);
+    oylng_emit_doc_end(e);
+    CHECK(oylng_emit_stream_end(e) == OYLNG_OK, "by hand: %s", oylng_emitter_error(e));
+    oylng_str o = oylng_emitter_output(e);
+    static const char want[] = "%YAML 2.0 json\n---\nn: '1'\ns: 1\n";
+    CHECK(o.len == sizeof want - 1 && !memcmp(o.data, want, o.len), "by hand:\n%.*s", (int)o.len, o.data);
+    oylng_emitter_free(e);
+
+    /* with no document, set_word's word still goes on the line */
+    e = oylng_emitter_new();
+    oylng_emitter_set_word(e, OYLNG_WORD_QUOTES);
+    oylng_emit_stream_start(e);
+    oylng_emit_stream_end(e);
+    o = oylng_emitter_output(e);
+    CHECK(o.len == 17 && !memcmp(o.data, "%YAML 2.0 quotes\n", 17), "no document:\n%.*s", (int)o.len, o.data);
+    oylng_emitter_free(e);
+
+    /* an event's word must be one */
+    e = oylng_emitter_new();
+    oylng_emit_stream_start(e);
+    oylng_event bad = { OYLNG_EVT_DOC_START, { NULL, 0 }, 0, false, (oylng_word)7 };
+    CHECK(oylng_emit(e, &bad) == OYLNG_ERR_EMIT, "a word of 7");
+    oylng_emitter_free(e);
+
+    /* a document start event brings its word; set_word before it, none */
+    e = oylng_emitter_new();
+    oylng_emitter_set_word(e, OYLNG_WORD_QUOTES);
+    oylng_emit_stream_start(e);
+    oylng_event d = { OYLNG_EVT_DOC_START, { NULL, 0 }, 0, false, OYLNG_WORD_NONE };
+    oylng_emit(e, &d);
+    oylng_emit_scalar(e, S("1"));
+    oylng_emit_doc_end(e);
+    oylng_emit_stream_end(e);
+    o = oylng_emitter_output(e);
+    CHECK(o.len == 16 && !memcmp(o.data, "%YAML 2.0\n--- 1\n", 16), "event's word:\n%.*s", (int)o.len, o.data);
+    oylng_emitter_free(e);
+}
+
 int main(int argc, char **argv) {
     int maxlen = argc > 1 ? atoi(argv[1]) : 3;
     test_shapes();
+    test_words();
     test_errors();
     test_take();
     test_strings(maxlen);

@@ -200,11 +200,21 @@ mapping holds at every level below it, by its rules or by its `!*`, and
 walks the rest. How a scalar is written doesn't count for its type: `3`,
 `"3"` and `'3'` are all 3 under `!int`. `!null` takes `null` and the empty
 text, so `retries:` is null under `retries?: {!|: [!null, !int]}` and
-refused under `retries?: !int`, where `?` only lets the key be left out. A
-union reads any JSON value, though a string that reads as a number, a
-boolean or null is read as one:
-`json: {!|: [!null(null), !bool, !int, !float, !str, {!*: !json}, [!json, ...]]}`.
-`include/oylng/schema.h` documents the rest.
+refused under `retries?: !int`, where `?` only lets the key be left out.
+
+A stream can say that quoting counts, on its `%YAML 2.0` line (part 1,
+section 4.1): under `%YAML 2.0 quotes` or `%YAML 2.0 json`, `!int`,
+`!bigint`, `!float`, `!decimal`, `!bool`, `!true`, `!false` and `!null`
+take only plain values, so `"3"` is a string under `{!|: [!int, !str]}`.
+A block scalar isn't plain, and a value left out is. Keys are never
+marked, so `!int` as a type key still takes `1` and `"1"`. `!json` is a
+standard name for any JSON value,
+`{!|: [!null(null), !bool, !int, !float, !str, {!*: !json}, [!json, ...]]}`,
+and under `json` a document nothing else types is read with it, so JSON
+with `%YAML 2.0 json` in front reads as JSON. `oylng_parser_word` and
+`oylng_tree_word` give a document's word, an event's `plain` whether a
+value was plain, and `oylng_typed_how` gives `OYLNG_TYPED_JSON` for a
+document the default typed. `include/oylng/schema.h` documents the rest.
 
 A published name (section 3.1), such as
 `--- !tabcomputing.com/address/v1/address.yes#sha256=8789cc…`, ends in the
@@ -304,6 +314,15 @@ hold: a key given twice in a mapping, a collection as a key, invalid
 UTF-8, a bad name, or events out of order. `oylng_emitter_take` hands over
 the output so far, so a large stream needn't be held whole.
 
+`oylng_emitter_set_word` puts `quotes` or `json` on the `%YAML 2.0` line,
+and a document start event given to `oylng_emit` brings its own, so a
+stream read and written again keeps its words; where the word changes, the
+emitter writes `...` and the line again. Under a word, a scalar event's
+value is written plain where it was plain and quoted where it wasn't, and
+`oylng_emit_scalar` gives a string, so it is quoted. A plain value that
+can't stay plain where it goes is refused, such as `a, b` in flow, which
+block style holds.
+
 With a schema (part 2, section 13), the emitter writes typed data so that
 the same schema reads it back unchanged. `oylng_emitter_set_schema` holds
 each document until it ends, types it as a parser would, and writes each
@@ -317,7 +336,10 @@ where it has no fraction (`2.0`) and a signed exponent past 1e21
 (`1e+21`); null as `null`. Under words, a boolean or null is the first
 word of the first alternative that takes it: true as `yes` under
 `{!|: [!true(yes|on), !false(no|off)]}`, and `""` where that word is
-empty. A value written
+empty. Under `quotes` or `json`, a string is quoted where that reads back
+as a string, `'3'` under `{!|: [!int, !str]}`, rather than refused, and a
+boolean or null is the first word that can be plain where it goes, an
+empty one written as a value left out. A value written
 again with `oylng_emit_value` may also take the text it was read from.
 Nothing else is tried: 5 under `!signed` below is refused, as `5` doesn't
 match its pattern, and an application that wants `+5` writes it with its

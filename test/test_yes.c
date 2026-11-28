@@ -442,6 +442,21 @@ static void table_text(strbuf *b, const oylng_tree *t, oylng_node n, int ind) {
     }
 }
 
+/* The standard !json as an application's schema, for a document the
+ * json default typed (part 2, section 3) */
+static const oylng_schema *json_schema(void) {
+    static oylng_schema *js;
+    if (!js) {
+        static const char text[] = "%YAML 2.0\n--- &\nj: !json\n";
+        js = oylng_schema_new(text, sizeof text - 1, (oylng_str){ "j", 1 }, 0);
+        if (oylng_schema_status(js) != OYLNG_OK) {
+            fprintf(stderr, "the standard json: %s\n", oylng_schema_error(js));
+            exit(2);
+        }
+    }
+    return js;
+}
+
 static const char *again(oylng_parser *rp, const oylng_typed *y, const oylng_schema *app, bool cut, uint64_t lim,
                          char *why, size_t whyn) {
     oylng_str name = oylng_tree_name(oylng_typed_tree(y));
@@ -471,6 +486,7 @@ static const char *again(oylng_parser *rp, const oylng_typed *y, const oylng_sch
         break;
     }
     case OYLNG_TYPED_PUBLISHED: trips_skipped++; return NULL;
+    case OYLNG_TYPED_JSON: sc = json_schema(); break;
     default: break;
     }
     strbuf want = { 0 };
@@ -481,6 +497,7 @@ static const char *again(oylng_parser *rp, const oylng_typed *y, const oylng_sch
         oylng_emitter *e = oylng_emitter_new();
         oylng_emitter_set_flow(e, flow);
         oylng_emitter_set_schema(e, sc);
+        oylng_emitter_set_word(e, oylng_tree_word(oylng_typed_tree(y)));
         oylng_status st = oylng_emit_stream_start(e);
         if (st == OYLNG_OK) st = oylng_emit_doc_start(e, name);
         if (st == OYLNG_OK) st = oylng_emit_value(e, y, oylng_typed_root(y));
@@ -536,12 +553,13 @@ static int etrips, etrips_skipped, erefusals;
 typedef struct {
     size_t at, end;
     bool   table;
+    bool   reset;   /* after a ..., which empties the table */
 } span;
 
 static size_t doc_spans(const char *s, size_t n, span **out, size_t *head) {
     span *sp = NULL;
     size_t ns = 0, cap = 0;
-    bool open = false;
+    bool open = false, reset = false;
     *head = n;
     for (size_t i = 0; i < n;) {
         size_t e = i;
@@ -556,12 +574,14 @@ static size_t doc_spans(const char *s, size_t n, span **out, size_t *head) {
             while (j < e && (s[j] == ' ' || s[j] == '\t')) j++;
             bool table = j < e && s[j] == '&' && (j + 1 == e || s[j + 1] == ' ' || s[j + 1] == '\t' ||
                                                   s[j + 1] == '\r' || s[j + 1] == '#');
-            sp[ns++] = (span){ i, n, table };
+            sp[ns++] = (span){ i, n, table, reset };
+            reset = false;
             if (*head == n) *head = i;
             open = true;
-        } else if (stop && open) {
-            sp[ns - 1].end = e < n ? e + 1 : e;
+        } else if (stop) {
+            if (open) sp[ns - 1].end = e < n ? e + 1 : e;
             open = false;
+            reset = true;
         }
         i = e < n ? e + 1 : e;
     }
@@ -695,6 +715,7 @@ static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oyl
         break;
     }
     case OYLNG_TYPED_PUBLISHED: etrips_skipped++; return NULL;
+    case OYLNG_TYPED_JSON: sc = json_schema(); break;
     default: break;
     }
 
@@ -713,13 +734,13 @@ static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oyl
         j = e + 1;
     }
     if (bare) seen = 1;
+    /* the tables since the last ..., which empties the table, under the
+       %YAML 2.0 line the emitter writes, with the document's word */
     strbuf pre = { 0 };
     for (i = 0; i < ns && !(bare && !k); i++) {
+        if (sp[i].reset) pre.len = 0;
         if (!sp[i].table && seen++ == k) break;
-        if (sp[i].table) {
-            if (!pre.len) sb_add(&pre, in, head);
-            sb_add(&pre, in + sp[i].at, sp[i].end - sp[i].at);
-        }
+        if (sp[i].table) sb_add(&pre, in + sp[i].at, sp[i].end - sp[i].at);
     }
     free(sp);
     const char *res = NULL;
@@ -737,6 +758,8 @@ static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oyl
         oylng_emitter *e = oylng_emitter_new();
         oylng_emitter_set_flow(e, flow);
         oylng_emitter_set_schema(e, sc);
+        /* the word on the stream's first line, as the suite's emit asks */
+        oylng_emitter_set_word(e, oylng_tree_word(oylng_typed_tree(y)));
         oylng_status st = OYLNG_OK;
         for (size_t j = 0; j < nnames && st == OYLNG_OK; j++)
             st = oylng_emitter_bind(e, (oylng_str){ names[j].name, strlen(names[j].name) }, rewrite, (void *)&names[j]);
@@ -754,16 +777,17 @@ static const char *from_events(oylng_parser *rp, const oylng_typed *y, const oyl
             snprintf(why, whyn, "written %s from its events: %s", how, oylng_emitter_error(e));
             res = why;
         } else {
-            /* after the tables, which carry the stream's %YAML line */
-            strbuf s = { 0 };
-            sb_add(&s, pre.data ? pre.data : "", pre.len);
-            const char *body = out.data;
+            /* after the tables, under the emitter's %YAML 2.0 line */
+            const char *body = out.data ? out.data : "";
             size_t blen = out.len;
-            if (pre.len && blen >= 10 && !memcmp(body, "%YAML 2.0\n", 10)) {
-                body += 10;
-                blen -= 10;
-            }
-            sb_add(&s, body, blen);
+            size_t first = 0;   /* the first line's length, with its break */
+            while (first < blen && body[first++] != '\n') {}
+            strbuf s = { malloc(blen + pre.len + 1), blen + pre.len, blen + pre.len + 1 };
+            if (!s.data) { fputs("out of memory\n", stderr); exit(2); }
+            memcpy(s.data, body, first);
+            if (pre.len) memcpy(s.data + first, pre.data, pre.len);
+            memcpy(s.data + first + pre.len, body + first, blen - first);
+            s.data[s.len] = '\0';
             oylng_parser *p = oylng_parser_new(s.data, s.len);
             oylng_parser_set_limit(p, UINT64_MAX);
             oylng_parser_set_cut(p, cut);

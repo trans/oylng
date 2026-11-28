@@ -108,10 +108,7 @@ enum { STD_STR, STD_INT, STD_BIGINT, STD_FLOAT, STD_DECIMAL, STD_BOOL, STD_TRUE,
 typedef struct oylng__xt    xt;
 typedef struct oylng__entry centry;
 
-typedef struct {
-    const char *s;
-    uint32_t    len;
-} xstr;
+typedef oylng__text xstr;
 
 typedef struct {
     xstr     name;
@@ -145,8 +142,9 @@ typedef struct {
     uint32_t  nmaps;
     uint32_t  any;        /* the first !any position, or UINT32_MAX */
     bool      all_lits;   /* literals only */
-    oylng__word *words;   /* how a boolean or null is written here, in the
-                             order its alternatives are tried (section 13) */
+    oylng__word *words;   /* how a boolean or null is written here, a group
+                             for each alternative with a word list of its
+                             own, in the order they are tried (section 13) */
     uint32_t  nwords;
 } xalts;
 
@@ -200,6 +198,7 @@ struct oylng__entry {
     uint64_t full;
     xt      *kind_of;
     uint32_t tname_gen, tname;   /* its name in the typed document gen */
+    bool     builtin;     /* the standard json, which no table has (section 10) */
     centry **bare;        /* the names its type is, written bare or in a union */
     uint32_t nbare;
     bool     bare_known;
@@ -212,6 +211,8 @@ struct oylng__sctx {
     oylng_arena   *A;
     oylng_hash_key key;
     oylng_parser  *P;          /* the table, while compiling */
+    oylng_parser  *jp;         /* the standard json's own table, once a type names it */
+    bool           json_used;  /* json named the standard json: an entry named json changes that */
     const char    *in;         /* the table's text, for marks */
     size_t         inlen;
     uint64_t       limit;

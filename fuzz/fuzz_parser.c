@@ -30,10 +30,17 @@
  * the objects of the bound values just below it made, a value written at
  * an offset of 5 mod 8 is refused, each bound value has its object, at one place only,
  * and every object made is let go.
- * A document the application's schema typed, or that nothing typed, is
- * written again with that schema (section 13), under a size budget: in
- * block style it must be accepted, and in flow refused only for a value
- * with no spelling there, and it must read back the same.
+ * A document the application's schema typed, or that nothing typed, or the
+ * json default, is written again with that schema (section 13), under a
+ * size budget, and the document's word: in block style it must be
+ * accepted, and in flow refused only for a value with no spelling there,
+ * or a plain value flow can't hold, and it must read back the same.
+ * Under %YAML 2.0 quotes or json, each document's word and whether each
+ * value is plain must be written again too: the emitter may refuse only a
+ * plain value it can't keep plain there, in block style only in a stream
+ * then refused; typed with stamps ignored and no schema, a document under
+ * json is typed by the standard !json, and may be refused for a number or
+ * the size.
  * Where the stream holds a NUL, what comes before it is also a published
  * file (section 3.1), and what comes after a stream typed with a lookup
  * that gives it, once each #sha256= and the 64 hex digits after it are set
@@ -63,6 +70,64 @@ static uint64_t ev_hash(uint64_t h, const oylng_event *e) {
     h = (h ^ (uint64_t)(e->value.data != NULL)) * 0x100000001B3u;
     for (size_t i = 0; i < e->value.len; i++) h = (h ^ (unsigned char)e->value.data[i]) * 0x100000001B3u;
     return h;
+}
+
+/* Where the events are, for mark_hash: whether the document is marked
+ * quotes or json, and each open collection's nodes, times 2, plus 1 for a
+ * mapping, so that a key is known */
+typedef struct {
+    bool     marked;
+    size_t   depth;
+    uint64_t n[OYLNG_MAX_LEVELS + 8];
+} mstate;
+
+/* A hash of what a marked stream keeps: each document's word, and whether
+ * each value in a marked document is plain (keys are never marked) */
+static uint64_t mark_hash(uint64_t h, const oylng_event *e, mstate *m) {
+    switch (e->type) {
+    case OYLNG_EVT_DOC_START:
+        m->marked = e->word != OYLNG_WORD_NONE;
+        m->depth = 0;
+        return (h ^ (uint64_t)e->word) * 0x100000001B3u;
+    case OYLNG_EVT_MAP_START:
+    case OYLNG_EVT_SEQ_START:
+        if (m->depth) m->n[m->depth - 1] += 2;
+        if (m->depth < sizeof m->n / sizeof *m->n) m->n[m->depth++] = e->type == OYLNG_EVT_MAP_START;
+        return h;
+    case OYLNG_EVT_MAP_END:
+    case OYLNG_EVT_SEQ_END:
+        if (m->depth) m->depth--;
+        return h;
+    case OYLNG_EVT_SCALAR: {
+        uint64_t n = m->depth ? m->n[m->depth - 1] : 0;
+        bool key = (n & 1) && (n >> 1) % 2 == 0;
+        if (m->depth) m->n[m->depth - 1] += 2;
+        if (m->marked && !key) h = (h ^ (uint64_t)(2 + e->plain)) * 0x100000001B3u;
+        return h;
+    }
+    default:
+        return h;
+    }
+}
+
+/* Whether the emitter refused, in flow, a value a marked stream keeps
+ * plain, which flow can't hold (section 11) */
+static bool plain_refused(const oylng_emitter *e, oylng_status st, bool flow) {
+    const char *why = oylng_emitter_error(e);
+    return flow && st == OYLNG_ERR_EMIT && why &&
+           (strstr(why, "is plain, and can't be plain here") || strstr(why, "an empty value is plain"));
+}
+
+/* The standard !json as an application's schema, for writing again what
+ * the json default typed (part 2, section 3) */
+static const oylng_schema *json_schema(void) {
+    static oylng_schema *js;
+    if (!js) {
+        static const char text[] = "%YAML 2.0\n--- &\nj: !json\n";
+        js = oylng_schema_new(text, sizeof text - 1, (oylng_str){ "j", 1 }, 0);
+        if (!js || oylng_schema_status(js) != OYLNG_OK) abort();
+    }
+    return js;
 }
 
 /* The same, of what a tree holds: no offsets, and only a name's data may
@@ -502,6 +567,7 @@ static void write_again(const oylng_typed *y, const oylng_schema *sc, unsigned o
         oylng_emitter_set_flow(e, flow);
         oylng_emitter_set_indent(e, ((opt >> 3) & 7) + 1);
         if (sc && oylng_emitter_set_schema(e, sc) != OYLNG_OK) abort();
+        oylng_emitter_set_word(e, oylng_tree_word(oylng_typed_tree(y)));
         oylng_status st = oylng_emit_stream_start(e);
         if (st == OYLNG_OK) st = oylng_emit_doc_start(e, oylng_tree_name(oylng_typed_tree(y)));
         if (st == OYLNG_OK) st = oylng_emit_value(e, y, oylng_typed_root(y));
@@ -513,7 +579,8 @@ static void write_again(const oylng_typed *y, const oylng_schema *sc, unsigned o
                 oylng_emitter_free(e);
                 return;
             }
-            if (!flow || st != OYLNG_ERR_EMIT || !why || !strstr(why, "no spelling of")) abort();
+            if (!plain_refused(e, st, flow) && (!flow || st != OYLNG_ERR_EMIT || !why || !strstr(why, "no spelling of")))
+                abort();
             oylng_emitter_free(e);
             continue;
         }
@@ -602,8 +669,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     if (!em) { oylng_parser_free(p); free(in); return 0; }
     oylng_emitter_set_flow(em, (opt & 0x40) != 0);
     oylng_emitter_set_indent(em, ((opt >> 3) & 7) + 1);
-    uint64_t h1 = 0xCBF29CE484222325u, h3 = h1;
-    bool clean = false;
+    uint64_t h1 = 0xCBF29CE484222325u, h3 = h1, hm1 = h1;
+    static mstate m1, m2;
+    m1.depth = 0;
+    bool clean = false, block_refused = false;
 
     /* for each open collection, whether it's a mapping and how many nodes
        it has had */
@@ -619,11 +688,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             break;
         }
         h1 = ev_hash(h1, e);
+        hm1 = mark_hash(hm1, e, &m1);
         if (e->type != OYLNG_EVT_STREAM_START && e->type != OYLNG_EVT_STREAM_END)
             h3 = tv_hash(h3, e->type, e->value);
-        /* everything the parser delivers, the emitter can write */
+        /* everything the parser delivers, the emitter can write, but for
+           a plain value flow can't hold, or one the parser delivers just
+           before refusing the stream (`:` in `d: ::`), which block style
+           can't hold either: so a refusal in block counts once the
+           stream is known to be accepted */
         oylng_status est = oylng_emit(em, e);
-        if (est != OYLNG_OK && est != OYLNG_ERR_MEMORY) abort();
+        if (est != OYLNG_OK && est != OYLNG_ERR_MEMORY) {
+            if (!plain_refused(em, est, true)) abort();
+            if (!(opt & 0x40)) block_refused = true;
+        }
         switch (e->type) {
         case OYLNG_EVT_STREAM_START:
             if (started) abort();
@@ -668,6 +745,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     }
 
     if (pst != OYLNG_OK) check_mark(in, size, oylng_parser_error_mark(p));
+    if (clean && block_refused) abort();
 
     /* read as trees, the same, or the same error; written, the same text */
     oylng_parser *tp = parser_for(in, size, opt);
@@ -684,7 +762,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             h4 = tree_hash(h4, t, oylng_tree_root(t));
             h4 = tv_hash(h4, OYLNG_EVT_DOC_END, (oylng_str){ NULL, 0 });
             oylng_status est = oylng_emit_tree(te, t);
-            if (est != OYLNG_OK && est != OYLNG_ERR_MEMORY) abort();
+            if (est != OYLNG_OK && est != OYLNG_ERR_MEMORY && !plain_refused(te, est, (opt & 0x40) != 0)) abort();
             oylng_tree_free(t);
             check_table(tp, OYLNG_OK);
         }
@@ -781,7 +859,10 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         oylng_typed *y;
         oylng_status st;
         while ((st = oylng_parse_typed(np, NULL, &y)) == OYLNG_OK && y) {
-            if (oylng_typed_how(y) != OYLNG_TYPED_NOT) abort();
+            /* or, under %YAML 2.0 json, the standard !json (part 2, section 3) */
+            oylng_typed_by how = oylng_typed_how(y);
+            bool js = oylng_tree_word(oylng_typed_tree(y)) == OYLNG_WORD_JSON;
+            if (how != (js ? OYLNG_TYPED_JSON : OYLNG_TYPED_NOT)) abort();
             const oylng_tree *t = oylng_typed_tree(y);
             h5 = tv_hash(h5, OYLNG_EVT_DOC_START, oylng_tree_name(t));
             h5 = tree_hash(h5, t, oylng_tree_root(t));
@@ -789,6 +870,12 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             oylng_typed_free(y);
         }
         if (st == OYLNG_ERR_MEMORY || pst == OYLNG_ERR_MEMORY) {
+        } else if ((st == OYLNG_ERR_LIMIT || st == OYLNG_ERR_SCHEMA) && oylng_parser_word(np) == OYLNG_WORD_JSON) {
+            /* typed by !json, its count can pass the limit where the tree's
+               doesn't, and a number out of range refuses it (part 2,
+               section 4.4) */
+            if (!oylng_parser_error(np)) abort();
+            check_mark(in, size, oylng_parser_error_mark(np));
         } else if (clean) {
             if (st != OYLNG_OK || h5 != h3) abort();
         } else {
@@ -848,7 +935,8 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
             size_t cap = 0, ob = 1 << 16;
             check_objects(y, root, &seen, &cap, &ob);
             free(seen);
-            if (how == OYLNG_TYPED_APP || how == OYLNG_TYPED_NOT) write_again(y, how == OYLNG_TYPED_APP ? app : NULL, opt);
+            if (how == OYLNG_TYPED_APP || how == OYLNG_TYPED_NOT || how == OYLNG_TYPED_JSON)
+                write_again(y, how == OYLNG_TYPED_APP ? app : how == OYLNG_TYPED_JSON ? json_schema() : NULL, opt);
             if (!kdone) {
                 oylng_parser_set_stamps(kyp, !off);
                 oylng_typed *ky = NULL;
@@ -895,14 +983,16 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
         if (copy) {
             memcpy(copy, out.data, out.len);
             oylng_parser *q = parser_for(copy, out.len, opt);
-            uint64_t h2 = 0xCBF29CE484222325u;
+            uint64_t h2 = 0xCBF29CE484222325u, hm2 = h2;
+            m2.depth = 0;
             for (;;) {
                 if (!q) break;
                 if (oylng_parse_next(q, &e) != OYLNG_OK) abort();
                 h2 = ev_hash(h2, e);
+                hm2 = mark_hash(hm2, e, &m2);
                 if (e->type == OYLNG_EVT_STREAM_END) break;
             }
-            if (q && h1 != h2) abort();
+            if (q && (h1 != h2 || hm1 != hm2)) abort();
             oylng_parser_free(q);
             free(copy);
         }

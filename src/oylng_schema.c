@@ -119,6 +119,7 @@ sctx *oylng__sctx_new(oylng_parser *P, bool stamp) {
 void oylng__sctx_free(void *ctx) {
     sctx *S = ctx;
     if (!S) return;
+    oylng_parser_free(S->jp);
     oylng_arena_free(S->A);
     free(S->buckets);
     free(S->memo);
@@ -132,17 +133,62 @@ void oylng__sctx_free(void *ctx) {
     free(S);
 }
 
+/* ── The standard json (section 10) ─────────────────────────
+ * json is a standard name for an entry no table has, so it is read from a
+ * table of its own, whose nodes are numbered from BUILTIN, and the table a
+ * name is looked up in wins over it (section 8). */
+
+#define BUILTIN 0x80000000u
+
+static oylng_parser *json_table(sctx *S) {
+    if (!S->jp) {
+        static const char text[] = "%YAML 2.0\n--- &\n"
+                                   "json: {!|: [!null(null), !bool, !int, !float, !str, {!*: !json}, [!json, ...]]}\n---\n";
+        oylng_parser *jp = oylng_parser_new(text, sizeof text - 1);
+        if (!jp) nomem(S);
+        const oylng_event *e;
+        oylng_status st;
+        while ((st = oylng_parse_next(jp, &e)) == OYLNG_OK && e->type != OYLNG_EVT_DOC_START) continue;
+        if (st != OYLNG_OK) {
+            oylng_parser_free(jp);
+            nomem(S);
+        }
+        S->jp = jp;
+    }
+    return S->jp;
+}
+
+/* Node i of the table, or of the standard json's */
+static void tnode(const sctx *S, uint32_t i, oylng__tnode *out) {
+    if (!(i & BUILTIN)) {
+        oylng__table_node(S->P, i, out);
+        return;
+    }
+    oylng__table_node(S->jp, i & ~BUILTIN, out);
+    out->pos = 0;   /* not written in the schema: its start */
+    if (out->link != UINT32_MAX) out->link |= BUILTIN;
+}
+
 /* The context's entry for a name the table has, made the first time; NULL
- * if the table has none */
-static centry *entry_of(sctx *S, const char *name, size_t len) {
+ * if the table has none. json, which the table may not have, is the
+ * standard one if std, so for a type, not for a root (section 3). */
+static centry *entry_of(sctx *S, const char *name, size_t len, bool std) {
     uint64_t h = oylng__hash_str(S, name, len);
     if (S->nbuckets) {
         for (centry *e = S->buckets[h & (S->nbuckets - 1)]; e; e = e->next)
-            if (is(e->name, name, len)) return e;
+            if (is(e->name, name, len)) return e->builtin && !std ? NULL : e;
     }
     uint32_t pe;
     uint32_t node = oylng__table_entry(S->P, name, len, &pe);
+    bool builtin = false;
+    if (node == NONE && std && len == 4 && !memcmp(name, "json", 4)) {
+        node = oylng__table_entry(json_table(S), name, len, &pe);
+        if (node == NONE) nomem(S);   /* it has it */
+        node |= BUILTIN;
+        builtin = S->json_used = true;
+    }
     if (node == NONE) return NULL;
+    if (node & BUILTIN && !builtin) bad(S, 0, "a table of 2G nodes or more");
     if (S->nentries >= S->nbuckets) {   /* twice the buckets, rehashed */
         uint32_t nb = S->nbuckets ? S->nbuckets * 2 : 64;
         centry **b = calloc(nb, sizeof *b);
@@ -162,6 +208,7 @@ static centry *entry_of(sctx *S, const char *name, size_t len) {
     e->name = copy(S, name, len);
     e->node = node;
     e->pentry = pe;
+    e->builtin = builtin;
     e->next = S->buckets[h & (S->nbuckets - 1)];
     S->buckets[h & (S->nbuckets - 1)] = e;
     S->nentries++;
@@ -391,7 +438,7 @@ static xt *atom(sctx *S, const char *s, size_t n, size_t pos) {
         bool args = j < n;
         if (j == 1 || (args && (s[j] != '(' || s[n - 1] != ')')))
             bad(S, pos, "bad type: %.*s", (int)(n > 60 ? 60 : n), s);
-        centry *e = entry_of(S, s + 1, j - 1);
+        centry *e = entry_of(S, s + 1, j - 1, true);
         if (e) {
             if (args) bad(S, pos, "%.*s: a named type takes no limit", (int)(n > 60 ? 60 : n), s);
             xt *t = new_xt(S, X_NAME, pos);
@@ -481,8 +528,16 @@ static void kid(void *ctx, uint32_t i) {
  * (part 2, section 11): hold_entries has held what it reaches to full. */
 static void children(sctx *S, uint32_t node, kids *k) {
     *k = (kids){ S, NULL, 0, 0, false };
-    bool ok = oylng__table_spread(S->P, node, kid, k);
+    bool builtin = node & BUILTIN;
+    bool ok = oylng__table_spread(builtin ? S->jp : S->P, node & ~BUILTIN, kid, k);
     if (!ok || k->oom) { free(k->v); nomem(S); }
+    for (uint32_t i = 0; i < k->n; i++) {
+        if (builtin) k->v[i] |= BUILTIN;
+        else if (k->v[i] & BUILTIN) {
+            free(k->v);
+            bad(S, 0, "a table of 2G nodes or more");
+        }
+    }
 }
 
 /* The same, in the arena */
@@ -508,7 +563,7 @@ static bool is_union(sctx *S, uint32_t node) {
     bool u = false;
     for (uint32_t p = 0; p + 1 < k.n && !u; p += 2) {
         oylng__tnode kn;
-        oylng__table_node(S->P, k.v[p], &kn);
+        tnode(S, k.v[p], &kn);
         u = plain_is(&kn, "!|", 2);
     }
     free(k.v);
@@ -522,7 +577,7 @@ static xt *compile_node(sctx *S, uint32_t i) {
     xt *t = memo_get(S, i);
     if (t) return t;
     oylng__tnode tn;
-    oylng__table_node(S->P, i, &tn);
+    tnode(S, i, &tn);
     if (tn.kind == OYLNG__T_STR) {
         xstr text = copy(S, tn.data, tn.len);
         if (!tn.plain || !tn.len) {   /* a quoted scalar is a literal (section 5) */
@@ -582,14 +637,14 @@ static void fill(sctx *S, xt *t) {
         /* section 9: one key, `!|`, and a sequence of alternatives */
         if (n != 2) bad(S, t->pos, "a `!|` mapping holds no other key");
         oylng__tnode vn;
-        oylng__table_node(S->P, c[1], &vn);
+        tnode(S, c[1], &vn);
         uint32_t m = 0, *items = vn.kind == OYLNG__T_SEQ ? arena_children(S, c[1], &m) : NULL;
         if (!m) bad(S, vn.pos, "`!|` holds a sequence of one or more alternatives");
         t->u.alt.v = alloc(S, (size_t)m * sizeof *t->u.alt.v);
         t->u.alt.n = m;
         for (uint32_t j = 0; j < m; j++) {
             oylng__tnode in;
-            oylng__table_node(S->P, items[j], &in);
+            tnode(S, items[j], &in);
             if (plain_is(&in, "...", 3)) bad(S, in.pos, "`...` repeats an item in a sequence, not in `!|`");
         }
         for (uint32_t j = 0; j < m; j++) t->u.alt.v[j] = compile_node(S, items[j]);
@@ -598,7 +653,7 @@ static void fill(sctx *S, xt *t) {
     if (t->kind == X_SEQ) {
         if (n) {
             oylng__tnode last;
-            oylng__table_node(S->P, c[n - 1], &last);
+            tnode(S, c[n - 1], &last);
             if (plain_is(&last, "...", 3)) {
                 if (n == 1) bad(S, last.pos, "`...` repeats the item before it");
                 n -= 2;
@@ -621,7 +676,7 @@ static void fill(sctx *S, xt *t) {
     }
     for (uint32_t p = 0; p < pairs; p++) {
         oylng__tnode kn;
-        oylng__table_node(S->P, c[2 * p], &kn);
+        tnode(S, c[2 * p], &kn);
         const char *ks = kn.data;
         size_t kl = kn.len;
         bool opt = false;
@@ -680,7 +735,7 @@ static void reach(sctx *S, centry *e) {
     if (e->reached) return;
     e->reached = true;
     if (!e->top) e->top = compile_node(S, e->node);
-    if (S->stamp) oylng__entry_reach(S->P, e->pentry);
+    if (S->stamp && !e->builtin) oylng__entry_reach(S->P, e->pentry);
     GROW(S, S->fresh_entries, S->capfresh_entries, S->nfresh_entries + 1);
     S->fresh_entries[S->nfresh_entries++] = e;
     make_place(S, e->top, false);
@@ -994,40 +1049,40 @@ static void expand(sctx *S, xt *t) {
         }
     }
     /* how a boolean or null is written here: as the first alternative
-       that takes it would read it, its first word or standard spelling */
+       that takes it would read it, its words in order or its standard
+       spelling, the first that can be written (in a marked stream, plain)
+       where it goes (section 13). A group points at its type's words, and
+       a list a group before it has adds nothing, so is left out. */
+    static const xstr std_true[] = { { "true", 4 } }, std_false[] = { { "false", 5 } }, std_null[] = { { "null", 4 } };
     uint32_t nw = 0;
     for (uint32_t i = 0; i < no; i++) {
         const xt *x = a->p[i].t;
         if (x->kind == X_STD) nw += x->std == STD_BOOL ? 2 : x->std == STD_TRUE || x->std == STD_FALSE || x->std == STD_NULL;
     }
     if (nw) {
+        uint32_t cap = 16;
+        while (cap < 2 * nw) cap *= 2;
+        const xstr **seen = zalloc(S, (size_t)cap * sizeof *seen);
         a->words = alloc(S, nw * sizeof *a->words);
         for (uint32_t i = 0; i < no; i++) {
             const xt *x = a->p[i].t;
             if (x->kind != X_STD) continue;
-            oylng__word *w = a->words + a->nwords;
-            oylng_str first = (x->flags & XF_WORDS) ? (oylng_str){ x->u.std.words[0].s, x->u.std.words[0].len }
-                                                    : (oylng_str){ NULL, 0 };
-            switch (x->std) {
-            case STD_BOOL:
-                w[0] = (oylng__word){ OYLNG__TRUE, { "true", 4 } };
-                w[1] = (oylng__word){ OYLNG__FALSE, { "false", 5 } };
-                a->nwords += 2;
-                break;
-            case STD_TRUE:
-                *w = (oylng__word){ OYLNG__TRUE, first.data ? first : (oylng_str){ "true", 4 } };
-                a->nwords++;
-                break;
-            case STD_FALSE:
-                *w = (oylng__word){ OYLNG__FALSE, first.data ? first : (oylng_str){ "false", 5 } };
-                a->nwords++;
-                break;
-            case STD_NULL:
-                *w = (oylng__word){ OYLNG__NULL, first.data ? first : (oylng_str){ "null", 4 } };
-                a->nwords++;
-                break;
-            default:
-                break;
+            oylng__word g[2];
+            uint32_t ng = 0;
+            if (x->std == STD_BOOL) {
+                g[ng++] = (oylng__word){ OYLNG__TRUE, std_true, 1 };
+                g[ng++] = (oylng__word){ OYLNG__FALSE, std_false, 1 };
+            } else if (x->std == STD_TRUE || x->std == STD_FALSE || x->std == STD_NULL) {
+                uint8_t what = x->std == STD_TRUE ? OYLNG__TRUE : x->std == STD_FALSE ? OYLNG__FALSE : OYLNG__NULL;
+                g[ng++] = (x->flags & XF_WORDS) ? (oylng__word){ what, x->u.std.words, x->u.std.nwords }
+                        : (oylng__word){ what, what == OYLNG__TRUE ? std_true : what == OYLNG__FALSE ? std_false : std_null, 1 };
+            }
+            for (uint32_t j = 0; j < ng; j++) {
+                size_t h = ((uintptr_t)g[j].words >> 3) * 0x9E3779B97F4A7C15u >> 7 & (cap - 1);
+                while (seen[h] && seen[h] != g[j].words) h = (h + 1) & (cap - 1);
+                if (seen[h]) continue;   /* the same list, tried already */
+                seen[h] = g[j].words;
+                a->words[a->nwords++] = g[j];
             }
         }
     }
@@ -1109,7 +1164,7 @@ static void hold_entries(sctx *S, xt *root) {
             centry *e = t->u.name;
             if (e->mark != gen) {
                 e->mark = gen;
-                total = sat(total, oylng__table_entry_full(S->P, e->pentry));
+                if (!e->builtin) total = sat(total, oylng__table_entry_full(S->P, e->pentry));
                 if (total > S->limit)
                     bad(S, t->pos, "the entries this schema reaches come to %llu in full, past the size limit of %llu",
                         (unsigned long long)total, (unsigned long long)S->limit);
@@ -1148,7 +1203,7 @@ static void compile_root(sctx *S, centry *e) {
         e->root = new_xt(S, X_NAME, 0);
         e->root->u.name = e;
         oylng__tnode tn;
-        oylng__table_node(S->P, e->node, &tn);
+        tnode(S, e->node, &tn);
         e->root->pos = (uint32_t)pos32(tn.pos);
     }
     xt *root = e->root;
@@ -1176,7 +1231,7 @@ static void compile_root(sctx *S, centry *e) {
 xt *oylng__sctx_root(sctx *S, const char *name, size_t len, bool *found) {
     *found = false;
     if (setjmp(S->jb)) return NULL;
-    centry *e = entry_of(S, name, len);
+    centry *e = entry_of(S, name, len, false);
     if (!e) return NULL;
     *found = true;
     if (!e->root_ok) compile_root(S, e);
@@ -1203,7 +1258,7 @@ static bool compile_app(sctx *S, oylng_parser *P, oylng_str root, xt **out, char
     missing[0] = '\0';
     if (setjmp(S->jb)) return false;
     if (root.data) {
-        centry *en = entry_of(S, root.data, root.len);
+        centry *en = entry_of(S, root.data, root.len, false);
         if (!en) snprintf(missing, mn, "%s has no entry %.*s", what, (int)(root.len > 60 ? 60 : root.len), root.data);
         else {
             compile_root(S, en);
@@ -1216,7 +1271,7 @@ static bool compile_app(sctx *S, oylng_parser *P, oylng_str root, xt **out, char
         const char *k;
         size_t kl;
         oylng__table_entry_at(P, i, &k, &kl);
-        centry *en = entry_of(S, k, kl);
+        centry *en = entry_of(S, k, kl, false);
         if (en && !en->root_ok) compile_root(S, en);
     }
     return true;
@@ -1264,6 +1319,13 @@ static oylng_schema *schema_make(const char *yaml, size_t len, oylng_str root, u
         return sc;
     }
     oylng__parser_shape(P, &tables, &dotted);
+    if (published && oylng_parser_word(P) != OYLNG_WORD_NONE) {
+        /* a word would change nothing, and give the schema a second file
+           and hash (section 3.1) */
+        schema_fail(sc, OYLNG_ERR_SCHEMA, "a published schema's %YAML 2.0 line has no word", (oylng_mark){ 0, 1, 1 });
+        oylng_parser_free(P);
+        return sc;
+    }
     if (published && (docs || tables != 1 || dotted)) {
         schema_fail(sc, OYLNG_ERR_SCHEMA, "a published schema is one table and nothing else", (oylng_mark){ 0, 0, 0 });
         oylng_parser_free(P);
@@ -1284,6 +1346,8 @@ static oylng_schema *schema_make(const char *yaml, size_t len, oylng_str root, u
     S->P = NULL;
     S->in = NULL;
     oylng_parser_free(P);
+    oylng_parser_free(S->jp);
+    S->jp = NULL;
     return sc;
 }
 

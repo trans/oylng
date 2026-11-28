@@ -7,9 +7,12 @@
  * --events (the default) writes the events in the suite's notation;
  * --json writes one line of JSON per document; --emit writes the stream
  * again as YAML 2.0, its references resolved, in block style or with
- * --flow one line per document. --typed types each document (part 2, YAML
- * Easy Schema) by its stamp, or else by the entry ROOT of the file SCHEMA,
- * and writes one line of JSON per document, each value [type, value]. As
+ * --flow one line per document, each under its %YAML 2.0 line's word, and
+ * under quotes or json each value plain or not as it was. --typed types
+ * each document (part 2, YAML Easy Schema) by its stamp, or else by the
+ * entry ROOT of the file SCHEMA, or else, under %YAML 2.0 json, by the
+ * standard !json, and writes one line of JSON per document, each value
+ * [type, value]. As
  * section 2 has it, only what a document reaches is checked, so a stream
  * with a table and no documents loads, empty; with --every-entry, it is
  * checked as a schema file is, every entry as a root. With --store, a

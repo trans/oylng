@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+- **`%YAML 2.0 quotes` and `%YAML 2.0 json`** (part 1, section 4.1, and
+  part 2, sections 3, 4, 7 and 13, yaml2 `v1.0.0-beta.1`). Part 1's 393
+  tests pass, and part 2's 1,051 (1,026 run, 25 holding more). CI now
+  tests against that tag.
+  - The `%YAML 2.0` line may end with one space and `quotes` or `json`,
+    and the word holds for the documents after it, up to the next such
+    line, past a `...` with none. Anything else after `%YAML 2.0` is
+    refused: a tab, two spaces, `Quotes`, `jsonx`, two words. After `...`
+    too, where a line with an unknown word used to stop the stream, marker
+    or not; a known word with no marker after it is still a stop.
+  - New `oylng_word`, the `word` field at the end of `oylng_event`, set on
+    a document start, and `oylng_parser_word`, `oylng_tree_word` and
+    `oylng_emitter_set_word`. The `--events` notation writes `=VAL "` for a
+    value that isn't plain under a word, as the suite does.
+  - Under a word, whether a value is plain is data: `!int`, `!bigint`,
+    `!float`, `!decimal`, `!bool`, `!true`, `!false` and `!null` take only
+    plain values, and the other standard types any scalar. A block scalar
+    isn't plain; a value left out and an empty document are. Keys are
+    never marked, so a type key takes `1` and `"1"` under any word.
+  - `!json` is a standard name for any JSON value. A table entry named
+    `json` wins over it, and `!json(1..2)`, `!json(/x/)`, `!**: !json` and
+    `!json` as a type key are refused. Under `json`, a document nothing else
+    types (no stamp, a stamp that stamps nothing, or stamps ignored) is read
+    with the standard `!json`, and `oylng_typed_how` gives the new
+    `OYLNG_TYPED_JSON`. A published schema's `%YAML 2.0` line can't have a
+    word.
+  - The emitter writes the `%YAML 2.0` line when the first document starts,
+    or at the stream's end if none does, and `...` and the line again where
+    the word changes. Under a word it keeps each value plain or quoted as
+    the event has it, quotes `oylng_emit_scalar`'s strings, and refuses,
+    `OYLNG_ERR_EMIT`, a plain value that can't be plain where it goes (`a,
+    b` in flow, an empty item of a flow sequence). With a schema, it quotes
+    a string where that reads back as a string (`'3'` under
+    `{!|: [!int, !str]}`), where it would refuse it with no word, and
+    writes a boolean or null as the first word that can be plain.
+    `oylng_emit_tree` now gives the tree's word and each value's plain flag.
+  - A union's booleans and nulls are written as the first of all its words
+    that reads back, not the first word of each alternative only.
+  - The emitter writes a string starting `-<<` and a space plain where it
+    can be, as `- -<< x`: only `-<<`, white space and `*` starts a splice,
+    where before any `-<< ` was quoted, so under a word a plain one was
+    refused.
+  - The fuzz harness checks that words and plain flags are written again,
+    and the dictionary has the words and `!json`.
 - **Quotes don't count for a type, and `!true`, `!false` and words** (part
   2, sections 4.1, 7 and 13, yaml2 `v0.2.4`). Part 2's 984 tests pass (959
   run, 25 holding more), and part 1's 373 are unchanged.

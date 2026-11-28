@@ -125,6 +125,8 @@ static char *emitted(const char *text, size_t len, const char *limit, bool flow,
     return out.data;
 }
 
+static int flow_refused;
+
 /* Why the stream, written again four ways, doesn't read back as events
  * want; NULL if it does */
 static const char *round_trip(const char *in, size_t len, const char *limit, const char *want,
@@ -136,6 +138,12 @@ static const char *round_trip(const char *in, size_t len, const char *limit, con
         size_t olen;
         const char *err;
         char *out = emitted(in, len, limit, ways[w].flow, ways[w].indent, &olen, &err);
+        if (!out && ways[w].flow && strstr(err, "is plain, and can't")) {
+            /* in a stream marked quotes or json, a value stays plain, and
+               flow can't hold every plain value (section 11) */
+            flow_refused++;
+            continue;
+        }
         if (!out) {
             snprintf(detail, dn, "%s: %s", ways[w].name, err);
             return "the emitter refused it";
@@ -170,7 +178,7 @@ static const char *round_trip(const char *in, size_t len, const char *limit, con
 static bool tree_events(const oylng_tree *t, oylng_node n, strbuf *ev, strbuf *offs) {
     oylng_kind k = oylng_node_kind(t, n);
     oylng_event e = { OYLNG_EVT_SCALAR, oylng_node_text(t, n), oylng_node_mark(t, n).offset,
-                      oylng_node_plain(t, n) };
+                      oylng_node_plain(t, n), OYLNG_WORD_NONE };
     char o[32];
     snprintf(o, sizeof o, k == OYLNG_NODE_STRING ? "%zu %c\n" : "%zu\n", e.offset, e.plain ? 'p' : 'q');
     sb_str(offs, o);
@@ -248,7 +256,7 @@ static bool kept_events(const oylng_tree *t, oylng_node n, strbuf *ev, strbuf *o
     oylng_kind k = oylng_node_kind(t, n);
     if (k == OYLNG_NODE_SPLICE || k == OYLNG_NODE_MERGE) return false;   /* never a value */
     oylng_event e = { OYLNG_EVT_SCALAR, oylng_node_text(t, n), oylng_node_mark(t, n).offset,
-                      oylng_node_plain(t, n) };
+                      oylng_node_plain(t, n), OYLNG_WORD_NONE };
     char o[32];
     snprintf(o, sizeof o, k == OYLNG_NODE_STRING ? "%zu %c\n" : "%zu\n", e.offset, e.plain ? 'p' : 'q');
     sb_str(offs, o);
@@ -295,7 +303,7 @@ static const char *kept_check(const char *in, size_t len, const char *limit, con
     oylng_status st;
     oylng_emitter *em = oylng_emitter_new();
     while (!why && (st = oylng_parse_tree(p, &t)) == OYLNG_OK && t) {
-        oylng_event d = { OYLNG_EVT_DOC_START, oylng_tree_name(t), 0, false };
+        oylng_event d = { OYLNG_EVT_DOC_START, oylng_tree_name(t), 0, false, oylng_tree_word(t) };
         ev_line(&ev, &d);
         /* spread only where the full size was accepted: refused for it,
            a kept tree can stand for terabytes */
@@ -358,7 +366,7 @@ static const char *tree_check(const char *in, size_t len, const char *limit, con
     oylng_tree *t;
     oylng_status st;
     while ((st = oylng_parse_tree(p, &t)) == OYLNG_OK && t) {
-        oylng_event d = { OYLNG_EVT_DOC_START, oylng_tree_name(t), 0, false };
+        oylng_event d = { OYLNG_EVT_DOC_START, oylng_tree_name(t), 0, false, oylng_tree_word(t) };
         ev_line(&ev, &d);
         if (!tree_events(t, oylng_tree_root(t), &ev, &of)) why = "a key's lookup is wrong";
         d.type = OYLNG_EVT_DOC_END;
@@ -548,7 +556,8 @@ int main(int argc, char **argv) {
     if (!data) { fprintf(stderr, "usage: test_suite DATA [-v]\n"); return 2; }
     walk(data);
     printf("suite: %d passed, %d failed, %d skipped\n", passed, failed, skipped);
-    printf("emitter: %d streams written again and read back the same\n", trips);
+    printf("emitter: %d streams written again and read back the same, %d refused in flow, which can't keep a "
+           "value plain (section 11)\n", trips, flow_refused);
     printf("tree: %d streams read as trees, the same as their events\n", trees);
     printf("keep: %d streams read with references kept, accepted and refused alike, the same when spread\n", kept);
     return failed ? 1 : 0;

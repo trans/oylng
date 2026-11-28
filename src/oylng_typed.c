@@ -96,6 +96,7 @@ typedef struct {
     const oylng_tree *T;
     oylng_parser     *P;
     bool              cut;
+    bool              marked;     /* the document's stream is marked quotes or json (section 4.1) */
     bool              kept;       /* the tree keeps references (section 11) */
     /* kept: what a line naming each node adds when spread, or UNKNOWN, and
        each node's spread copy, or NONE, for the tree's first nkept nodes,
@@ -480,7 +481,7 @@ static bool pat_number(typer *R, bool integer, const char *s, size_t n, size_t *
     return true;
 }
 
-static int match_std(typer *R, const xt *x, const char *s, size_t n, scalar *out) {
+static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain, scalar *out) {
     const char *name = oylng__std_names[x->std];
     oylng__num num;
     out->neg = false;   /* what a match doesn't set is 0 */
@@ -488,6 +489,12 @@ static int match_std(typer *R, const xt *x, const char *s, size_t n, scalar *out
     out->f = 0;
     out->text = NULL;
     out->textlen = 0;
+    /* in a stream marked quotes or json, the types for numbers, booleans
+       and null take a plain value only (section 4.1) */
+    if (!plain && x->std >= STD_INT && x->std <= STD_NULL) {
+        snprintf(out->why, sizeof out->why, "'%.*s' isn't plain, so not !%s", SHOW(n), s, name);
+        return NO_MATCH;
+    }
     switch (x->std) {
     case STD_STR:
         if ((x->flags & XF_PAT) && !pat_match(R, x, s, n)) {
@@ -621,7 +628,8 @@ static int match_std(typer *R, const xt *x, const char *s, size_t n, scalar *out
 
 /* A scalar matched against a union's alternatives in the order written,
  * !any last: the position that took it, or NONE */
-static uint32_t match_alts(typer *R, const xalts *a, uint32_t node, const char *s, size_t n, scalar *out) {
+static uint32_t match_alts(typer *R, const xalts *a, uint32_t node, const char *s, size_t n, bool plain,
+                           scalar *out) {
     out->neg = false;   /* a literal and !any set only the type */
     out->u = 0;
     out->f = 0;
@@ -630,7 +638,7 @@ static uint32_t match_alts(typer *R, const xalts *a, uint32_t node, const char *
     for (uint32_t i = 0; i < a->n && (lit == NONE || i < lit); i++) {
         const xt *x = a->p[i].t;
         if (x->kind != X_STD || x->std == STD_ANY) continue;
-        int r = match_std(R, x, s, n, out);
+        int r = match_std(R, x, s, n, plain, out);
         if (r == MATCH) return i;
         if (r == REFUSED) refuse(R, node, "%s", out->why);
     }
@@ -645,10 +653,17 @@ static uint32_t match_alts(typer *R, const xalts *a, uint32_t node, const char *
     return NONE;
 }
 
-/* Whether a key fits a type key: how it was written doesn't count (section 7) */
+/* Whether a key fits a type key: how it was written doesn't count, in any
+ * stream (section 7) */
 static bool key_fits(typer *R, const xt *kt, uint32_t node, oylng_str k) {
     scalar sc;
-    return match_alts(R, kt->alts, node, k.data, k.len, &sc) != NONE;
+    return match_alts(R, kt->alts, node, k.data, k.len, true, &sc) != NONE;
+}
+
+/* Whether string node is plain, as the types read it: in a stream marked
+ * quotes or json, as written; in any other, always (section 4.1) */
+static bool plain_here(const typer *R, uint32_t node) {
+    return !R->marked || oylng_node_plain(R->T, node);
 }
 
 static uint32_t scalar_val(typer *R, uint32_t node, const scalar *sc, const xpos *p) {
@@ -805,7 +820,7 @@ static uint32_t one(typer *R, const xpos *p, uint32_t node, const xt *scope) {
     if (k != OYLNG_NODE_STRING) refuse(R, node, "expected !%s", oylng__std_names[x->std]);
     oylng_str s = oylng_node_text(R->T, node);
     scalar sc;
-    int r = match_std(R, x, s.data, s.len, &sc);
+    int r = match_std(R, x, s.data, s.len, plain_here(R, node), &sc);
     if (r != MATCH) refuse(R, node, "%s", sc.why);
     return scalar_val(R, node, &sc, p);
 }
@@ -828,7 +843,7 @@ static uint32_t convert(typer *R, const xt *t, uint32_t node, const xt *scope) {
     }
     oylng_str s = oylng_node_text(R->T, node);
     scalar sc;
-    uint32_t i = match_alts(R, a, node, s.data, s.len, &sc);
+    uint32_t i = match_alts(R, a, node, s.data, s.len, plain_here(R, node), &sc);
     if (i == NONE) refuse(R, node, "'%.*s' is not allowed here", SHOW(s.len), s.data);
     if (sc.type == OYLNG_T_ANY) return new_val(R, OYLNG_T_ANY, node, &a->p[i]);
     return scalar_val(R, node, &sc, &a->p[i]);
@@ -1391,6 +1406,8 @@ memory:
     return NULL;
 }
 
+static void schema_free(void *s) { oylng_schema_free(s); }
+
 /* At a document's start: the schema its stamp names, compiled and checked
  * before its data is read (section 2), or the application's */
 static oylng_status at_start(void *ctx, oylng_str name) {
@@ -1413,13 +1430,18 @@ static oylng_status at_start(void *ctx, oylng_str name) {
     if (name.data && !memchr(name.data, '/', name.len)) {
         sctx *S = oylng__parser_ctx(P);
         uint32_t count = oylng__table_count(P);
-        if (S && S->std_used) {
+        if (S && (S->std_used || S->json_used)) {
             /* an entry since named like a standard type changes what a
                name means, so the schema is compiled again */
             for (uint32_t i = S->entries_seen; i < count && S; i++) {
                 const char *k;
                 size_t kl;
                 oylng__table_entry_at(P, i, &k, &kl);
+                if (S->json_used && kl == 4 && !memcmp(k, "json", 4)) {
+                    oylng__parser_set_ctx(P, NULL, NULL);
+                    S = NULL;
+                    break;
+                }
                 for (int s = 0; s <= STD_ANY; s++)
                     if ((S->std_used & 1u << s) && strlen(oylng__std_names[s]) == kl &&
                         memcmp(oylng__std_names[s], k, kl) == 0) {
@@ -1449,6 +1471,23 @@ static oylng_status at_start(void *ctx, oylng_str name) {
         c->S = c->app->ctx;
         c->root = c->app->root;
         c->how = OYLNG_TYPED_APP;
+    } else if (oylng_parser_word(P) == OYLNG_WORD_JSON) {
+        /* a document that would stay strings: the standard !json, whatever
+           the table's json is, since nothing stamps it with that (section 3) */
+        oylng_schema *js = oylng__parser_json(P);
+        if (!js) {
+            static const char text[] = "%YAML 2.0\n--- &\n"
+                                       "json: {!|: [!null(null), !bool, !int, !float, !str, {!*: !json}, [!json, ...]]}\n";
+            js = oylng_schema_new(text, sizeof text - 1, (oylng_str){ "json", 4 }, 0);
+            if (!js || js->st != OYLNG_OK) {
+                oylng_schema_free(js);
+                return oylng__parser_fail(P, OYLNG_ERR_MEMORY, "out of memory");
+            }
+            oylng__parser_set_json(P, js, schema_free);
+        }
+        c->S = js->ctx;
+        c->root = js->root;
+        c->how = OYLNG_TYPED_JSON;
     }
     return OYLNG_OK;
 }
@@ -1492,6 +1531,7 @@ oylng_status oylng_parse_typed(oylng_parser *P, const oylng_schema *app, oylng_t
     /* with references kept, the limit is on held, which the parser keeps,
        and on typed (section 11) */
     typer R = { .Y = Y, .S = c.S, .T = T, .P = P, .cut = oylng__parser_cut(P), .kept = oylng__parser_keep(P),
+                .marked = oylng_tree_word(T) != OYLNG_WORD_NONE,
                 .nkept = oylng__parser_keep(P) ? oylng_tree_nodes(T) : 0, .limit = oylng__parser_counts_limit(P) };
     bool ok;
     if (!c.root) {
@@ -1539,7 +1579,8 @@ oylng_status oylng__type_emit(const oylng_schema *sc, oylng_tree *T, const oylng
     }
     Y->T = T;
     Y->how = OYLNG_TYPED_APP;
-    typer R = { .Y = Y, .S = sc->ctx, .T = T, .limit = UINT64_MAX, .E = sp, .msg = msg, .msglen = msglen };
+    typer R = { .Y = Y, .S = sc->ctx, .T = T, .limit = UINT64_MAX, .E = sp, .msg = msg, .msglen = msglen,
+                .marked = oylng_tree_word(T) != OYLNG_WORD_NONE };
     R.bn = (oylng_str *)bound;
     R.nbn = nbound;
     bool ok = type_tree(&R, sc->root);

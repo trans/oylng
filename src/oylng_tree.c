@@ -60,6 +60,7 @@ struct oylng_tree {
     bool           keyed;
     oylng_hash_key key;
     bool           kept;   /* references kept: SPLICE and MERGE nodes */
+    uint8_t        word;   /* oylng_word: the document's (section 4.1) */
 };
 
 /* What is needed only while the tree is read */
@@ -370,6 +371,7 @@ oylng_status oylng__tree_read(oylng_parser *P, oylng_tree **out,
         B.T->inlen = len;
         B.T->root = OYLNG_NO_NODE;
         B.T->kept = oylng__parser_keep(P);
+        B.T->word = (uint8_t)e->word;
         if (e->value.data) {
             B.T->has_name = true;
             B.T->name_n = (uint32_t)e->value.len;
@@ -413,6 +415,7 @@ oylng_status oylng_parser_table(oylng_parser *P, oylng_tree **out) {
     B.T->in = in;
     B.T->inlen = len;
     B.T->kept = oylng__parser_keep(P);
+    B.T->word = (uint8_t)oylng_parser_word(P);
     /* a mapping of the entries, where the first one's key is */
     uint32_t k, v;
     oylng__tnode kn;
@@ -445,6 +448,8 @@ oylng_str oylng_tree_name(const oylng_tree *T) {
     if (!T || !T->has_name) return (oylng_str){ NULL, 0 };
     return (oylng_str){ (T->name_flags & F_POOLED ? T->pool : T->in) + T->name_a, T->name_n };
 }
+
+oylng_word oylng_tree_word(const oylng_tree *T) { return T ? (oylng_word)T->word : OYLNG_WORD_NONE; }
 
 size_t oylng_tree_nodes(const oylng_tree *T) { return T ? T->nn : 0; }
 
@@ -744,12 +749,13 @@ oylng_mark oylng_node_mark(const oylng_tree *T, oylng_node n) {
 
 /* ── A tree the emitter builds (part 2, section 13) ──────── */
 
-oylng_status oylng__tree_make(const oylng__tnew *nd, size_t n, const char *text, oylng_tree **out) {
+oylng_status oylng__tree_make(const oylng__tnew *nd, size_t n, const char *text, oylng_word word, oylng_tree **out) {
     *out = NULL;
     builder B = { .st = OYLNG_OK };
     B.T = calloc(1, sizeof *B.T);
     if (!B.T) return OYLNG_ERR_MEMORY;
     B.T->in = "";
+    B.T->word = (uint8_t)word;
     B.T->root = OYLNG_NO_NODE;
     for (size_t i = 0; i < n && B.st == OYLNG_OK; i++) {
         bool str = nd[i].kind == OYLNG_NODE_STRING;
@@ -801,7 +807,8 @@ oylng_status oylng_emit_tree(oylng_emitter *E, const oylng_tree *T) {
     if (!E || !T || T->root == OYLNG_NO_NODE) return OYLNG_ERR_INPUT;
     /* written in full, its references could be any size */
     if (T->kept) return OYLNG_ERR_INPUT;
-    oylng_status st = oylng_emit_doc_start(E, oylng_tree_name(T));
+    oylng_event ev = { .type = OYLNG_EVT_DOC_START, .value = oylng_tree_name(T), .word = oylng_tree_word(T) };
+    oylng_status st = oylng_emit(E, &ev);
     if (st != OYLNG_OK) return st;
     /* the collections open: each one's node and its next child */
     struct walk { oylng_node id; uint32_t next; } local[64], *stk = local;
@@ -809,7 +816,10 @@ oylng_status oylng_emit_tree(oylng_emitter *E, const oylng_tree *T) {
     oylng_node id = T->root;
     for (;;) {
         const tnode *nd = &T->nodes[id];
-        if (nd->kind == OYLNG_NODE_STRING) st = oylng_emit_scalar(E, text_of(T, nd));
+        if (nd->kind == OYLNG_NODE_STRING) {
+            ev = (oylng_event){ .type = OYLNG_EVT_SCALAR, .value = text_of(T, nd), .plain = (nd->flags & F_PLAIN) != 0 };
+            st = oylng_emit(E, &ev);
+        }
         else {
             bool map = nd->kind == OYLNG_NODE_MAPPING;
             st = map ? oylng_emit_map_start(E, false) : oylng_emit_seq_start(E, false);

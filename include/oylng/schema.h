@@ -139,10 +139,14 @@ typedef enum {
     OYLNG_TYPED_APP,       /**< by the application's schema */
     OYLNG_TYPED_PUBLISHED, /**< by its stamp, a published name the
                                 application's lookup found */
+    OYLNG_TYPED_JSON,      /**< by the standard !json, as a stream marked
+                                json reads a document nothing else types
+                                (section 3) */
 } oylng_typed_by;
 
 /** The next document, typed: by its stamp, else by @p app (which may be
- *  NULL), else not at all. Called where oylng_parse_tree can be, and like
+ *  NULL), else, under %YAML 2.0 json, by the standard !json, else not at
+ *  all. Called where oylng_parse_tree can be, and like
  *  it gives *out NULL at the end of the stream. A schema the stream holds,
  *  or a published one, is checked before the document's data is read.
  *  Errors are final, as the parser's are; OYLNG_ERR_INPUT for an app

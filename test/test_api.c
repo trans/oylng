@@ -1028,9 +1028,127 @@ static void test_keep(void) {
           "kept alone, 12");
 }
 
+/* The words of each document, from its events, or "!" where refused */
+static const char *words_of(const char *s, oylng_mark *m) {
+    static char out[64];
+    size_t n = 0;
+    oylng_parser *p = oylng_parser_new(s, strlen(s));
+    const oylng_event *e;
+    for (;;) {
+        oylng_status st = oylng_parse_next(p, &e);
+        if (st != OYLNG_OK) { if (m) *m = oylng_parser_error_mark(p); out[n++] = '!'; break; }
+        if (e->type == OYLNG_EVT_DOC_START) {
+            out[n++] = "nqj"[e->word];
+            if (e->word != oylng_parser_word(p)) out[n++] = '?';
+        }
+        if (e->type == OYLNG_EVT_STREAM_END || n > 60) break;
+    }
+    out[n] = 0;
+    oylng_parser_free(p);
+    return out;
+}
+
+/* %YAML 2.0 quotes and json (part 1, section 4.1) */
+static void test_words(void) {
+    oylng_mark m = { 0 };
+    const char *w;
+    w = words_of("%YAML 2.0 quotes\n---\na\n...\n%YAML 2.0\n---\nb\n...\n%YAML 2.0 json\n---\nc\n", NULL);
+    CHECK(!strcmp(w, "qnj"), "a word each: %s", w);
+    w = words_of("%YAML 2.0 quotes\n---\na\n...\n---\nb\n--- c\n", NULL);
+    CHECK(!strcmp(w, "qqq"), "held past ...: %s", w);
+    w = words_of("%YAML 2.0 json # a comment\n---\na\n", NULL);
+    CHECK(!strcmp(w, "j"), "with a comment: %s", w);
+    static const char *bad[] = { "%YAML 2.0\tquotes\n", "%YAML 2.0  quotes\n", "%YAML 2.0 Quotes\n",
+                                 "%YAML 2.0 jsonx\n", "%YAML 2.0 quotes json\n", "%YAML 2.0 yes\n",
+                                 "%YAML 2.0 json\t\n#\n" };
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; i++) {
+        char s[96];
+        snprintf(s, sizeof s, "%s---\na\n", bad[i]);
+        w = words_of(s, &m);
+        bool ok = i == 6 ? !strcmp(w, "j") : !strcmp(w, "!") && m.line == 1 && m.col == 11;
+        CHECK(ok, "%s: %s at %zu:%zu", bad[i], w, m.line, m.col);
+    }
+    /* after ...: an unknown word is refused, marker or not; a known one
+       with no marker after it is a stop */
+    w = words_of("%YAML 2.0\n---\na\n...\n%YAML 2.0 jsonx\n---\nb\n", &m);
+    CHECK(!strcmp(w, "n!") && m.line == 5 && m.col == 11, "jsonx after ...: %s at %zu:%zu", w, m.line, m.col);
+    w = words_of("%YAML 2.0\n---\na\n...\n%YAML 2.0 x\nbody\n", &m);
+    CHECK(!strcmp(w, "n!") && m.line == 5, "x after ..., no marker: %s at %zu", w, m.line);
+    const char *t = "%YAML 2.0\n---\na\n...\n%YAML 2.0 quotes\nbody\n";
+    oylng_parser *p = oylng_parser_new(t, strlen(t));
+    size_t off = 0;
+    CHECK(read_all(p, NULL) == OYLNG_OK && oylng_parser_stopped(p, &off) && !strcmp(t + off, "%YAML 2.0 quotes\nbody\n"),
+          "quotes after ..., no marker: a stop");
+    oylng_parser_free(p);
+
+    /* each value plain or not; the tree keeps the word and the flags */
+    t = "%YAML 2.0 quotes\n---\na: \"1\"\nb: 1\nc:\nd: |-\n  x\n";
+    p = oylng_parser_new(t, strlen(t));
+    oylng_tree *tr = NULL;
+    CHECK(oylng_parse_tree(p, &tr) == OYLNG_OK && tr, "a tree under quotes");
+    if (tr) {
+        oylng_node r = oylng_tree_root(tr);
+        CHECK(oylng_tree_word(tr) == OYLNG_WORD_QUOTES, "the tree's word");
+        CHECK(!oylng_node_plain(tr, oylng_node_get(tr, r, (oylng_str){ "a", 1 })) &&
+              oylng_node_plain(tr, oylng_node_get(tr, r, (oylng_str){ "b", 1 })) &&
+              oylng_node_plain(tr, oylng_node_get(tr, r, (oylng_str){ "c", 1 })) &&
+              !oylng_node_plain(tr, oylng_node_get(tr, r, (oylng_str){ "d", 1 })), "plain flags");
+        oylng_tree_free(tr);
+    }
+    oylng_parser_free(p);
+
+    /* typed: under json, the standard !json, unless something else types
+       it; under quotes, nothing more */
+    static const struct { const char *s; oylng_typed_by how; oylng_type a, b; } ty[] = {
+        { "%YAML 2.0 json\n---\n{\"a\": 1, \"b\": \"1\"}\n", OYLNG_TYPED_JSON, OYLNG_T_INT, OYLNG_T_STR },
+        { "%YAML 2.0 json\n--- !nope\n{\"a\": null, \"b\": \"null\"}\n", OYLNG_TYPED_JSON, OYLNG_T_NULL, OYLNG_T_STR },
+        { "%YAML 2.0 json\n--- &\njson: {a: !str, b: !int}\n--- !json\na: 1\nb: 1\n", OYLNG_TYPED_STAMP, OYLNG_T_STR, OYLNG_T_INT },
+        /* untyped: the root is !any, with no values below it */
+        { "%YAML 2.0 quotes\n---\na: 1\nb: \"1\"\n", OYLNG_TYPED_NOT, OYLNG_T_NONE, OYLNG_T_NONE },
+        { "%YAML 2.0 quotes\n--- &\nn: {a: {!|: [!int, !str]}, b: {!|: [!int, !str]}}\n--- !n\na: 1\nb: \"1\"\n",
+          OYLNG_TYPED_STAMP, OYLNG_T_INT, OYLNG_T_STR },
+        { "%YAML 2.0 json\n--- &\nn: {!int: !bool}\n--- !n\n1: true\n\"2\": false\n", OYLNG_TYPED_STAMP, OYLNG_T_BOOL, OYLNG_T_BOOL },
+    };
+    for (size_t i = 0; i < sizeof ty / sizeof *ty; i++) {
+        p = oylng_parser_new(ty[i].s, strlen(ty[i].s));
+        oylng_typed *y = NULL;
+        oylng_status st = oylng_parse_typed(p, NULL, &y);
+        CHECK(st == OYLNG_OK && y, "typed %zu: %s", i, oylng_parser_error(p));
+        if (y) {
+            oylng_value r = oylng_typed_root(y);
+            oylng_value a = oylng_value_at(y, r, 0), b = oylng_value_at(y, r, 1);
+            CHECK(oylng_typed_how(y) == ty[i].how && oylng_value_type(y, a) == ty[i].a && oylng_value_type(y, b) == ty[i].b,
+                  "typed %zu: by %d, %d and %d", i, oylng_typed_how(y), oylng_value_type(y, a), oylng_value_type(y, b));
+            oylng_typed_free(y);
+        }
+        oylng_parser_free(p);
+    }
+    /* !json in a schema, and what it can't be */
+    const char *js = "%YAML 2.0\n--- &\nr: {x: !json}\n";
+    oylng_schema *sc = oylng_schema_new(js, strlen(js), (oylng_str){ "r", 1 }, 0);
+    CHECK(oylng_schema_status(sc) == OYLNG_OK, "!json in a schema: %s", oylng_schema_error(sc));
+    t = "%YAML 2.0 json\n---\nx: [1, {\"y\": \"z\"}]\n";
+    p = oylng_parser_new(t, strlen(t));
+    oylng_typed *y = NULL;
+    CHECK(oylng_parse_typed(p, sc, &y) == OYLNG_OK && y && oylng_typed_how(y) == OYLNG_TYPED_APP,
+          "the app's schema over json's: %s", oylng_parser_error(p));
+    oylng_typed_free(y);
+    oylng_parser_free(p);
+    oylng_schema_free(sc);
+    static const char *nots[] = { "r: !json(1..2)\n", "r: !json(/x/)\n", "r: {!**: !json}\n", "r: {!json: !str}\n" };
+    for (size_t i = 0; i < sizeof nots / sizeof *nots; i++) {
+        char s[96];
+        snprintf(s, sizeof s, "%%YAML 2.0\n--- &\n%s", nots[i]);
+        sc = oylng_schema_new(s, strlen(s), (oylng_str){ "r", 1 }, 0);
+        CHECK(oylng_schema_status(sc) != OYLNG_OK, "refused: %s", nots[i]);
+        oylng_schema_free(sc);
+    }
+}
+
 int main(void) {
     test_error_marks();
     test_stop();
+    test_words();
     test_limits();
     test_levels();
     test_api_edges();

@@ -232,6 +232,9 @@ static const char *round_trip(const char *s, size_t n, const oylng_typed *y, cha
             oylng_schema_free(sc);
             return why;
         }
+    } else if (oylng_typed_how(y) == OYLNG_TYPED_JSON) {
+        static const char js[] = "%YAML 2.0\n--- &\nj: !json\n";   /* the default's standard !json */
+        sc = oylng_schema_new(js, sizeof js - 1, (oylng_str){ "j", 1 }, 0);
     } else if (oylng_typed_how(y) != OYLNG_TYPED_NOT) {
         return NULL;   /* a published name, which isn't looked up here */
     }
@@ -240,6 +243,7 @@ static const char *round_trip(const char *s, size_t n, const oylng_typed *y, cha
         oylng_emitter *e = oylng_emitter_new();
         oylng_emitter_set_flow(e, flow);
         oylng_emitter_set_schema(e, sc);
+        oylng_emitter_set_word(e, oylng_tree_word(oylng_typed_tree(y)));
         oylng_status st = oylng_emit_stream_start(e);
         if (st == OYLNG_OK) st = oylng_emit_doc_start(e, name);
         if (st == OYLNG_OK) st = oylng_emit_value(e, y, oylng_typed_root(y));

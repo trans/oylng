@@ -38,6 +38,10 @@ enum { E_BEFORE, E_STREAM, E_ROOT, E_DONE, E_END, E_FAILED };
  * caller has found reads back, or not plain, or as an empty value */
 enum { F_AUTO, F_PLAIN, F_QUOTED, F_EMPTY };
 
+/* A value as given, in a document under quotes or json (section 4.1): a
+ * string, written as the emitter or the typer chooses, or plain, or not */
+enum { M_NONE, M_PLAIN, M_QUOTED };
+
 /* An open collection */
 typedef struct {
     bool     map;        /* else a sequence */
@@ -68,6 +72,12 @@ struct oylng_emitter {
 
     unsigned indent;
     bool     flow_all;
+
+    /* the words (section 4.1): for the documents started from now on, the
+       open document's, and the last %YAML 2.0 line's, which the first
+       document writes */
+    uint8_t  word, dword, lword;
+    bool     line_due;
 
     eframe  *fr;
     uint32_t sp, capfr;
@@ -106,6 +116,9 @@ struct oylng_emitter {
     uint32_t  cnode;              /* the node being spelled */
     char      why[160];           /* why its spelling doesn't read back */
     unsigned  craw;               /* and its next spelling to look at */
+    uint32_t  wg, wj;             /* or its next word: the group, the word */
+    bool      wq;                 /* and whether quoted */
+    bool      words_done;         /* past its words */
     struct ebind { char *name; size_t len; oylng_unbind_fn fn; void *ctx; } *binds;
     size_t    nbinds, capbinds;
 };
@@ -232,8 +245,13 @@ static bool first_ok(const char *s, size_t n, const place *pl) {
         if (n == 1 || s[1] == ' ' || s[1] == '\t' || (pl->flow && is_flowi(s[1]))) return false;
         break;
     }
-    /* -<< and a space: a splice, where it's an item */
-    if (n > 3 && !memcmp(s, "-<<", 3) && (s[3] == ' ' || s[3] == '\t')) return false;
+    /* -<<, white space and *: a splice where it's an item, refused
+       elsewhere; no plain scalar starts so (the grammar's merge-item) */
+    if (n > 3 && !memcmp(s, "-<<", 3) && (s[3] == ' ' || s[3] == '\t')) {
+        size_t i = 3;
+        while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+        if (i < n && s[i] == '*') return false;
+    }
     /* a plain << key merges; and at column 0, a line of --- or ... is a
        marker or an end: such a key reads back, but would only mislead */
     if (pl->key && n == 2 && s[0] == '<' && s[1] == '<') return false;
@@ -542,6 +560,7 @@ typedef struct erec {
     size_t   b, blen;       /* in tb, OYLNG_T_BINARY's bytes */
     size_t   hint, hlen;    /* in tb, how it was written where it was read, or SIZE_MAX */
     bool     hplain;
+    uint8_t  mark;          /* a string's M_: given plain or not, in a marked document */
     union {
         double         f;
         oylng_datetime dt;
@@ -671,23 +690,30 @@ static int spelling(const oylng_emitter *E, const erec *r, const oylng__tnew *t,
     return raw_spelling(r->want, std, t->len, i, out, plain);
 }
 
-/* Spelling i of record r where a boolean or null is written as one of
- * the nw words w: those for its value, in order, each plain and then
- * quoted, an empty one as ""; then its own (section 13) */
-static int place_spelling(const oylng_emitter *E, const erec *r, const oylng__tnew *t, unsigned i,
-                          const oylng__word *w, uint32_t nw, oylng_str *out, bool *plain) {
-    if (r->want == OYLNG_T_BOOL || r->want == OYLNG_T_NULL) {
-        if (i < 2 * (size_t)nw) {
-            const oylng__word *x = &w[i / 2];
-            uint8_t what = r->want == OYLNG_T_NULL ? OYLNG__NULL : E->tb[t->off] == 't' ? OYLNG__TRUE : OYLNG__FALSE;
-            if (x->what != what || (i % 2 == 0 && !x->text.len)) return -1;
-            *out = x->text;
-            *plain = i % 2 == 0;
+/* The next word of the nw groups w for record r, a boolean or null: the
+ * words of each group for its value, in order, each plain and then
+ * quoted, an empty one as "" (section 13). In a document under quotes or
+ * json, a quoted word doesn't match, so each is plain only, and an empty
+ * one is a value left out. 1 with it, or 0 past the last. */
+static int word_spelling(oylng_emitter *E, const erec *r, const oylng__tnew *t, const oylng__word *w, uint32_t nw,
+                         oylng_str *out, bool *plain) {
+    uint8_t what = r->want == OYLNG_T_NULL ? OYLNG__NULL : E->tb[t->off] == 't' ? OYLNG__TRUE : OYLNG__FALSE;
+    bool marked = E->dword != OYLNG_WORD_NONE;
+    for (; E->wg < nw; E->wg++, E->wj = 0, E->wq = false) {
+        const oylng__word *x = &w[E->wg];
+        if (x->what != what) continue;
+        while (E->wj < x->n) {
+            oylng_str s = { x->words[E->wj].s, x->words[E->wj].len };
+            bool q = E->wq;
+            E->wq = !q;
+            if (q) E->wj++;
+            if (q ? marked : !marked && !s.len) continue;
+            *out = s;
+            *plain = !q;
             return 1;
         }
-        i -= 2 * nw;
     }
-    return spelling(E, r, t, i, out, plain);
+    return 0;
 }
 
 /* For the typer (oylng__speller) */
@@ -697,12 +723,28 @@ static bool next_spelling(void *ctx, uint32_t node, unsigned k, const oylng__wor
     if (!k || node != E->cnode) {
         E->cnode = node;
         E->craw = 0;
+        E->wg = E->wj = 0;
+        E->wq = false;
+        E->words_done = E->rec[node].want != OYLNG_T_BOOL && E->rec[node].want != OYLNG_T_NULL;
     }
     const erec *r = &E->rec[node];
     const oylng__tnew *t = &E->tn[node];
     place pl = { NULL, r->flow, false, false, -1 };
+    if (r->mark) {
+        /* given plain or not, in a marked document: that is data, so the
+           one spelling there is */
+        if (E->craw++) return false;
+        *out = (oylng_str){ E->tb + t->off, t->len };
+        *plain = r->mark == M_PLAIN;
+        return writable(*out, *plain, &pl, r->empty);
+    }
     for (;;) {
-        int got = place_spelling(E, r, t, E->craw++, w, nw, out, plain);
+        /* its words first, then its own spellings (section 13) */
+        int got = E->words_done ? spelling(E, r, t, E->craw++, out, plain) : word_spelling(E, r, t, w, nw, out, plain);
+        if (!got && !E->words_done) {
+            E->words_done = true;
+            continue;
+        }
         if (!got) return false;
         if (got > 0 && writable(*out, *plain, &pl, r->empty)) return true;
     }
@@ -855,7 +897,7 @@ static oylng_status typed_out(oylng_emitter *E, uint8_t want, const char *s, siz
 /* Typed, then written again as typed */
 static oylng_status held_end(oylng_emitter *E) {
     oylng_tree *T;
-    oylng_status st = oylng__tree_make(E->tn, E->nrec, E->tb, &T);
+    oylng_status st = oylng__tree_make(E->tn, E->nrec, E->tb, (oylng_word)E->dword, &T);
     if (st != OYLNG_OK)
         return fail(E, st, "%s", st == OYLNG_ERR_MEMORY ? "out of memory" : "a typed document too large to hold");
     oylng__speller sp = { E, next_spelling, fits, describe };
@@ -944,14 +986,27 @@ void oylng_emitter_set_flow(oylng_emitter *E, bool flow) {
     if (E) E->flow_all = flow;
 }
 
+void oylng_emitter_set_word(oylng_emitter *E, oylng_word word) {
+    if (E && (unsigned)word <= OYLNG_WORD_JSON) E->word = (uint8_t)word;
+}
+
 oylng_status oylng_emit_stream_start(oylng_emitter *E) {
     if (!E) return OYLNG_ERR_INPUT;
     if (!live(E)) return E->status;
     if (E->state != E_BEFORE) return fail(E, OYLNG_ERR_EMIT, "the stream has started already");
-    OUT(E, "%YAML 2.0");
-    out_nl(E);
+    E->line_due = true;   /* written with the first document's word */
     E->state = E_STREAM;
     return done(E);
+}
+
+static const char *const word_names[] = { "", " quotes", " json" };
+
+static void directive_out(oylng_emitter *E, uint8_t w) {
+    OUT(E, "%YAML 2.0");
+    out_add(E, word_names[w], strlen(word_names[w]));
+    out_nl(E);
+    E->lword = w;
+    E->line_due = false;
 }
 
 oylng_status oylng_emit_stream_end(oylng_emitter *E) {
@@ -961,6 +1016,7 @@ oylng_status oylng_emit_stream_end(oylng_emitter *E) {
         return fail(E, OYLNG_ERR_EMIT, "%s", E->state == E_BEFORE ? "the stream hasn't started" :
                                              E->state == E_END ? "the stream has ended already" :
                                              "a document is still open");
+    if (E->line_due) directive_out(E, E->word);
     E->state = E_END;
     return done(E);
 }
@@ -992,6 +1048,17 @@ oylng_status oylng_emit_doc_start(oylng_emitter *E, oylng_str name) {
                 return fail(E, OYLNG_ERR_EMIT, "a document's name is letters, digits and . _ - /, "
                             "and this one has another character, at its byte %zu", (size_t)(q - u));
             q += n;
+        }
+    }
+    if (!E->replay) {
+        /* the word: on the first line, or after ... on a line of its own */
+        E->dword = E->word;
+        if (E->line_due) directive_out(E, E->dword);
+        else if (E->dword != E->lword) {
+            new_line(E, 0);
+            OUT(E, "...");
+            out_nl(E);
+            directive_out(E, E->dword);
         }
     }
     if (!E->replay && E->schema) {   /* held till its end (section 13) */
@@ -1031,7 +1098,9 @@ oylng_status oylng_emit_doc_end(oylng_emitter *E) {
     return done(E);
 }
 
-oylng_status oylng_emit_scalar(oylng_emitter *E, oylng_str value) {
+/* A string, given plain or not (M_) where its document is under quotes or
+ * json and it is a value: there that is data, and kept (section 11) */
+static oylng_status scalar_emit(oylng_emitter *E, oylng_str value, int mark) {
     if (!E || (value.len && !value.data)) return OYLNG_ERR_INPUT;
     if (!live(E)) return E->status;
     place pl;
@@ -1041,21 +1110,36 @@ oylng_status oylng_emit_scalar(oylng_emitter *E, oylng_str value) {
         int n = value.len > 60 ? 60 : (int)value.len;
         return fail(E, OYLNG_ERR_EMIT, "the key \"%.*s\" is given twice in one mapping", n, value.data);
     }
+    if (pl.key || E->dword == OYLNG_WORD_NONE) mark = M_NONE;
+    else if (mark == M_NONE && !holding(E)) mark = M_QUOTED;   /* a string, with no schema to say */
+    int style = E->replay ? E->force : mark == M_QUOTED ? F_QUOTED : F_AUTO;
+    if (mark == M_PLAIN && !E->replay) {
+        int n = value.len > 60 ? 60 : (int)value.len;
+        if (!value.len && !empty_ok(&pl))
+            return fail(E, OYLNG_ERR_EMIT, "an empty value is plain, and can't be an item of a flow sequence");
+        if (value.len && !can_plain(value.data, value.len, &pl))
+            return fail(E, OYLNG_ERR_EMIT, "'%.*s' is plain, and can't be plain here, where a stream marked "
+                        "quotes or json keeps it so", n, value.data);
+        style = value.len ? F_PLAIN : F_EMPTY;
+    }
     if (holding(E)) {
         erec *r = rec_add(E, OYLNG_NODE_STRING, value.data, value.len,
-                          !pl.key && can_plain(value.data, value.len, &pl));
+                          !pl.key && (mark ? mark == M_PLAIN : can_plain(value.data, value.len, &pl)));
         if (!r) return done(E);
         if (!pl.key) {
             r->want = OYLNG_T_STR;
             r->flow = pl.flow;
             r->empty = empty_ok(&pl);
+            r->mark = (uint8_t)mark;
         }
     }
-    st = scalar_out(E, value.data, value.len, &pl, E->replay ? E->force : F_AUTO);
+    st = scalar_out(E, value.data, value.len, &pl, style);
     if (st != OYLNG_OK) return st;
     node_done(E);
     return done(E);
 }
+
+oylng_status oylng_emit_scalar(oylng_emitter *E, oylng_str value) { return scalar_emit(E, value, M_NONE); }
 
 static oylng_status coll_start(oylng_emitter *E, bool map, bool flow) {
     if (!E) return OYLNG_ERR_INPUT;
@@ -1132,13 +1216,19 @@ oylng_status oylng_emit(oylng_emitter *E, const oylng_event *evt) {
     switch (evt->type) {
     case OYLNG_EVT_STREAM_START: return oylng_emit_stream_start(E);
     case OYLNG_EVT_STREAM_END:   return oylng_emit_stream_end(E);
-    case OYLNG_EVT_DOC_START:    return oylng_emit_doc_start(E, evt->value);
+    case OYLNG_EVT_DOC_START:
+        if (live(E) && E->state == E_STREAM) {
+            if ((unsigned)evt->word > OYLNG_WORD_JSON)
+                return fail(E, OYLNG_ERR_EMIT, "no such word as %u: a document's is none, quotes or json", (unsigned)evt->word);
+            E->word = (uint8_t)evt->word;
+        }
+        return oylng_emit_doc_start(E, evt->value);
     case OYLNG_EVT_DOC_END:      return oylng_emit_doc_end(E);
     case OYLNG_EVT_MAP_START:    return oylng_emit_map_start(E, false);
     case OYLNG_EVT_MAP_END:      return oylng_emit_map_end(E);
     case OYLNG_EVT_SEQ_START:    return oylng_emit_seq_start(E, false);
     case OYLNG_EVT_SEQ_END:      return oylng_emit_seq_end(E);
-    case OYLNG_EVT_SCALAR:       return oylng_emit_scalar(E, evt->value);
+    case OYLNG_EVT_SCALAR:       return scalar_emit(E, evt->value, evt->plain ? M_PLAIN : M_QUOTED);
     default:                     return OYLNG_ERR_INPUT;
     }
 }
@@ -1377,7 +1467,10 @@ oylng_status oylng_emit_value(oylng_emitter *E, const oylng_typed *t, oylng_valu
         }
         if (node) {
             oylng_kind k = oylng_node_kind(T, id);
-            if (k == OYLNG_NODE_STRING) st = oylng_emit_scalar(E, oylng_node_text(T, id));
+            /* untyped: in a marked stream, plain or not as read (section 11) */
+            if (k == OYLNG_NODE_STRING)
+                st = scalar_emit(E, oylng_node_text(T, id), oylng_tree_word(T) == OYLNG_WORD_NONE ? M_NONE
+                                                          : oylng_node_plain(T, id) ? M_PLAIN : M_QUOTED);
             else {
                 coll = true;
                 map = k == OYLNG_NODE_MAPPING;

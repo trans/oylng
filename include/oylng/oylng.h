@@ -86,6 +86,17 @@ typedef enum {
     OYLNG_EVT_SCALAR,       /**< value: the string */
 } oylng_event_type;
 
+/** The word after `%YAML 2.0` on a stream's first line, or on one after
+ *  `...` (section 4.1), which holds for the documents after it */
+typedef enum {
+    OYLNG_WORD_NONE = 0,   /**< `%YAML 2.0` alone: how a scalar is written
+                                isn't data */
+    OYLNG_WORD_QUOTES,     /**< `%YAML 2.0 quotes`: whether a value is
+                                plain is data (section 5) */
+    OYLNG_WORD_JSON,       /**< `%YAML 2.0 json`: quotes, and part 2 reads a
+                                document nothing else types with !json */
+} oylng_word;
+
 /** An event. A mapping's events alternate key and value. */
 typedef struct {
     oylng_event_type type;
@@ -93,10 +104,17 @@ typedef struct {
     size_t           offset;  /**< Where the node is written in the input.
                                    A node reached through a reference is
                                    where the table holds it. */
-    bool             plain;   /**< SCALAR: written plain, or an empty value.
-                                   How a scalar was written isn't data
-                                   (section 11), but a schema reads it
-                                   (part 2, section 3). */
+    bool             plain;   /**< SCALAR: written plain, or an empty value,
+                                   through a reference as the table has it.
+                                   In a stream marked quotes or json, a
+                                   value's is data (section 5); a key's
+                                   never is, and elsewhere a value's isn't
+                                   either. A schema's own table reads it
+                                   in any stream: a quoted scalar there is
+                                   a literal (part 2, section 5). */
+    oylng_word       word;    /**< DOC_START: the word the document comes
+                                   under. Given to oylng_emit, the word the
+                                   emitter writes it under. */
 } oylng_event;
 
 /* ── Parser ──────────────────────────────────────────────── */
@@ -162,6 +180,10 @@ OYLNG_API oylng_mark  oylng_parser_error_mark(const oylng_parser *p);
  *  after the `...`. The rest wasn't read or checked. */
 OYLNG_API bool oylng_parser_stopped(const oylng_parser *p, size_t *offset);
 
+/** The word the document being read, or the last one read, comes under:
+ *  the one on the `%YAML 2.0` line before it (section 4.1). */
+OYLNG_API oylng_word oylng_parser_word(const oylng_parser *p);
+
 OYLNG_API void oylng_parser_free(oylng_parser *p);
 
 /* ── Emitter ─────────────────────────────────────────────── */
@@ -169,15 +191,23 @@ OYLNG_API void oylng_parser_free(oylng_parser *p);
 /* The emitter writes YAML 2.0 from events, in the order the parser gives
  * them: STREAM_START (DOC_START node DOC_END)* STREAM_END, where a node is
  * a SCALAR or a collection, and a mapping's nodes alternate key and value.
- * It writes `%YAML 2.0` first, `---` (or `--- !name`) for each document,
- * keys in the order given, and every node in full (section 11). Reading
- * the output gives the same events back.
+ * It writes `%YAML 2.0` first, with the first document's word if it has
+ * one, `---` (or `--- !name`) for each document, keys in the order given,
+ * and every node in full (section 11). A document under another word than
+ * the one before it starts after `...` and a `%YAML 2.0` line with its
+ * word. Reading the output gives the same events back.
  *
  * A scalar is written plain where that reads back as the same string,
  * else in single quotes, else in double quotes with JSON's escapes. Text
  * with line breaks is written as a literal block scalar (| or |-) where
  * that reads back exactly, else in double quotes. Collections are block
  * collections, indented, unless flow is asked for; an empty one is {} or [].
+ *
+ * In a document under quotes or json (section 4.1), whether a value is
+ * plain is data, and a value is written plain or not as its event's plain
+ * says (oylng_emit), or, from oylng_emit_scalar, quoted; a key as before.
+ * Where a plain value can't be plain, as `a, b` can't in a flow
+ * collection, nor an empty value in a flow sequence, it is OYLNG_ERR_EMIT.
  *
  * What YAML 2.0 can't hold is OYLNG_ERR_EMIT: invalid UTF-8, a key given
  * twice in a mapping, a collection as a key, a name with characters a name
@@ -198,6 +228,12 @@ OYLNG_API void oylng_emitter_set_indent(oylng_emitter *e, unsigned indent);
  *  document is one line. */
 OYLNG_API void oylng_emitter_set_flow(oylng_emitter *e, bool flow);
 
+/** The word the documents started from now on are written under (section
+ *  4.1); OYLNG_WORD_NONE, the default, for none, and any other value is
+ *  ignored. A DOC_START event given to oylng_emit sets it to the event's
+ *  word, and one with another value is refused. */
+OYLNG_API void oylng_emitter_set_word(oylng_emitter *e, oylng_word word);
+
 /** Write an event, such as one from oylng_parse_next(). A collection's
  *  start is written in block style unless the emitter is set to flow. */
 OYLNG_API oylng_status oylng_emit(oylng_emitter *e, const oylng_event *evt);
@@ -211,7 +247,9 @@ OYLNG_API oylng_status oylng_emit_doc_start(oylng_emitter *e, oylng_str name);
 OYLNG_API oylng_status oylng_emit_doc_end(oylng_emitter *e);
 
 /** A string. It is copied or written at once, so it needn't outlive the
- *  call. */
+ *  call. As a value in a document under quotes or json, with no schema, it
+ *  is quoted, so that it reads as a string; oylng_emit with a SCALAR event
+ *  writes one plain. */
 OYLNG_API oylng_status oylng_emit_scalar(oylng_emitter *e, oylng_str value);
 
 /** Start a mapping or a sequence; @p flow writes this one in flow style,
@@ -304,6 +342,9 @@ OYLNG_API oylng_node oylng_tree_root(const oylng_tree *t);
 /** The document's name, or data NULL if it has none. */
 OYLNG_API oylng_str oylng_tree_name(const oylng_tree *t);
 
+/** The word the document comes under (section 4.1). */
+OYLNG_API oylng_word oylng_tree_word(const oylng_tree *t);
+
 /** How many nodes the tree has, a shared node counted once. */
 OYLNG_API size_t oylng_tree_nodes(const oylng_tree *t);
 
@@ -315,7 +356,7 @@ OYLNG_API oylng_kind oylng_node_kind(const oylng_tree *t, oylng_node n);
 OYLNG_API oylng_str oylng_node_text(const oylng_tree *t, oylng_node n);
 
 /** Whether a string was written plain, or is an empty value, as an event's
- *  plain says. */
+ *  plain says: data for a value under quotes or json (section 5). */
 OYLNG_API bool oylng_node_plain(const oylng_tree *t, oylng_node n);
 
 /** A sequence's items or a mapping's pairs, as written in a kept tree,
@@ -354,7 +395,9 @@ OYLNG_API oylng_node oylng_node_merge(const oylng_tree *t, oylng_node map, size_
 OYLNG_API oylng_mark oylng_node_mark(const oylng_tree *t, oylng_node n);
 
 /** Write the tree as one document, between the emitter's documents: its
- *  name, then each node in full, a shared one wherever it appears. */
+ *  name and word, then each node in full, a shared one wherever it
+ *  appears, each value plain or not as the tree has it where its word
+ *  makes that data. */
 OYLNG_API oylng_status oylng_emit_tree(oylng_emitter *e, const oylng_tree *t);
 
 #ifdef __cplusplus
