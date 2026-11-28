@@ -480,7 +480,7 @@ static bool pat_number(typer *R, bool integer, const char *s, size_t n, size_t *
     return true;
 }
 
-static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain, scalar *out) {
+static int match_std(typer *R, const xt *x, const char *s, size_t n, scalar *out) {
     const char *name = oylng__std_names[x->std];
     oylng__num num;
     out->neg = false;   /* what a match doesn't set is 0 */
@@ -506,17 +506,20 @@ static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain,
         }
         out->type = OYLNG_T_STR;
         return MATCH;
-    case STD_INT:
-    case STD_BIGINT:
-    case STD_FLOAT:
-    case STD_DECIMAL:
-    case STD_BOOL:
+    case STD_TRUE:
+    case STD_FALSE:
     case STD_NULL:
-        if (!plain) {
-            snprintf(out->why, sizeof out->why, "'%.*s' isn't plain, so not !%s", SHOW(n), s, name);
-            return NO_MATCH;
+        /* section 4.1: words replace the standard spelling */
+        if ((x->flags & XF_WORDS) ? oylng__word_of(R->S, x, s, n)
+            : x->std == STD_TRUE  ? n == 4 && memcmp(s, "true", 4) == 0
+            : x->std == STD_FALSE ? n == 5 && memcmp(s, "false", 5) == 0
+                                  : !n || (n == 4 && memcmp(s, "null", 4) == 0)) {
+            out->type = x->std == STD_NULL ? OYLNG_T_NULL : OYLNG_T_BOOL;
+            out->u = x->std == STD_TRUE;
+            return MATCH;
         }
-        break;
+        snprintf(out->why, sizeof out->why, "expected !%s, got '%.*s'", name, SHOW(n), s);
+        return NO_MATCH;
     case STD_DATE:
     case STD_DATETIME: {
         oylng_datetime dt;
@@ -546,7 +549,6 @@ static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain,
             snprintf(out->why, sizeof out->why, "'%.*s' does not match", SHOW(n), s);
             return NO_MATCH;
         }
-        if (x->std == STD_NULL) { out->type = OYLNG_T_NULL; return MATCH; }
         bool integer = x->std == STD_INT || x->std == STD_BIGINT;
         size_t len;
         if (!pat_number(R, integer, s, n, &len)) {
@@ -610,9 +612,6 @@ static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain,
         if (n == 4 && memcmp(s, "true", 4) == 0) { out->type = OYLNG_T_BOOL; out->u = 1; return MATCH; }
         if (n == 5 && memcmp(s, "false", 5) == 0) { out->type = OYLNG_T_BOOL; out->u = 0; return MATCH; }
         break;
-    case STD_NULL:
-        if (n == 4 && memcmp(s, "null", 4) == 0) { out->type = OYLNG_T_NULL; return MATCH; }
-        break;
     default:
         break;
     }
@@ -622,8 +621,7 @@ static int match_std(typer *R, const xt *x, const char *s, size_t n, bool plain,
 
 /* A scalar matched against a union's alternatives in the order written,
  * !any last: the position that took it, or NONE */
-static uint32_t match_alts(typer *R, const xalts *a, uint32_t node, const char *s, size_t n, bool plain,
-                           scalar *out) {
+static uint32_t match_alts(typer *R, const xalts *a, uint32_t node, const char *s, size_t n, scalar *out) {
     out->neg = false;   /* a literal and !any set only the type */
     out->u = 0;
     out->f = 0;
@@ -632,7 +630,7 @@ static uint32_t match_alts(typer *R, const xalts *a, uint32_t node, const char *
     for (uint32_t i = 0; i < a->n && (lit == NONE || i < lit); i++) {
         const xt *x = a->p[i].t;
         if (x->kind != X_STD || x->std == STD_ANY) continue;
-        int r = match_std(R, x, s, n, plain, out);
+        int r = match_std(R, x, s, n, out);
         if (r == MATCH) return i;
         if (r == REFUSED) refuse(R, node, "%s", out->why);
     }
@@ -650,7 +648,7 @@ static uint32_t match_alts(typer *R, const xalts *a, uint32_t node, const char *
 /* Whether a key fits a type key: how it was written doesn't count (section 7) */
 static bool key_fits(typer *R, const xt *kt, uint32_t node, oylng_str k) {
     scalar sc;
-    return match_alts(R, kt->alts, node, k.data, k.len, true, &sc) != NONE;
+    return match_alts(R, kt->alts, node, k.data, k.len, &sc) != NONE;
 }
 
 static uint32_t scalar_val(typer *R, uint32_t node, const scalar *sc, const xpos *p) {
@@ -807,7 +805,7 @@ static uint32_t one(typer *R, const xpos *p, uint32_t node, const xt *scope) {
     if (k != OYLNG_NODE_STRING) refuse(R, node, "expected !%s", oylng__std_names[x->std]);
     oylng_str s = oylng_node_text(R->T, node);
     scalar sc;
-    int r = match_std(R, x, s.data, s.len, oylng_node_plain(R->T, node), &sc);
+    int r = match_std(R, x, s.data, s.len, &sc);
     if (r != MATCH) refuse(R, node, "%s", sc.why);
     return scalar_val(R, node, &sc, p);
 }
@@ -830,7 +828,7 @@ static uint32_t convert(typer *R, const xt *t, uint32_t node, const xt *scope) {
     }
     oylng_str s = oylng_node_text(R->T, node);
     scalar sc;
-    uint32_t i = match_alts(R, a, node, s.data, s.len, oylng_node_plain(R->T, node), &sc);
+    uint32_t i = match_alts(R, a, node, s.data, s.len, &sc);
     if (i == NONE) refuse(R, node, "'%.*s' is not allowed here", SHOW(s.len), s.data);
     if (sc.type == OYLNG_T_ANY) return new_val(R, OYLNG_T_ANY, node, &a->p[i]);
     return scalar_val(R, node, &sc, &a->p[i]);
@@ -955,10 +953,10 @@ static uint32_t walk(typer *R, uint32_t node, const xt *scope) {
 
 /* The value at node typed with t, or walked if t is NULL: once for each
  * type and nearest `!**`, if node is shared */
-static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope, bool opt);
+static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope);
 
 static uint32_t conv(typer *R, const xt *t, uint32_t node, const xt *scope) {
-    if (R->E && oylng_node_kind(R->T, node) == OYLNG_NODE_STRING) return spell(R, t, node, scope, false);
+    if (R->E && oylng_node_kind(R->T, node) == OYLNG_NODE_STRING) return spell(R, t, node, scope);
     const xt *k = t ? t->kind_of : &WALK;
     bool shared = oylng__node_shared(R->T, node);
     if (shared && R->capmemo) {
@@ -1014,16 +1012,8 @@ static uint32_t anywhere(typer *R, uint32_t node, const xt *scope) {
     return conv(R, NULL, node, scope);
 }
 
-/* An optional key written with no value: null (section 7) */
-static bool no_value(const typer *R, uint32_t vn) {
-    return oylng_node_kind(R->T, vn) == OYLNG_NODE_STRING && oylng_node_plain(R->T, vn) &&
-           !oylng_node_text(R->T, vn).len;
-}
-
 /* The value of a key the type names, at vn */
 static uint32_t field(typer *R, const xfield *fd, uint32_t vn, const xt *scope) {
-    if (R->E && oylng_node_kind(R->T, vn) == OYLNG_NODE_STRING) return spell(R, fd->type, vn, scope, fd->opt);
-    if (fd->opt && no_value(R, vn)) return new_val(R, OYLNG_T_NULL, vn, NULL);
     return conv(R, fd->type, vn, scope);
 }
 
@@ -1031,12 +1021,10 @@ static uint32_t field(typer *R, const xfield *fd, uint32_t vn, const xt *scope) 
 
 /* String node read as written now, as a parser reads it: its value, or
  * NONE if that refuses the document */
-static uint32_t attempt(typer *R, const xt *t, uint32_t node, const xt *scope, bool opt) {
+static uint32_t attempt(typer *R, const xt *t, uint32_t node, const xt *scope) {
     if (setjmp(R->tjb)) return NONE;
     R->trial = true;
-    uint32_t v = opt && no_value(R, node) ? new_val(R, OYLNG_T_NULL, node, NULL)
-               : t                        ? convert(R, t, node, scope)
-                                          : walk(R, node, scope);
+    uint32_t v = t ? convert(R, t, node, scope) : walk(R, node, scope);
     R->trial = false;
     return v;
 }
@@ -1045,15 +1033,16 @@ static uint32_t attempt(typer *R, const xt *t, uint32_t node, const xt *scope, b
  * spellings that reads back as what the emitter was given. A string
  * decides nothing above it but by its text, so it is spelled where it is
  * typed. */
-static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope, bool opt) {
+static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope) {
     oylng_typed *Y = R->Y;
     const oylng__speller *E = R->E;
+    const xalts *a = t ? t->alts : NULL;
     char first[48] = "";
     R->why0[0] = 0;
     for (unsigned k = 0;; k++) {
         oylng_str s;
         bool plain;
-        if (!E->next(E->ctx, node, k, opt, &s, &plain)) {
+        if (!E->next(E->ctx, node, k, a ? a->words : NULL, a ? a->nwords : 0, &s, &plain)) {
             char what[96];
             E->desc(E->ctx, node, what, sizeof what);
             refuse_as(R, OYLNG_ERR_EMIT, node, "no spelling of %s reads back: written %s, %s", what, first,
@@ -1061,14 +1050,14 @@ static uint32_t spell(typer *R, const xt *t, uint32_t node, const xt *scope, boo
         }
         if (!k) {
             size_t n = s.len > 40 ? 40 : s.len;
-            if (!s.len) snprintf(first, sizeof first, "empty");
+            if (!s.len && plain) snprintf(first, sizeof first, "empty");
             else snprintf(first, sizeof first, "%s%.*s%s%s", plain ? "" : "\"", (int)n, s.data,
                           n < s.len ? "..." : "", plain ? "" : "\"");
         }
         if (!oylng__tree_set_str((oylng_tree *)R->T, node, s.data, s.len, plain)) nomem(R);
         size_t nv = Y->nv, nb = Y->nb;
         R->trial_k = k;
-        uint32_t v = attempt(R, t, node, scope, opt);
+        uint32_t v = attempt(R, t, node, scope);
         if (v != NONE) {
             const char *why = E->fits(E->ctx, node, Y, v);
             if (!why) return v;

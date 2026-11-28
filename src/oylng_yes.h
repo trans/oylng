@@ -90,7 +90,7 @@ extern const char oylng__ucd_version[];
 
 enum { X_ALT, X_LIT, X_STD, X_NAME, X_SEQ, X_MAP };
 
-enum { STD_STR, STD_INT, STD_BIGINT, STD_FLOAT, STD_DECIMAL, STD_BOOL, STD_NULL,
+enum { STD_STR, STD_INT, STD_BIGINT, STD_FLOAT, STD_DECIMAL, STD_BOOL, STD_TRUE, STD_FALSE, STD_NULL,
        STD_DATE, STD_DATETIME, STD_BINARY, STD_ANY };
 
 #define XF_LO      1u    /* X_STD: a limit's lower end */
@@ -103,6 +103,7 @@ enum { STD_STR, STD_INT, STD_BIGINT, STD_FLOAT, STD_DECIMAL, STD_BOOL, STD_NULL,
 #define XF_PAT   128u    /* X_STD: a pattern */
 #define XF_BARE  256u    /* X_MAP: the rules of a `!**` written as a type, its
                             only rule !* (section 10) */
+#define XF_WORDS 512u    /* X_STD: !true, !false or !null with words (section 4.1) */
 
 typedef struct oylng__xt    xt;
 typedef struct oylng__entry centry;
@@ -144,6 +145,9 @@ typedef struct {
     uint32_t  nmaps;
     uint32_t  any;        /* the first !any position, or UINT32_MAX */
     bool      all_lits;   /* literals only */
+    oylng__word *words;   /* how a boolean or null is written here, in the
+                             order its alternatives are tried (section 13) */
+    uint32_t  nwords;
 } xalts;
 
 struct oylng__xt {
@@ -163,6 +167,11 @@ struct oylng__xt {
             uint64_t   prec, scale;
             oylng__rx *rx;        /* XF_PAT: its matcher, if within the ceiling */
             uint64_t   rxcount;   /* XF_PAT: its count (section 9) */
+            xstr      *words;     /* XF_WORDS: in the order written */
+            uint32_t   nwords;
+            uint32_t  *wix;       /* XF_WORDS: a hash table of them, each its
+                                     number + 1, or 0; wcap slots */
+            uint32_t   wcap;
         } std;
         centry *name;
         struct { xt **items; uint32_t n; xt *rest; } seq;
@@ -249,6 +258,8 @@ uint64_t oylng__hash_str(const sctx *s, const char *p, size_t n);
 const xfield *oylng__field(const sctx *s, const xt *m, const char *k, size_t n);
 /* The literal position of a with text k, or UINT32_MAX */
 uint32_t oylng__lit(const sctx *s, const xalts *a, const char *k, size_t n);
+/* Whether !true, !false or !null x, with words, takes text k */
+bool     oylng__word_of(const sctx *s, const xt *x, const char *k, size_t n);
 
 struct oylng_schema {
     sctx        *ctx;

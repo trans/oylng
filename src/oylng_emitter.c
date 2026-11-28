@@ -608,12 +608,10 @@ static bool can_plain(const char *s, size_t n, const place *pl) {
 }
 
 /* Spelling i of a value of type want whose standard spelling is t, n
- * long, as an optional key's value if opt: 1, with it in *out; 0 past
- * the last; -1 if spelling i is none. A string, a date, a time or bytes
- * is plain, then quoted. Anything else has its standard spelling alone
- * (section 13), and null is null, or no value under an optional key,
- * which always reads back as null there. */
-static int raw_spelling(uint8_t want, const char *t, size_t n, unsigned i, bool opt, oylng_str *out, bool *plain) {
+ * long: 1, with it in *out; 0 past the last; -1 if spelling i is none. A
+ * string, a date, a time or bytes is plain, then quoted. Anything else
+ * has its standard spelling alone (section 13), so null is null. */
+static int raw_spelling(uint8_t want, const char *t, size_t n, unsigned i, oylng_str *out, bool *plain) {
     *plain = true;
     switch (want) {
     case OYLNG_T_STR:
@@ -624,10 +622,6 @@ static int raw_spelling(uint8_t want, const char *t, size_t n, unsigned i, bool 
         if (!n && !i) return -1;   /* an empty string is "", not an empty value */
         *out = (oylng_str){ t, n };
         *plain = i == 0;
-        return 1;
-    case OYLNG_T_NULL:
-        if (i) return 0;
-        *out = opt ? (oylng_str){ "", 0 } : (oylng_str){ "null", 4 };
         return 1;
     default:
         if (i) return 0;
@@ -648,7 +642,7 @@ static bool writable(oylng_str s, bool plain, const place *pl, bool empty) {
 static void first_spelling(uint8_t want, const char *t, size_t n, const place *pl, bool empty, oylng_str *out,
                            bool *plain) {
     for (unsigned i = 0;; i++) {
-        int got = raw_spelling(want, t, n, i, false, out, plain);
+        int got = raw_spelling(want, t, n, i, out, plain);
         if (got > 0 && writable(*out, *plain, pl, empty)) return;
         if (!got) break;
     }
@@ -656,29 +650,49 @@ static void first_spelling(uint8_t want, const char *t, size_t n, const place *p
     *plain = false;
 }
 
-/* Spelling i of record r, as an optional key's value if opt: the
- * standard one; then the text it was read from, where it was read and
- * the application kept that, by writing a typed document again (section
- * 13); then, for a string, a date, a time or bytes, quoted */
-static int spelling(const oylng_emitter *E, const erec *r, const oylng__tnew *t, unsigned i, bool opt,
-                    oylng_str *out, bool *plain) {
+/* Spelling i of record r: the standard one; then the text it was read
+ * from, where it was read and the application kept that, by writing a
+ * typed document again (section 13); then, for a string, a date, a time
+ * or bytes, quoted */
+static int spelling(const oylng_emitter *E, const erec *r, const oylng__tnew *t, unsigned i, oylng_str *out,
+                    bool *plain) {
     const char *std = E->tb + t->off;
     if (r->hint != SIZE_MAX && i) {
-        if (i > 1) return raw_spelling(r->want, std, t->len, i - 1, opt, out, plain);
+        if (i > 1) return raw_spelling(r->want, std, t->len, i - 1, out, plain);
         *out = (oylng_str){ E->tb + r->hint, r->hlen };
         *plain = r->hplain;
         oylng_str first;
         bool fp;
-        if (raw_spelling(r->want, std, t->len, 0, opt, &first, &fp) > 0 && fp == *plain &&
+        if (raw_spelling(r->want, std, t->len, 0, &first, &fp) > 0 && fp == *plain &&
             str_is(first, out->data, out->len))
             return -1;   /* the same */
         return 1;
     }
-    return raw_spelling(r->want, std, t->len, i, opt, out, plain);
+    return raw_spelling(r->want, std, t->len, i, out, plain);
+}
+
+/* Spelling i of record r where a boolean or null is written as one of
+ * the nw words w: those for its value, in order, each plain and then
+ * quoted, an empty one as ""; then its own (section 13) */
+static int place_spelling(const oylng_emitter *E, const erec *r, const oylng__tnew *t, unsigned i,
+                          const oylng__word *w, uint32_t nw, oylng_str *out, bool *plain) {
+    if (r->want == OYLNG_T_BOOL || r->want == OYLNG_T_NULL) {
+        if (i < 2 * (size_t)nw) {
+            const oylng__word *x = &w[i / 2];
+            uint8_t what = r->want == OYLNG_T_NULL ? OYLNG__NULL : E->tb[t->off] == 't' ? OYLNG__TRUE : OYLNG__FALSE;
+            if (x->what != what || (i % 2 == 0 && !x->text.len)) return -1;
+            *out = x->text;
+            *plain = i % 2 == 0;
+            return 1;
+        }
+        i -= 2 * nw;
+    }
+    return spelling(E, r, t, i, out, plain);
 }
 
 /* For the typer (oylng__speller) */
-static bool next_spelling(void *ctx, uint32_t node, unsigned k, bool opt, oylng_str *out, bool *plain) {
+static bool next_spelling(void *ctx, uint32_t node, unsigned k, const oylng__word *w, uint32_t nw, oylng_str *out,
+                          bool *plain) {
     oylng_emitter *E = ctx;
     if (!k || node != E->cnode) {
         E->cnode = node;
@@ -688,7 +702,7 @@ static bool next_spelling(void *ctx, uint32_t node, unsigned k, bool opt, oylng_
     const oylng__tnew *t = &E->tn[node];
     place pl = { NULL, r->flow, false, false, -1 };
     for (;;) {
-        int got = spelling(E, r, t, E->craw++, opt, out, plain);
+        int got = place_spelling(E, r, t, E->craw++, w, nw, out, plain);
         if (!got) return false;
         if (got > 0 && writable(*out, *plain, &pl, r->empty)) return true;
     }

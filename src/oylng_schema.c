@@ -170,8 +170,8 @@ static centry *entry_of(sctx *S, const char *name, size_t len) {
 
 /* ── Type expressions (sections 4 to 9, 14) ──────────────── */
 
-const char *const oylng__std_names[] = { "str", "int", "bigint", "float", "decimal", "bool", "null",
-                                         "date", "datetime", "binary", "any" };
+const char *const oylng__std_names[] = { "str", "int", "bigint", "float", "decimal", "bool", "true", "false",
+                                         "null", "date", "datetime", "binary", "any" };
 
 static int std_of(const char *s, size_t n) {
     for (int i = 0; i <= STD_ANY; i++)
@@ -271,12 +271,63 @@ static uint64_t whole(const char *s, size_t n) {
     return v;
 }
 
+/* Section 4.1: the words of !true, !false or !null, split at |, which
+ * replace its standard spelling. An empty word is the empty text and
+ * stands only beside another; none holds a space, |, /, ( or ), and none
+ * is there twice. */
+static void words(sctx *S, xt *t, const char *a, size_t n, const char *whole_text, size_t wn, size_t pos) {
+    int show = (int)(wn > 60 ? 60 : wn);
+    if (!n) bad(S, pos, "an empty word stands only beside another: %.*s", show, whole_text);
+    size_t k = 1;
+    for (size_t i = 0; i < n; i++) {
+        if (a[i] == '|') k++;
+        else if (a[i] == ' ' || a[i] == '/' || a[i] == '(' || a[i] == ')')
+            bad(S, pos, "a word holds no space, |, /, ( or ): %.*s", show, whole_text);
+    }
+    if (k > UINT32_MAX / 4) bad(S, pos, "too many words: %.*s", show, whole_text);
+    xstr *w = alloc(S, k * sizeof *w);
+    uint32_t cap = 16;
+    while (cap < 2 * k) cap *= 2;
+    uint32_t *ix = zalloc(S, (size_t)cap * sizeof *ix);
+    size_t b = 0, j = 0;
+    for (size_t i = 0; i <= n; i++) {
+        if (i < n && a[i] != '|') continue;
+        w[j] = (xstr){ a + b, (uint32_t)(i - b) };
+        uint32_t h = (uint32_t)oylng__hash_str(S, w[j].s, w[j].len) & (cap - 1);
+        for (; ix[h]; h = (h + 1) & (cap - 1))
+            if (is(w[ix[h] - 1], w[j].s, w[j].len))
+                bad(S, pos, "the word '%.*s' is there twice: %.*s", (int)(w[j].len > 40 ? 40 : w[j].len), w[j].s,
+                    show, whole_text);
+        ix[h] = (uint32_t)j + 1;
+        j++;
+        b = i + 1;
+    }
+    t->u.std.words = w;
+    t->u.std.nwords = (uint32_t)k;
+    t->u.std.wix = ix;
+    t->u.std.wcap = cap;
+    t->flags |= XF_WORDS;
+}
+
+bool oylng__word_of(const sctx *S, const xt *x, const char *k, size_t n) {
+    uint32_t mask = x->u.std.wcap - 1;
+    for (uint32_t h = (uint32_t)oylng__hash_str(S, k, n) & mask;; h = (h + 1) & mask) {
+        uint32_t i = x->u.std.wix[h];
+        if (!i) return false;
+        if (is(x->u.std.words[i - 1], k, n)) return true;
+    }
+}
+
 /* Sections 4.2, 4.6 and 4.7: in one pair of parentheses, in this order and
- * at most one of each, a precision (!decimal only), a range and a pattern */
+ * at most one of each, a precision (!decimal only), a range and a pattern,
+ * on a string or a number; words on !true, !false and !null (section 4.1) */
 static void limits(sctx *S, xt *t, const char *a, size_t n, const char *whole_text, size_t wn, size_t pos) {
     int std = t->std;
-    if (std != STD_STR && std != STD_INT && std != STD_BIGINT && std != STD_FLOAT && std != STD_DECIMAL &&
-        std != STD_NULL)
+    if (std == STD_TRUE || std == STD_FALSE || std == STD_NULL) {
+        words(S, t, a, n, whole_text, wn, pos);
+        return;
+    }
+    if (std != STD_STR && std != STD_INT && std != STD_BIGINT && std != STD_FLOAT && std != STD_DECIMAL)
         bad(S, pos, "%.*s: !%s takes nothing in parentheses", (int)(wn > 60 ? 60 : wn), whole_text,
             oylng__std_names[std]);
     /* a pattern is last, from the first /, with one space before it */
@@ -316,7 +367,7 @@ static void limits(sctx *S, xt *t, const char *a, size_t n, const char *whole_te
             }
         }
         size_t lo = limit_number(tok, tl), hi = 0;
-        bool ok = !rng && std != STD_NULL && tl - lo >= 2 && tok[lo] == '.' && tok[lo + 1] == '.';
+        bool ok = !rng && tl - lo >= 2 && tok[lo] == '.' && tok[lo + 1] == '.';
         if (ok) {
             hi = tl - lo - 2;
             ok = (lo || hi) && (!hi || limit_number(tok + lo + 2, hi) == hi);
@@ -940,6 +991,44 @@ static void expand(sctx *S, xt *t) {
             for (; a->lits[h]; h = (h + 1) & (cap - 1))
                 if (is(a->p[a->lits[h] - 1].t->u.lit, l.s, l.len)) { dup = true; break; }
             if (!dup) a->lits[h] = i + 1;
+        }
+    }
+    /* how a boolean or null is written here: as the first alternative
+       that takes it would read it, its first word or standard spelling */
+    uint32_t nw = 0;
+    for (uint32_t i = 0; i < no; i++) {
+        const xt *x = a->p[i].t;
+        if (x->kind == X_STD) nw += x->std == STD_BOOL ? 2 : x->std == STD_TRUE || x->std == STD_FALSE || x->std == STD_NULL;
+    }
+    if (nw) {
+        a->words = alloc(S, nw * sizeof *a->words);
+        for (uint32_t i = 0; i < no; i++) {
+            const xt *x = a->p[i].t;
+            if (x->kind != X_STD) continue;
+            oylng__word *w = a->words + a->nwords;
+            oylng_str first = (x->flags & XF_WORDS) ? (oylng_str){ x->u.std.words[0].s, x->u.std.words[0].len }
+                                                    : (oylng_str){ NULL, 0 };
+            switch (x->std) {
+            case STD_BOOL:
+                w[0] = (oylng__word){ OYLNG__TRUE, { "true", 4 } };
+                w[1] = (oylng__word){ OYLNG__FALSE, { "false", 5 } };
+                a->nwords += 2;
+                break;
+            case STD_TRUE:
+                *w = (oylng__word){ OYLNG__TRUE, first.data ? first : (oylng_str){ "true", 4 } };
+                a->nwords++;
+                break;
+            case STD_FALSE:
+                *w = (oylng__word){ OYLNG__FALSE, first.data ? first : (oylng_str){ "false", 5 } };
+                a->nwords++;
+                break;
+            case STD_NULL:
+                *w = (oylng__word){ OYLNG__NULL, first.data ? first : (oylng_str){ "null", 4 } };
+                a->nwords++;
+                break;
+            default:
+                break;
+            }
         }
     }
     t->alts = a;

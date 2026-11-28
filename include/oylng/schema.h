@@ -234,8 +234,7 @@ typedef void (*oylng_drop_fn)(void *ctx, void *object);
  *  for each place a value is used, so `*p` twice is two calls and two
  *  objects; innermost first, so the code finds the objects of the values
  *  below its own made; and in the order written. It runs for no key, even
- *  one a type key names a bound entry for, and for no optional key written
- *  with no value, whose null has no name. Its refusal refuses the
+ *  one a type key names a bound entry for. Its refusal refuses the
  *  document, OYLNG_ERR_SCHEMA with the value's path and where it is
  *  written, and the objects made are let go. Binding a name again
  *  replaces its binding, and @p fn NULL unbinds it; from inside a binding,
@@ -261,12 +260,15 @@ OYLNG_API void *oylng_value_take(oylng_typed *t, oylng_value v);
  *  document is held until it ends, and the output stops short of it till
  *  then. It is typed with s, as the parser would type it, and each scalar
  *  is written in the first of its spellings that reads back as given. A
- *  string is plain, else quoted, as is one whose plain spelling would
- *  refuse the document (`1e999` under `{!|: [!float, !str]}`). A number, a
- *  boolean, null or a time has its standard spelling alone (section 13): a
- *  float in the fewest significant digits, positional from 1e-7 to below
- *  1e21 with .0 where it has no fraction, else with a signed exponent
- *  (2.0, 1e+21); null is null, or no value under an optional key. A value
+ *  string is plain, else quoted; since quoting doesn't change a type, one
+ *  its type reads as something else, or that would refuse the document, is
+ *  refused (`3` under `{!|: [!int, !str]}`, `1e999` under
+ *  `{!|: [!float, !str]}`). A number, a boolean, null or a time has its
+ *  standard spelling alone (section 13): a float in the fewest significant
+ *  digits, positional from 1e-7 to below 1e21 with .0 where it has no
+ *  fraction, else with a signed exponent (2.0, 1e+21); null is null. Under
+ *  words (section 4.1), a boolean or null is the first word of the first
+ *  alternative that takes it, written "" where that word is empty. A value
  *  written by oylng_emit_value may also take the text it was read from,
  *  if that reads back where the standard spelling doesn't, so 5 under
  *  `!signed` is refused, but a +5 read there is written +5. What reads

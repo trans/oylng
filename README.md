@@ -184,8 +184,10 @@ oylng_parser_free(p);
 oylng_schema_free(sc);
 ```
 
-It has the eleven standard types with their limits and a decimal's
-precision, literals, optional keys, type keys, `!*`, unions (a mapping
+It has the thirteen standard types with their limits, a decimal's
+precision and the words of `!true`, `!false` and `!null`
+(`{!|: [!true(yes|on), !false(no|off)]}`, `!null(~|null|)`), literals,
+optional keys, type keys, `!*`, unions (a mapping
 whose one key is `!|`: `{!|: [!int, !str]}`), sequences,
 named and recursive types, references and merges in a schema, section 11's
 typed count, and an application's cut of a time's fraction. `!int` is
@@ -195,8 +197,13 @@ second and the year 0000. Patterns (`!str(/[a-z][a-z0-9-]*/)` and the like)
 are I-Regexp, matched without backtracking, so in time linear in the
 text, with Unicode 16's categories for `\p{..}`. `!**` types what a
 mapping holds at every level below it, by its rules or by its `!*`, and
-walks the rest. A union reads any JSON value:
-`json: {!|: [!null, !bool, !int, !float, !str, {!*: !json}, [!json, ...]]}`.
+walks the rest. How a scalar is written doesn't count for its type: `3`,
+`"3"` and `'3'` are all 3 under `!int`. `!null` takes `null` and the empty
+text, so `retries:` is null under `retries?: {!|: [!null, !int]}` and
+refused under `retries?: !int`, where `?` only lets the key be left out. A
+union reads any JSON value, though a string that reads as a number, a
+boolean or null is read as one:
+`json: {!|: [!null(null), !bool, !int, !float, !str, {!*: !json}, [!json, ...]]}`.
 `include/oylng/schema.h` documents the rest.
 
 A published name (section 3.1), such as
@@ -236,8 +243,8 @@ never on trial, innermost first, and once for each place a value is used:
 as a `!spot` is through `spot` and then `point` with `spot: !point`, gets
 the code of the outermost one bound, and no other's; a union's name counts
 the same way (`oylng_value_bound` says which). Code runs only for a typed
-value: none for a key, even one a type key names a bound entry for, and
-none for an optional key written with no value. The document holds the
+value: none for a key, even one a type key names a bound entry for. The
+document holds the
 objects until the application takes them, and lets go the rest when it is
 freed.
 
@@ -300,12 +307,17 @@ the output so far, so a large stream needn't be held whole.
 With a schema (part 2, section 13), the emitter writes typed data so that
 the same schema reads it back unchanged. `oylng_emitter_set_schema` holds
 each document until it ends, types it as a parser would, and writes each
-scalar so that it reads back as what it was given: a string plain, or
-quoted where its type would read it plain as something else or refuse it.
-A number, a boolean, null or a time has one spelling, its standard one: a
-float in the fewest digits that read back, with `.0` where it has no
-fraction (`2.0`) and a signed exponent past 1e21 (`1e+21`); null as
-`null`, or no value under an optional key (`retries:`). A value written
+scalar so that it reads back as what it was given. Quoting doesn't change
+a type, so a string its type would read as something else, or that would
+refuse the document, is refused: the string `3` under
+`{!|: [!int, !str]}`. Other strings are plain where that reads back the
+same, else quoted. A number, a boolean, null or a time has one spelling,
+its standard one: a float in the fewest digits that read back, with `.0`
+where it has no fraction (`2.0`) and a signed exponent past 1e21
+(`1e+21`); null as `null`. Under words, a boolean or null is the first
+word of the first alternative that takes it: true as `yes` under
+`{!|: [!true(yes|on), !false(no|off)]}`, and `""` where that word is
+empty. A value written
 again with `oylng_emit_value` may also take the text it was read from.
 Nothing else is tried: 5 under `!signed` below is refused, as `5` doesn't
 match its pattern, and an application that wants `+5` writes it with its
@@ -319,7 +331,7 @@ oylng_emitter_set_schema(em, sc);
 oylng_emit_doc_start(em, (oylng_str){ NULL, 0 });
 oylng_emit_map_start(em, false);
 oylng_emit_scalar(em, (oylng_str){ "id", 2 });
-oylng_emit_scalar(em, (oylng_str){ "3", 1 });       /* a string: id: '3' */
+oylng_emit_scalar(em, (oylng_str){ "a7", 2 });      /* id: a7; the string 3 would refuse it, as it reads as 3 */
 oylng_emit_scalar(em, (oylng_str){ "at", 2 });
 oylng_emit_int(em, -5);                             /* at: -5; a 5 would refuse it */
 oylng_emit_map_end(em);

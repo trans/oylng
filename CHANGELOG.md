@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+- **Quotes don't count for a type, and `!true`, `!false` and words** (part
+  2, sections 4.1, 7 and 13, yaml2 `v0.2.4`). Part 2's 984 tests pass (959
+  run, 25 holding more), and part 1's 373 are unchanged.
+  - How a scalar is written no longer counts: `3`, `"3"`, `'3'` and a `|-`
+    block holding `3` are all 3 under `!int`, and the same holds for the
+    other numbers, booleans and null.
+  - `!null` takes `null` and the empty text, and `?` only lets a key be
+    left out. So `retries:` is refused under `retries?: !int`, and is null
+    under `{!|: [!null, !int]}`, typed like any other value: code bound to
+    a name it goes through now runs for it.
+  - New standard types `!true` and `!false`; `!bool` takes what
+    `{!|: [!true, !false]}` does. `!true`, `!false` and `!null` take a list
+    of words, which replaces the standard spelling: `!true(yes|on)`,
+    `!null(~|null|)`. A schema with a word twice, an empty word alone, or a
+    space, `/`, `(` or `)` in a word is refused.
+  - A pattern on `!null` is now refused, and `!null(/nil/)` is written
+    `!null(nil)`.
+  - The emitter writes null as `null` everywhere, an optional key's too,
+    and a boolean or null under words as the first word of the first
+    alternative that takes it, `""` where that word is empty. A string its
+    type would read as something else is refused, `OYLNG_ERR_EMIT`, where it
+    was quoted: the string `3` under `{!|: [!int, !str]}`, and `1e999` under
+    `{!|: [!float, !str]}`.
 - **What bound code writes, against the suite** (part 2, section 13,
   yaml2 `v0.2.2`): part 2's 8 tests with `writes` now run, and pass. Each
   name a test binds is bound to the emitter too, its code writing what

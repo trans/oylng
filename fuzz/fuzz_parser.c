@@ -270,12 +270,10 @@ static void check_value(const oylng_typed *t, oylng_value v, size_t *budget) {
     case OYLNG_T_FLOAT:
         if (!isfinite(oylng_value_float(t, v))) abort();
         break;
-    case OYLNG_T_BOOL:
-        if (!(s.len == 4 && !memcmp(s.data, "true", 4) && oylng_value_bool(t, v)) &&
-            !(s.len == 5 && !memcmp(s.data, "false", 5) && !oylng_value_bool(t, v)))
-            abort();
+    case OYLNG_T_BOOL:   /* any text: words can make even `false` true (section 4.1) */
+        (void)oylng_value_bool(t, v);
         break;
-    case OYLNG_T_NULL:   /* "null", empty for an optional key, or what a pattern took */
+    case OYLNG_T_NULL:   /* "null", the empty text, or a word of its type */
         break;
     case OYLNG_T_DATE: case OYLNG_T_DATETIME:
         if (!oylng_value_datetime(t, v, &dt) || dt.year < 0 || dt.year > 9999 || dt.month < 1 ||

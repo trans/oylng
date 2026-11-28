@@ -1411,15 +1411,17 @@ static void float_spellings(void) {
 }
 
 static void emitting(void) {
-    /* section 13: a string the type would read as something else is quoted */
+    /* section 13: a string the type would read as something else is
+       refused, since quotes don't count (section 4.1, yaml2 961fd4c) */
     const char *u = "n: {!|: [!int, !str]}\n";
-    WRITES(u, "n", "s:3", false, "--- '3'\n", "s3@n");
+    REFUSES(u, "n", "s:3", false, "/: no spelling of the string '3' reads back: written 3, it reads as !int");
     WRITES(u, "n", "i:3", false, "--- 3\n", "i3@n");
     WRITES(u, "n", "s:abc", false, "--- abc\n", "sabc@n");
     REFUSES(u, "n", "f:1.5", false, "/: no spelling of the float 1.5 reads back: written 1.5, it reads as !str");
-    /* and one whose plain spelling would refuse the document: 1e999 is a
-       float too large (yaml2 8b774fc) */
-    WRITES("n: {!|: [!float, !str]}\n", "n", "s:1e999", false, "--- '1e999'\n", "s1e999@n");
+    /* and one that would refuse the document: 1e999 is a float too large
+       (yaml2 8b774fc) */
+    REFUSES("n: {!|: [!float, !str]}\n", "n", "s:1e999", false,
+            "/: no spelling of the string '1e999' reads back: written 1e999, 1e999 is too large for binary64");
     /* 5 fits {!|: [!signed, !str]} only as the string "5", so it's refused
        (yaml2 340fe27) */
     REFUSES("signed: !int(/[-+][0-9]+/)\nn: {!|: [!signed, !str]}\n", "n", "i:5", false,
@@ -1443,12 +1445,14 @@ static void emitting(void) {
        below 1e21 with .0 where it has no fraction, else with an exponent
        and its sign (section 4.4); a decimal as written, so 19.9 isn't
        19.90; and a pattern must match that spelling, or it's refused */
-    const char *it = "cents: !decimal(/[0-9]+\\.[0-9]{2}/)\nnone: !null(/(~|null)?/)\n"
+    const char *it = "cents: !decimal(/[0-9]+\\.[0-9]{2}/)\nnone: !null(~|null|)\n"
                      "item:\n  price: !cents\n  ratio: !float(/[0-9]*\\.[0-9]+/)\n  note: {!|: [!none, !str]}\n";
-    WRITES(it, "item", "{ s:price D:19.99 s:ratio f:1 s:note n }", false, "price: 19.99\nratio: 1.0\nnote: null\n",
+    WRITES(it, "item", "{ s:price D:19.99 s:ratio f:1 s:note n }", false, "price: 19.99\nratio: 1.0\nnote: ~\n",
            "{price:d19.99@cents,ratio:f1,note:n@none}@item");
-    WRITES(it, "item", "{ s:price D:0.50 s:ratio f:0.5 s:note s:null }", true, "{price: 0.50, ratio: 0.5, note: 'null'}",
-           "{price:d0.50@cents,ratio:f0.5,note:snull}@item");
+    WRITES(it, "item", "{ s:price D:0.50 s:ratio f:0.5 s:note s:fine }", true, "{price: 0.50, ratio: 0.5, note: fine}",
+           "{price:d0.50@cents,ratio:f0.5,note:sfine}@item");
+    REFUSES(it, "item", "{ s:price D:0.50 s:ratio f:0.5 s:note s:null }", false,
+            "/note: no spelling of the string 'null' reads back: written null, it reads as !null");
     REFUSES(it, "item", "{ s:price D:19.9 s:ratio f:1 s:note n }", false,
             "/price: no spelling of the decimal 19.9 reads back: written 19.9, '19.9' does not match");
     REFUSES("c: !float(/[0-9]+\\.[0-9]{2}/)\n", "c", "f:19.9", false,
@@ -1471,21 +1475,31 @@ static void emitting(void) {
     WRITES("k: !int\n", "k", "u:18446744073709551615", false, "--- 18446744073709551615\n", "i18446744073709551615@k");
     REFUSES("k: !int\n", "k", "B:18446744073709551616", false, "no spelling of the integer 18446744073709551616");
 
-    /* null: no value under an optional key, which always reads back as
-       null there, and null anywhere else (section 13, yaml2 340fe27) */
-    const char *m = "m: {a?: !int, b?: !str, c: !null, d?: !null(/~/), e?: [!null(/(-)?/), ...]}\n";
-    WRITES(m, "m", "{ s:a n s:b n s:c n s:d n }", false, "a:\nb:\nc: null\nd:\n", "{a:n,b:n,c:n,d:n}@m");
-    WRITES(m, "m", "{ s:a n s:b n s:c n }", true, "{a:, b:, c: null}", "{a:n,b:n,c:n}@m");
-    REFUSES(m, "m", "{ s:c n s:e [[ n ] }", false, "/e/0: no spelling of null reads back: written null, 'null' does not match");
-    REFUSES(m, "m", "{ s:c n s:e [ n ] }", false, "/e/0: no spelling of null reads back: written null, 'null' does not match");
-    REFUSES("r: !null(/(-)?/)\n", "r", "n", false, "/: no spelling of null reads back: written null, 'null' does not match");
+    /* null is null everywhere, an optional key's value too, or the first
+       word of its type, written "" where that is empty; a boolean is its
+       first word too (section 13, yaml2 961fd4c) */
+    const char *m = "m: {a?: {!|: [!null, !int]}, b?: !str, c: !null, d?: !null(~), e?: [!null(-|), ...], f?: !null(|-)}\n";
+    WRITES(m, "m", "{ s:a n s:c n s:d n s:f n }", false, "a: null\nc: null\nd: ~\nf: \"\"\n", "{a:n,c:n,d:n,f:n}@m");
+    WRITES(m, "m", "{ s:a n s:c n }", true, "{a: null, c: null}", "{a:n,c:n}@m");
+    WRITES(m, "m", "{ s:c n s:e [[ n ] }", false, "e: ['-']", "{c:n,e:[n]}@m");
+    WRITES(m, "m", "{ s:c n s:e [ n ] }", false, "e:\n  - '-'\n", "{c:n,e:[n]}@m");
+    REFUSES(m, "m", "{ s:b n s:c n }", false, "/b: no spelling of null reads back: written null, it reads as !str");
     WRITES("r: {!|: [!null, !str]}\n", "r", "n", false, "--- null\n", "n@r");
-    WRITES("r: {!|: [!null(/(-)?/), !str]}\n", "r", "s:", false, "--- \"\"\n", "s@r");
+    REFUSES("r: {!|: [!null, !str]}\n", "r", "s:", false, "/: no spelling of the string '' reads back: written \"\", it reads as !null");
+    WRITES("r: {!|: [!null(null), !str]}\n", "r", "s:", false, "--- \"\"\n", "s@r");
+    const char *sw = "s: {!|: [!true(yes|on), !false(no|off)]}\n";
+    WRITES(sw, "s", "b:1", false, "--- yes\n", "btrue@s");
+    WRITES(sw, "s", "b:0", false, "--- no\n", "bfalse@s");
+    WRITES("s: {!|: [!bool, !true(yes)]}\n", "s", "b:1", false, "--- true\n", "btrue@s");
+    WRITES("s: {!|: [!false, !true(#t)]}\n", "s", "b:1", false, "--- '#t'\n", "btrue@s");
+    REFUSES("s: !true\n", "s", "b:0", false, "/: no spelling of false reads back: written false, expected !true, got 'false'");
 
-    /* a string where its type is another: quoted if that reads it back */
+    /* a string where its type is another: refused, quoted or not */
     const char *t = "t: {x: !bool, y: !str, z: !any, w: {!|: [!null, !bool, !int, !str]}, v: {!|: [!date, !str]}}\n";
-    WRITES(t, "t", "{ s:x b:1 s:y s:true s:z i:5 s:w s:true s:v s:x }", false, "x: true\ny: true\nz: 5\nw: 'true'\nv: x\n",
-           "{x:btrue,y:strue,z:A5,w:strue,v:sx}@t");
+    WRITES(t, "t", "{ s:x b:1 s:y s:true s:z i:5 s:w s:yes s:v s:x }", false, "x: true\ny: true\nz: 5\nw: yes\nv: x\n",
+           "{x:btrue,y:strue,z:A5,w:syes,v:sx}@t");
+    REFUSES(t, "t", "{ s:x b:1 s:y s:a s:z n s:w s:true s:v s:x }", false,
+            "/w: no spelling of the string 'true' reads back: written true, it reads as !bool");
     REFUSES(t, "t", "{ s:x s:true s:y s:a s:z n s:w n s:v s:a }", false, "/x: no spelling of the string 'true' reads back: written true, it reads as !bool");
     REFUSES(t, "t", "{ s:x b:1 s:y s:a s:z n s:w n s:v s:2001-02-03 }", false,
             "/v: no spelling of the string '2001-02-03' reads back: written 2001-02-03, it reads as !date");
@@ -1494,10 +1508,11 @@ static void emitting(void) {
     REFUSES(t, "t", "{ s:x b:1 }", false, "/: missing y");
     REFUSES(t, "t", "{ s:x b:1 s:y s:a s:z n s:w n s:v s:a s:q i:1 }", false, "/: unknown key q");
 
-    /* bytes in base64, quoted where plain reads as something else */
+    /* bytes in base64, refused where that reads as something else */
     WRITES("x: !binary\n", "x", "x:686921", false, "--- aGkh\n", "x686921@x");
     WRITES("x: !binary\n", "x", "x:", false, "--- \"\"\n", "x@x");
-    WRITES("x: {!|: [!int, !binary]}\n", "x", "x:d76df8", false, "--- '1234'\n", "xd76df8@x");
+    REFUSES("x: {!|: [!int, !binary]}\n", "x", "x:d76df8", false,
+            "/: no spelling of the bytes 1234 reads back: written 1234, it reads as !int");
 
     /* a key is a string */
     REFUSES(NULL, NULL, "{ i:1 s:a }", false, "a key is a string, and this is !int");
@@ -1679,7 +1694,7 @@ static void emitting_more(void) {
 
     /* a typed document written again: where no standard spelling reads
        back, how each value was written does */
-    const char *src = "%YAML 2.0\n--- &\nz: !int(/0{25}[0-9]/)\nnl: !null(/nil/)\n"
+    const char *src = "%YAML 2.0\n--- &\nz: !int(/0{25}[0-9]/)\nnl: !null(nil)\n"
                       "r:\n  a: !z\n  b: !nl\n  c: !float(/[0-9]\\.[0-9]{30}/)\n  d: !datetime\n"
                       "--- !r\na: 00000000000000000000000007\nb: nil\nc: 0.100000000000000005551115123125\n"
                       "d: 2001-02-03t04:05:06z\n";
